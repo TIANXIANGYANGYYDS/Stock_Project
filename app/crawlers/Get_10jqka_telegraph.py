@@ -189,22 +189,23 @@ class TonghuashunNewsCrawler(BaseNewsCrawler):
 
         return []
 
-    def fetch_latest_telegraphs(self, rn: int = 20) -> list[FetchedNews]:
+    def fetch_latest_telegraphs(self) -> list[FetchedNews]:
+        rn = 20
         raw_items = self.fetch_raw_telegraphs(rn=rn)
         rows = [self.normalize_item(x) for x in raw_items]
 
         return self.dedupe_news(rows, limit=rn)
 
 
-def fetch_latest_telegraphs(rn: int = 20) -> list[FetchedNews]:
+def fetch_latest_telegraphs() -> list[FetchedNews]:
     """
     保留原来的函数入口，避免外部调用方大面积改动。
     """
-    return TonghuashunNewsCrawler().fetch_latest_telegraphs(rn=rn)
+    return TonghuashunNewsCrawler().fetch_latest_telegraphs()
 
 
 if __name__ == "__main__":
-    rows = fetch_latest_telegraphs(rn=20)
+    rows = fetch_latest_telegraphs()
     print(
         json.dumps(
             [row.model_dump() for row in rows],

@@ -279,12 +279,11 @@ class Jin10NewsCrawler(BaseNewsCrawler):
             llm_analysis=None,
         )
 
-    def fetch_latest_telegraphs(
-        self,
-        limit: int = 20,
-        detail_limit: int | None = None,
-        sleep_seconds: float = 0.2,
-    ) -> list[FetchedNews]:
+    def fetch_latest_telegraphs(self) -> list[FetchedNews]:
+        limit = 20
+        detail_limit = None
+        sleep_seconds = 0.2
+
         html = self.fetch_home_html()
         candidates = self.parse_flash_list(html)
 
@@ -310,23 +309,15 @@ class Jin10NewsCrawler(BaseNewsCrawler):
         return self.dedupe_news(rows, limit=limit)
 
 
-def fetch_latest_telegraphs(
-    limit: int = 20,
-    detail_limit: int | None = None,
-    sleep_seconds: float = 0.2,
-) -> list[FetchedNews]:
+def fetch_latest_telegraphs() -> list[FetchedNews]:
     """
     保留原来的函数入口，避免外部调用方大面积改动。
     """
-    return Jin10NewsCrawler().fetch_latest_telegraphs(
-        limit=limit,
-        detail_limit=detail_limit,
-        sleep_seconds=sleep_seconds,
-    )
+    return Jin10NewsCrawler().fetch_latest_telegraphs()
 
 
 if __name__ == "__main__":
-    rows = fetch_latest_telegraphs(limit=20, detail_limit=10, sleep_seconds=0.2)
+    rows = fetch_latest_telegraphs()
     print(
         json.dumps(
             [row.model_dump() for row in rows[:5]],

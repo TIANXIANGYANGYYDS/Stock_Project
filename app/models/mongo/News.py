@@ -1,5 +1,5 @@
-from typing import ClassVar, List, Optional, Literal
-from pydantic import BaseModel, Field
+from typing import ClassVar, Dict, List, Literal, Optional
+from pydantic import BaseModel, Field, model_validator
 
 
 NewsProcessStatusCode = Literal[
@@ -17,6 +17,16 @@ class NewsStatus(BaseModel):
     """
     新闻处理状态。
     """
+
+    STATUS_REASON_MAP: ClassVar[Dict[str, str]] = {
+        "crawled": "爬虫数据已入库，等待后续板块分析。",
+        "sector_judging": "正在执行板块判断分析。",
+        "sector_judged": "板块判断分析已完成，等待板块详情分析。",
+        "sector_detail_analyzing": "正在执行板块详情分析。",
+        "finished": "新闻处理流程已完成。",
+        "sector_judge_failed": "板块判断分析失败。",
+        "sector_detail_failed": "板块详情分析失败。",
+    }
 
     status: NewsProcessStatusCode = Field(
         default="crawled",
@@ -36,6 +46,13 @@ class NewsStatus(BaseModel):
         default=None,
         description="状态解释；失败时记录失败原因，非失败时可记录当前阶段说明",
     )
+
+    @model_validator(mode="after")
+    def fill_default_reason(self) -> "NewsStatus":
+        if self.reason is None or not self.reason.strip():
+            self.reason = self.STATUS_REASON_MAP.get(self.status)
+
+        return self
 
 
 class NewsLLMAnalysis(BaseModel):

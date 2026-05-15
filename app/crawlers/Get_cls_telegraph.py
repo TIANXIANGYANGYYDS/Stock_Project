@@ -108,7 +108,8 @@ class CLSNewsCrawler(BaseNewsCrawler):
             source=self.source,
         )
 
-    def fetch_latest_news(self, rn: int = 20) -> list[FetchedNews]:
+    def fetch_latest_news(self) -> list[FetchedNews]:
+        rn = 20
         """
         获取财联社最新快讯。
         不做入库，不做 LLM。
@@ -127,16 +128,16 @@ class CLSNewsCrawler(BaseNewsCrawler):
         return self.dedupe_news(rows, limit=rn)
 
 
-def fetch_latest_news(rn: int = 20) -> list[FetchedNews]:
+def fetch_latest_news() -> list[FetchedNews]:
     """
     函数式入口，方便外部直接调用。
     """
     crawler = CLSNewsCrawler()
-    return crawler.fetch_latest_news(rn=rn)
+    return crawler.fetch_latest_news()
 
 
 if __name__ == "__main__":
-    rows = fetch_latest_news(rn=20)
+    rows = fetch_latest_news()
 
     print(
         json.dumps(
