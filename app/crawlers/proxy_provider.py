@@ -81,7 +81,7 @@ class ShanchenProxyProvider:
         key = Settings().proxy_api_key.strip()
 
         if not key:
-            raise ValueError("未配置闪臣代理 key，请检查 .env 中的 PROXY_API_KEY")
+            raise ValueError("未配置闪臣代理 key，请检查 .local/env/.env 中的 PROXY_API_KEY")
 
         self.minutes = minutes
         self.key = key

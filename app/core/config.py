@@ -6,11 +6,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+ACTIVE_ENV_FILE = PROJECT_ROOT / ".local" / "env" / ".env"
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=PROJECT_ROOT / ".env",
+        env_file=ACTIVE_ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
     )

@@ -139,12 +139,19 @@ class NewsIngestionService:
             ),
         ]
 
+    async def _run_fetcher_in_thread(
+        self,
+        fetcher: Callable[[], List[FetchedNews]],
+    ) -> List[FetchedNews]:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, fetcher)
+
     async def _fetch_once_from_source(
         self,
         crawler_source: _CrawlerSource,
     ) -> _CrawlerFetchResult:
         try:
-            rows = await asyncio.to_thread(crawler_source.fetcher)
+            rows = await self._run_fetcher_in_thread(crawler_source.fetcher)
 
             return _CrawlerFetchResult(
                 source=crawler_source.source,
