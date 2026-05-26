@@ -395,7 +395,7 @@ class NewsSectorJudgeLLMAnalyzer(BaseLLM):
         content: str,
         publish_time: str,
         temperature: float | None = 0,
-        max_tokens: int | None = 800,
+        max_tokens: int | None = 3000,
         max_retries: int = 2,
     ) -> list[NewsSectorLLMAnalysis]:
         title = (title or "").strip()
