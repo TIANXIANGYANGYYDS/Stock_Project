@@ -27,6 +27,20 @@ class Settings(BaseSettings):
     )
     llm_extra_body: str = Field(default="", alias="LLM_EXTRA_BODY")
 
+    # LLM worker
+    news_sector_judge_batch_size: int = Field(
+        default=5,
+        alias="NEWS_SECTOR_JUDGE_BATCH_SIZE",
+    )
+    news_sector_judge_idle_sleep_seconds: float = Field(
+        default=5,
+        alias="NEWS_SECTOR_JUDGE_IDLE_SLEEP_SECONDS",
+    )
+    news_sector_judge_error_sleep_seconds: float = Field(
+        default=10,
+        alias="NEWS_SECTOR_JUDGE_ERROR_SLEEP_SECONDS",
+    )
+
     # MongoDB
     mongo_uri: str = Field(default="mongodb://localhost:27017", alias="MONGO_URI")
     mongo_db_name: str = Field(default="stock_project", alias="MONGO_DB_NAME")

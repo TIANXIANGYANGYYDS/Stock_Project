@@ -76,3 +76,11 @@ python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
   apscheduler beautifulsoup4 motor pydantic pydantic-settings pymongo python-dotenv requests pytest \
   pandas html5lib lxml akshare
 ```
+
+## 7.以后每次进这个项目，本地只需要：
+
+```bash
+cd D:\study\shilv\Stock_Project
+.\Stock\Scripts\Activate.ps1
+python -V
+```
