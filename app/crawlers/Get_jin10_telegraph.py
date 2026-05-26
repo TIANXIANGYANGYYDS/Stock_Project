@@ -4,7 +4,7 @@ import json
 import re
 import time
 from datetime import datetime, timedelta
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -55,6 +55,30 @@ class Jin10NewsCrawler(BaseNewsCrawler):
             headers=self.headers,
         )
 
+    def normalize_detail_url(self, href: str | None) -> str | None:
+        href = (href or "").strip()
+        if not href:
+            return None
+
+        if href.startswith("//"):
+            href = "https:" + href
+
+        if href.startswith("/"):
+            href = urljoin(self.detail_base, href)
+
+        parsed = urlparse(href)
+
+        if parsed.scheme not in {"http", "https"}:
+            return None
+
+        if parsed.netloc != "flash.jin10.com":
+            return None
+
+        if not parsed.path.startswith("/detail/"):
+            return None
+
+        return href
+
     def parse_flash_list(self, html: str) -> list[dict]:
         """
         从金十首页提取候选快讯。
@@ -68,14 +92,9 @@ class Jin10NewsCrawler(BaseNewsCrawler):
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
 
-            if "flash.jin10.com" not in href and "/detail/" not in href:
+            detail_url = self.normalize_detail_url(href)
+            if not detail_url:
                 continue
-            if "/detail/" not in href:
-                continue
-
-            detail_url = href
-            if detail_url.startswith("/"):
-                detail_url = urljoin(self.detail_base, detail_url)
 
             block_text = ""
             node = a.parent
@@ -127,6 +146,10 @@ class Jin10NewsCrawler(BaseNewsCrawler):
         """
         抓取详情页，提取完整发布时间和正文。
         """
+        detail_url = self.normalize_detail_url(detail_url)
+        if not detail_url:
+            return None
+
         try:
             html = self.fetch_detail_html(detail_url)
         except Exception as e:

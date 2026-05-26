@@ -16,21 +16,16 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Qianwen / DashScope
-    qian_api_key: str = Field(default="", alias="QIAN_API_KEY")
-    qian_model: str = Field(default="qwen-plus", alias="QIAN_MODEL")
-    qian_api_base_url: str = Field(
-        default="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        alias="QIAN_API_BASE_URL",
+    # LLM
+    llm_api_key: str = Field(default="", alias="LLM_API_KEY")
+    llm_model: str = Field(default="", alias="LLM_MODEL")
+    llm_api_base_url: str = Field(default="", alias="LLM_API_BASE_URL")
+    llm_timeout: int = Field(default=30, alias="LLM_TIMEOUT")
+    llm_default_temperature: float = Field(
+        default=0.2,
+        alias="LLM_DEFAULT_TEMPERATURE",
     )
-
-    # DeepSeek
-    deepseek_api_key: str = Field(default="", alias="DEEPSEEK_API_KEY")
-    deepseek_model: str = Field(default="deepseek-v4-pro", alias="DEEPSEEK_MODEL")
-    deepseek_api_base_url: str = Field(
-        default="https://api.deepseek.com",
-        alias="DEEPSEEK_API_BASE_URL",
-    )
+    llm_extra_body: str = Field(default="", alias="LLM_EXTRA_BODY")
 
     # MongoDB
     mongo_uri: str = Field(default="mongodb://localhost:27017", alias="MONGO_URI")
