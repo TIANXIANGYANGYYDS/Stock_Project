@@ -33,3 +33,5 @@ Thumbs.db
 .ruff_cache/
 .coverage
 htmlcov/
+
+Stock/
