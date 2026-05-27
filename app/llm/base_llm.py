@@ -272,7 +272,7 @@ class BaseLLM:
 		):
 			return cleaned
 
-		for opening, closing in (("{", "}"), ("[", "]")):
+		for opening, closing in (("[", "]"), ("{", "}")):
 			start = cleaned.find(opening)
 			end = cleaned.rfind(closing)
 			if start != -1 and end != -1 and end > start:
@@ -284,6 +284,23 @@ class BaseLLM:
 					continue
 
 		raise LLMResponseError(f"未能从 LLM 返回中提取 JSON: {cleaned[:300]}")
+
+	@classmethod
+	def _extract_json_from_reasoning_content(cls, text: str) -> str | None:
+		"""
+		从 reasoning_content 中兜底提取合法 JSON。
+
+		部分推理模型可能把最终 JSON 放进 reasoning_content，同时 message.content
+		为空。业务层只需要 JSON 时，可以在这个异常形态下复用已经生成的合法 JSON。
+		"""
+
+		try:
+			json_text = cls.extract_json_text(text)
+			parsed = json.loads(json_text)
+		except (LLMResponseError, json.JSONDecodeError):
+			return None
+
+		return json.dumps(parsed, ensure_ascii=False)
 
 	def _post_chat_completion(self, payload: dict[str, Any], max_retries: int) -> dict[str, Any]:
 		last_error: Exception | None = None
@@ -331,6 +348,7 @@ class BaseLLM:
 		if not isinstance(first_choice, dict):
 			raise LLMResponseError(f"LLM 返回 choices[0] 不是 object: {data}")
 
+		finish_reason = first_choice.get("finish_reason")
 		message = first_choice.get("message") or {}
 		if not isinstance(message, dict):
 			raise LLMResponseError(f"LLM 返回 message 不是 object: {data}")
@@ -353,6 +371,26 @@ class BaseLLM:
 
 			if text_parts:
 				return "\n".join(text_parts)
+
+		reasoning_content = message.get("reasoning_content")
+
+		if finish_reason == "length":
+			raise LLMResponseError(
+				"LLM 输出被截断，finish_reason=length，message.content 为空。"
+				"请增大 max_tokens / max_completion_tokens，或缩短 prompt。"
+				f" response={data}"
+			)
+
+		if isinstance(reasoning_content, str) and reasoning_content.strip():
+			fallback_json = BaseLLM._extract_json_from_reasoning_content(reasoning_content)
+			if fallback_json:
+				return fallback_json
+
+			raise LLMResponseError(
+				"LLM 只返回 reasoning_content，message.content 为空，"
+				"且 reasoning_content 中无法提取合法 JSON。"
+				f" response={data}"
+			)
 
 		raise LLMResponseError(f"LLM 返回缺少 message.content: {data}")
 
