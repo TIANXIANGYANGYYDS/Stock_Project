@@ -297,3 +297,91 @@ class NewsRepository(BaseMongoRepository):
                 },
             },
         )
+
+    async def claim_next_sector_detail_news(self) -> News | None:
+        """
+        原子领取一条待板块详情分析的新闻。
+
+        详情分析是第二阶段，只处理第一阶段已经完成的新闻：
+        1. status.status 必须是 sector_judged；
+        2. 领取后立即改成 sector_detail_analyzing；
+        3. 返回更新后的 News 模型。
+
+        多 worker 并发时，同一条 sector_judged 新闻只会被一个 worker 领取。
+        """
+
+        doc = await self.collection.find_one_and_update(
+            {"status.status": "sector_judged"},
+            {
+                "$set": {
+                    "status": NewsStatus(
+                        status="sector_detail_analyzing",
+                        reason="板块详情 worker 已领取，正在调用 LLM。",
+                    ).model_dump(mode="python"),
+                },
+            },
+            sort=[("publish_ts", -1)],
+            projection={"_id": 0},
+            return_document=ReturnDocument.AFTER,
+        )
+
+        if doc is None:
+            return None
+
+        return News(**doc)
+
+    async def mark_sector_detail_success(
+        self,
+        event_id: str,
+        analysis: Sequence[NewsSectorLLMAnalysis],
+    ) -> UpdateResult:
+        """
+        写入板块详情分析结果，并把新闻状态推进到 finished。
+
+        analysis 会覆盖 sector_llm_analysis：第一阶段只有 sector_name，
+        第二阶段会把每个 sector_name 对应的 sector_llm_analysis 补齐。
+        """
+
+        return await self.update_one(
+            {
+                "event_id": event_id,
+                "status.status": "sector_detail_analyzing",
+            },
+            {
+                "$set": {
+                    "sector_llm_analysis": [
+                        item.model_dump(mode="python")
+                        for item in analysis
+                    ],
+                    "status": NewsStatus(status="finished").model_dump(mode="python"),
+                },
+            },
+        )
+
+    async def mark_sector_detail_failed(
+        self,
+        event_id: str,
+        reason: str,
+    ) -> UpdateResult:
+        """
+        标记板块详情分析失败，并记录失败原因。
+
+        失败状态与第一阶段失败状态分开，方便后续只重试详情分析，不重复做板块判断。
+        """
+
+        error_reason = (reason or "板块详情分析失败。").strip()
+
+        return await self.update_one(
+            {
+                "event_id": event_id,
+                "status.status": "sector_detail_analyzing",
+            },
+            {
+                "$set": {
+                    "status": NewsStatus(
+                        status="sector_detail_failed",
+                        reason=error_reason[:1000],
+                    ).model_dump(mode="python"),
+                },
+            },
+        )
