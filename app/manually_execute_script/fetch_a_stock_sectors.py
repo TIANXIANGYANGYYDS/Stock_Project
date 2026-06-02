@@ -1,5 +1,6 @@
 # app/manually_execute_script/fetch_a_stock_sectors.py
 # python app/manually_execute_script/fetch_a_stock_sectors.py
+# 这个脚本用于获取同花顺行业板块列表及其成份股，输出到单个 JSON 文件。
 
 from __future__ import annotations
 

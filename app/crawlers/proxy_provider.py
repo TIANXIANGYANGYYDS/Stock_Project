@@ -105,8 +105,8 @@ class ShanchenProxyProvider:
             "time": self.minutes,
             "count": 1,
             "type": "json",
-            "province": 215,
-            "city": 215,
+            # "province": 215,
+            # "city": 215,
             "only": 1,
         }
         return f"{self.API_BASE_URL}?{urlencode(params)}"
