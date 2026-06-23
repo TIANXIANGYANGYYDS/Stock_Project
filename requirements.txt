@@ -1,0 +1,18 @@
+# Core runtime dependencies
+apscheduler
+beautifulsoup4
+motor
+pydantic
+pydantic-settings
+pymongo
+python-dotenv
+requests
+
+# Test dependencies
+pytest
+
+# Optional dependencies for manual A-share sector scripts
+pandas
+html5lib
+lxml
+akshare
