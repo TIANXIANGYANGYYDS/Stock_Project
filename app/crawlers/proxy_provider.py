@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-import os
+import asyncio
+import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Protocol
+from typing import Any, Dict, List, Optional, Protocol
 from urllib.parse import urlencode
 
+import httpx
 import requests
 from app.core.config import Settings
+
+
+logger = logging.getLogger(__name__)
 
 
 class ProxyUnavailableError(RuntimeError):
@@ -27,14 +32,37 @@ class ProxyProvider(Protocol):
     不可用时返回 None。
     """
 
-    def get_requests_proxies(self) -> Optional[Dict[str, str]]:
-        ...
+    def get_requests_proxies(self) -> Optional[Dict[str, str]]: ...
 
-    def on_success(self) -> None:
-        ...
+    def on_success(self) -> None: ...
 
-    def on_failure(self, exc: Exception) -> None:
-        ...
+    def on_failure(self, exc: Exception) -> None: ...
+
+
+class AsyncProxyProvider(Protocol):
+    async def get_requests_proxies(self) -> Optional[Dict[str, str]]: ...
+
+    def on_success(self) -> None: ...
+
+    def on_failure(self, exc: Exception) -> None: ...
+
+    async def close(self) -> None: ...
+
+
+class AsyncRequestRateLimiter:
+    def __init__(self, max_calls_per_second: float = 3.0) -> None:
+        if max_calls_per_second <= 0:
+            raise ValueError("max_calls_per_second 必须大于 0")
+        self._interval_seconds = 1.0 / max_calls_per_second
+        self._lock = asyncio.Lock()
+        self._next_allowed_at = 0.0
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            delay = self._next_allowed_at - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._next_allowed_at = time.monotonic() + self._interval_seconds
 
 
 class NoProxyProvider:
@@ -68,6 +96,7 @@ class ShanchenProxyProvider:
         self,
         minutes: int,
         *,
+        count: int = 1,
         timeout: int = 10,
         refresh_before_seconds: int = 10,
     ) -> None:
@@ -76,14 +105,20 @@ class ShanchenProxyProvider:
 
         if minutes <= 0:
             raise ValueError("minutes 必须大于 0")
-
+        if not isinstance(count, int):
+            raise TypeError("count 必须是 int 类型")
+        if not 1 <= count <= 200:
+            raise ValueError("count 必须在 1 到 200 之间")
 
         key = Settings().proxy_api_key.strip()
 
         if not key:
-            raise ValueError("未配置闪臣代理 key，请检查 .local/env/.env 中的 PROXY_API_KEY")
+            raise ValueError(
+                "未配置闪臣代理 key，请检查 .local/env/.env 中的 PROXY_API_KEY"
+            )
 
         self.minutes = minutes
+        self.count = count
         self.key = key
         self.timeout = timeout
         self.refresh_before_seconds = refresh_before_seconds
@@ -93,17 +128,20 @@ class ShanchenProxyProvider:
         self.current_expire_at: Optional[float] = None
         self.last_endpoint: Optional[ProxyEndpoint] = None
 
-    def _build_api_url(self) -> str:
+    def _build_api_url(self, *, count: Optional[int] = None) -> str:
         """
         拼接固定参数后的 API URL。
 
         只允许 time 由 minutes 控制，key 从环境变量读取。
         """
+        request_count = self.count if count is None else count
+        if not 1 <= request_count <= 200:
+            raise ValueError("count 必须在 1 到 200 之间")
         params = {
             "action": "get_ip",
             "key": self.key,
             "time": self.minutes,
-            "count": 1,
+            "count": request_count,
             "type": "json",
             # "province": 215,
             # "city": 215,
@@ -111,7 +149,7 @@ class ShanchenProxyProvider:
         }
         return f"{self.API_BASE_URL}?{urlencode(params)}"
 
-    def _extract_endpoint_from_json(self, data: Any) -> Optional[ProxyEndpoint]:
+    def _extract_endpoints_from_json(self, data: Any) -> List[ProxyEndpoint]:
         """
         解析闪臣普通 get_ip JSON 返回。
 
@@ -130,47 +168,57 @@ class ShanchenProxyProvider:
         }
         """
         if not isinstance(data, dict):
-            return None
+            return []
 
         status = str(data.get("status", "")).strip()
         if status and status != "0":
             info = data.get("info", "未知错误")
             print(f"[代理池] 代理接口返回失败 status={status}, info={info}")
-            return None
+            return []
 
         items = data.get("list")
         if not isinstance(items, list) or not items:
             print(f"[代理池] JSON 中没有可用 list: {data}")
-            return None
+            return []
 
-        item = items[0]
-        if not isinstance(item, dict):
-            print(f"[代理池] list[0] 格式异常: {item}")
-            return None
+        endpoints: List[ProxyEndpoint] = []
+        seen: set[tuple[str, int]] = set()
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                print(f"[代理池] list[{index}] 格式异常: {item}")
+                continue
 
-        host = (
-            item.get("sever")
-            or item.get("server")
-            or item.get("ip")
-            or item.get("IP")
-            or item.get("host")
-        )
-        port = item.get("port") or item.get("Port")
-
-        if not host or not port:
-            print(f"[代理池] list[0] 中未找到 sever/port: {item}")
-            return None
-
-        try:
-            endpoint = ProxyEndpoint(
-                host=str(host).strip(),
-                port=int(str(port).strip()),
+            host = (
+                item.get("sever")
+                or item.get("server")
+                or item.get("ip")
+                or item.get("IP")
+                or item.get("host")
             )
-        except ValueError:
-            print(f"[代理池] port 不是合法整数: {port}")
-            return None
+            port = item.get("port") or item.get("Port")
+            if not host or not port:
+                print(f"[代理池] list[{index}] 中未找到 sever/port: {item}")
+                continue
 
-        return endpoint
+            try:
+                endpoint = ProxyEndpoint(
+                    host=str(host).strip(),
+                    port=int(str(port).strip()),
+                )
+            except ValueError:
+                print(f"[代理池] port 不是合法整数: {port}")
+                continue
+
+            identity = (endpoint.host, endpoint.port)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            endpoints.append(endpoint)
+        return endpoints
+
+    def _extract_endpoint_from_json(self, data: Any) -> Optional[ProxyEndpoint]:
+        endpoints = self._extract_endpoints_from_json(data)
+        return endpoints[0] if endpoints else None
 
     def _fetch_proxy_endpoint(self) -> Optional[ProxyEndpoint]:
         api_url = self._build_api_url()
@@ -182,7 +230,9 @@ class ShanchenProxyProvider:
             try:
                 data = resp.json()
             except ValueError:
-                print(f"[代理池] 接口没有返回合法 JSON，响应前 300 字符: {resp.text[:300]}")
+                print(
+                    f"[代理池] 接口没有返回合法 JSON，响应前 300 字符: {resp.text[:300]}"
+                )
                 self.last_endpoint = None
                 return None
 
@@ -221,7 +271,9 @@ class ShanchenProxyProvider:
         self.current_proxies = None
         self.current_expire_at = None
 
-    def _set_current_proxy(self, endpoint: ProxyEndpoint, proxies: Dict[str, str]) -> None:
+    def _set_current_proxy(
+        self, endpoint: ProxyEndpoint, proxies: Dict[str, str]
+    ) -> None:
         """
         设置当前代理，并按 minutes 计算本地过期时间。
 
@@ -246,7 +298,9 @@ class ShanchenProxyProvider:
             return False
 
         if time.monotonic() >= self.current_expire_at:
-            print(f"[代理池] 当前代理已过期或接近过期: {self.current_endpoint.display()}")
+            print(
+                f"[代理池] 当前代理已过期或接近过期: {self.current_endpoint.display()}"
+            )
             return False
 
         return True
@@ -282,7 +336,9 @@ class ShanchenProxyProvider:
 
     def on_success(self) -> None:
         if self.current_endpoint:
-            print(f"[代理池] 当前代理请求成功，继续复用: {self.current_endpoint.display()}")
+            print(
+                f"[代理池] 当前代理请求成功，继续复用: {self.current_endpoint.display()}"
+            )
 
     def on_failure(self, exc: Exception) -> None:
         if self.current_endpoint:
@@ -294,6 +350,298 @@ class ShanchenProxyProvider:
             print(f"[代理池] 请求失败，但当前未记录代理: {repr(exc)}")
 
         self._clear_current_proxy()
+
+
+class AsyncShanchenProxyProvider(ShanchenProxyProvider):
+    """Async proxy provider used by coroutine-based page crawlers."""
+
+    def __init__(
+        self,
+        minutes: int,
+        *,
+        count: int = 1,
+        timeout: int = 10,
+        refresh_before_seconds: int = 10,
+        rate_limiter: Optional[AsyncRequestRateLimiter] = None,
+    ) -> None:
+        super().__init__(
+            minutes,
+            count=count,
+            timeout=timeout,
+            refresh_before_seconds=refresh_before_seconds,
+        )
+        self._client = httpx.AsyncClient(
+            timeout=timeout,
+            trust_env=False,
+        )
+        self._lock = asyncio.Lock()
+        self._rate_limiter = rate_limiter or AsyncRequestRateLimiter()
+
+    async def _fetch_proxy_endpoint_async(self) -> Optional[ProxyEndpoint]:
+        api_url = self._build_api_url()
+        try:
+            await self._rate_limiter.acquire()
+            response = await self._client.get(api_url)
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            logger.warning("proxy_endpoint_fetch_failed error=%s", repr(exc))
+            self.last_endpoint = None
+            return None
+
+        endpoint = self._extract_endpoint_from_json(data)
+        self.last_endpoint = endpoint
+        if endpoint is None:
+            logger.warning("proxy_endpoint_unavailable response=%s", data)
+            return None
+        return endpoint
+
+    async def get_requests_proxies(self) -> Optional[Dict[str, str]]:
+        async with self._lock:
+            if self._is_current_proxy_valid():
+                assert self.current_endpoint is not None
+                assert self.current_proxies is not None
+                logger.debug("proxy_reused endpoint=%s", self.current_endpoint.display())
+                return self.current_proxies
+
+            endpoint = await self._fetch_proxy_endpoint_async()
+            if endpoint is None:
+                self._clear_current_proxy()
+                return None
+
+            proxies = self._build_proxies_from_endpoint(endpoint)
+            self._set_current_proxy(endpoint, proxies)
+            logger.info("proxy_acquired endpoint=%s", endpoint.display())
+            return proxies
+
+    def on_success_for(self, proxies: Optional[Dict[str, str]]) -> None:
+        if proxies is None or self.current_proxies != proxies:
+            return
+        logger.debug("proxy_request_succeeded endpoint=%s", self.current_endpoint)
+
+    def on_failure_for(
+        self,
+        proxies: Optional[Dict[str, str]],
+        exc: Exception,
+    ) -> None:
+        if proxies is None or self.current_proxies != proxies:
+            return
+        logger.warning(
+            "proxy_discarded endpoint=%s error=%s",
+            self.current_endpoint.display() if self.current_endpoint else None,
+            repr(exc),
+        )
+        self._clear_current_proxy()
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+
+@dataclass
+class _ProxyPoolSlot:
+    endpoint: ProxyEndpoint
+    proxies: Dict[str, str]
+    expire_at: float
+    in_flight: int = 0
+    draining: bool = False
+
+
+@dataclass
+class ProxyPoolStats:
+    api_request_count: int = 0
+    requested_endpoint_count: int = 0
+    received_endpoint_count: int = 0
+    added_endpoint_count: int = 0
+    discarded_endpoint_count: int = 0
+    expired_endpoint_count: int = 0
+    lease_count: int = 0
+    success_count: int = 0
+    failure_count: int = 0
+    max_in_flight: int = 0
+
+
+class AsyncShanchenProxyPool(ShanchenProxyProvider):
+    """Batch-fetched proxy pool with bounded concurrency per endpoint."""
+
+    def __init__(
+        self,
+        minutes: int,
+        *,
+        pool_size: int = 4,
+        max_concurrency_per_proxy: int = 2,
+        timeout: int = 10,
+        refresh_before_seconds: int = 10,
+        rate_limiter: Optional[AsyncRequestRateLimiter] = None,
+    ) -> None:
+        if pool_size <= 0 or pool_size > 200:
+            raise ValueError("pool_size 必须在 1 到 200 之间")
+        if max_concurrency_per_proxy <= 0:
+            raise ValueError("max_concurrency_per_proxy 必须大于 0")
+        super().__init__(
+            minutes,
+            count=pool_size,
+            timeout=timeout,
+            refresh_before_seconds=refresh_before_seconds,
+        )
+        self.pool_size = pool_size
+        self.max_concurrency_per_proxy = max_concurrency_per_proxy
+        self._client = httpx.AsyncClient(timeout=timeout, trust_env=False)
+        self._condition = asyncio.Condition()
+        self._rate_limiter = rate_limiter or AsyncRequestRateLimiter()
+        self._slots: List[_ProxyPoolSlot] = []
+        self._fetching = False
+        self.stats = ProxyPoolStats()
+
+    def _slot_expire_at(self) -> float:
+        usable_ttl_seconds = max(
+            1,
+            self.minutes * 60 - self.refresh_before_seconds,
+        )
+        return time.monotonic() + usable_ttl_seconds
+
+    def _mark_expired_and_cleanup(self) -> None:
+        now = time.monotonic()
+        for slot in self._slots:
+            if now >= slot.expire_at and not slot.draining:
+                slot.draining = True
+                self.stats.expired_endpoint_count += 1
+        self._slots = [
+            slot
+            for slot in self._slots
+            if not (slot.draining and slot.in_flight == 0)
+        ]
+
+    def _select_available_slot(self) -> Optional[_ProxyPoolSlot]:
+        self._mark_expired_and_cleanup()
+        candidates = [
+            slot
+            for slot in self._slots
+            if not slot.draining
+            and slot.in_flight < self.max_concurrency_per_proxy
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda slot: (slot.in_flight, slot.expire_at))
+
+    async def _fetch_proxy_endpoints_async(
+        self,
+        count: int,
+    ) -> List[ProxyEndpoint]:
+        self.stats.api_request_count += 1
+        self.stats.requested_endpoint_count += count
+        try:
+            await self._rate_limiter.acquire()
+            response = await self._client.get(self._build_api_url(count=count))
+            response.raise_for_status()
+            data = response.json()
+        except Exception as exc:
+            logger.warning("proxy_pool_fetch_failed count=%s error=%s", count, repr(exc))
+            return []
+
+        endpoints = self._extract_endpoints_from_json(data)
+        self.stats.received_endpoint_count += len(endpoints)
+        if not endpoints:
+            logger.warning("proxy_pool_fetch_empty count=%s response=%s", count, data)
+        return endpoints
+
+    async def get_requests_proxies(self) -> Optional[Dict[str, str]]:
+        while True:
+            fetch_count = 0
+            async with self._condition:
+                slot = self._select_available_slot()
+                if slot is not None:
+                    slot.in_flight += 1
+                    self.stats.lease_count += 1
+                    self.stats.max_in_flight = max(
+                        self.stats.max_in_flight,
+                        sum(slot.in_flight for slot in self._slots),
+                    )
+                    return slot.proxies
+
+                active_count = sum(not slot.draining for slot in self._slots)
+                if not self._fetching and active_count < self.pool_size:
+                    self._fetching = True
+                    fetch_count = self.pool_size - active_count
+                else:
+                    await self._condition.wait()
+                    continue
+
+            endpoints = await self._fetch_proxy_endpoints_async(fetch_count)
+            async with self._condition:
+                existing = {
+                    (slot.endpoint.host, slot.endpoint.port) for slot in self._slots
+                }
+                added = 0
+                for endpoint in endpoints:
+                    identity = (endpoint.host, endpoint.port)
+                    if identity in existing:
+                        continue
+                    existing.add(identity)
+                    self._slots.append(
+                        _ProxyPoolSlot(
+                            endpoint=endpoint,
+                            proxies=self._build_proxies_from_endpoint(endpoint),
+                            expire_at=self._slot_expire_at(),
+                        )
+                    )
+                    added += 1
+                    self.stats.added_endpoint_count += 1
+                self._fetching = False
+                self._condition.notify_all()
+                if added:
+                    logger.info(
+                        "proxy_pool_filled requested=%s added=%s active=%s",
+                        fetch_count,
+                        added,
+                        sum(not slot.draining for slot in self._slots),
+                    )
+                elif self._select_available_slot() is None:
+                    return None
+
+    def _find_slot(self, proxies: Dict[str, str]) -> Optional[_ProxyPoolSlot]:
+        return next((slot for slot in self._slots if slot.proxies == proxies), None)
+
+    async def on_success_for(
+        self,
+        proxies: Optional[Dict[str, str]],
+    ) -> None:
+        if proxies is None:
+            return
+        async with self._condition:
+            slot = self._find_slot(proxies)
+            if slot is None:
+                return
+            slot.in_flight = max(0, slot.in_flight - 1)
+            self.stats.success_count += 1
+            self._mark_expired_and_cleanup()
+            self._condition.notify_all()
+
+    async def on_failure_for(
+        self,
+        proxies: Optional[Dict[str, str]],
+        exc: Exception,
+    ) -> None:
+        if proxies is None:
+            return
+        async with self._condition:
+            slot = self._find_slot(proxies)
+            if slot is None:
+                return
+            slot.in_flight = max(0, slot.in_flight - 1)
+            self.stats.failure_count += 1
+            if not slot.draining:
+                slot.draining = True
+                self.stats.discarded_endpoint_count += 1
+                logger.warning(
+                    "proxy_pool_discarded endpoint=%s error=%s",
+                    slot.endpoint.display(),
+                    repr(exc),
+                )
+            self._mark_expired_and_cleanup()
+            self._condition.notify_all()
+
+    async def close(self) -> None:
+        await self._client.aclose()
 
 
 def get_required_proxies(provider: ProxyProvider) -> Dict[str, str]:
@@ -308,6 +656,15 @@ def get_required_proxies(provider: ProxyProvider) -> Dict[str, str]:
     if proxies is None:
         raise ProxyUnavailableError("未获取到代理，禁止本机直连请求")
 
+    return proxies
+
+
+async def get_required_async_proxies(
+    provider: AsyncProxyProvider,
+) -> Dict[str, str]:
+    proxies = await provider.get_requests_proxies()
+    if proxies is None:
+        raise ProxyUnavailableError("未获取到代理，禁止本机直连请求")
     return proxies
 
 

@@ -9,7 +9,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.core.config import get_settings
 from app.db.mongo import client
-from app.scheduler.crawler_jobs import crawl_news_job, ensure_news_indexes
+from app.scheduler.crawler_jobs import (
+    crawl_news_job,
+    ensure_news_indexes,
+    register_crawler_jobs,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +31,8 @@ def configure_logging() -> None:
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
         force=True,
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def build_scheduler() -> AsyncIOScheduler:
@@ -42,6 +48,7 @@ def build_scheduler() -> AsyncIOScheduler:
         next_run_time=datetime.now(),
     )
     logger.info("registered job id=%s", job.id)
+    register_crawler_jobs(scheduler)
     return scheduler
 
 

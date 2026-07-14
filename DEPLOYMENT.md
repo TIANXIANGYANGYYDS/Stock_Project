@@ -4,8 +4,8 @@
 
 ## 1. Python 版本
 
-- 建议 Python 3.10 或 3.11。
-- `akshare` 建议只在 Python 3.10 或 3.11 下安装。
+- 服务器使用 `MyAgent` Conda 环境，已验证 Python 3.13.12。
+- 执行命令前先确认 `python -V` 和 `which python` 指向该环境。
 
 ## 2. 先切到清华源
 
@@ -37,7 +37,10 @@ python -m pip install --upgrade pip setuptools wheel -i https://pypi.tuna.tsingh
 python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
   apscheduler \
   beautifulsoup4 \
+  httpx \
   motor \
+  pandas \
+  playwright \
   pydantic \
   pydantic-settings \
   pymongo \
@@ -49,11 +52,20 @@ python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
 这些包大致对应：
 
 - 调度：`apscheduler`
+- 东方财富行情页抓取：`playwright`（Chromium）
+- 行情表格整理和日期转换：`pandas`（不在本地计算指标或筹码）
 - HTML 解析：`beautifulsoup4`
 - MongoDB：`motor`、`pymongo`
 - 配置：`pydantic`、`pydantic-settings`、`python-dotenv`
-- 网络请求：`requests`
+- 异步网络请求：`httpx`
+- 其他现有爬虫的同步网络请求：`requests`
 - 测试：`pytest`
+
+安装 Python 依赖后，还需要在同一个 `MyAgent` 环境安装 Chromium：
+
+```bash
+python -m playwright install chromium
+```
 
 ## 5. 可选依赖
 
@@ -61,10 +73,9 @@ python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
 
 ```bash
 python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
-  pandas \
+  akshare \
   html5lib \
-  lxml \
-  akshare
+  lxml
 ```
 
 ## 6. 一次装完
@@ -73,14 +84,55 @@ python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
 
 ```bash
 python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
-  apscheduler beautifulsoup4 motor pydantic pydantic-settings pymongo python-dotenv requests pytest \
-  pandas html5lib lxml akshare
+  apscheduler beautifulsoup4 httpx motor pandas playwright pydantic pydantic-settings pymongo python-dotenv requests pytest \
+  akshare \
+  html5lib lxml
 ```
 
-## 7.以后每次进这个项目，本地只需要：
+然后执行：
 
 ```bash
-cd D:\study\shilv\Stock_Project
-.\Stock\Scripts\Activate.ps1
+python -m playwright install chromium
+```
+
+## 7. 服务器进入项目
+
+```bash
+conda activate MyAgent
+cd /home/txy/Agent_first/Stock_Project
 python -V
+which python
+```
+
+## 8. 验证单只股票行情页
+
+先用单股脚本验证页面、代理池、网页指标和网页筹码，不写 MongoDB：
+
+```bash
+python app/manually_execute_script/fetch_eastmoney_quote_page_daily_detail.py \
+  --code 002185 \
+  --start-date 20240101 \
+  --end-date 20260710
+```
+
+`002185` 的正确行情页地址是 `https://quote.eastmoney.com/sz002185.html`。爬虫先
+尝试本机 IP，失败后切换代理池；代理失败会被废弃并按 `max_retry` 获取新代理。
+严格模式下不会使用本地指标/筹码公式。抓取失败时，脚本会把页面运行时诊断保存
+到 `.local/logs/eastmoney_runtime_diagnostics_002185.json`。
+
+每日调度先从东方财富当日行情列表筛出确实有成交的股票，再抓取逐票网页数据。
+默认启动 50 个协程消费股票队列，但通过信号量把实际网页并发限制为 8；失败重试
+使用异步退避，不占用其他股票的执行机会。
+
+## 9. 启动 scheduler
+
+```bash
+./.local/bin/start_scheduler.sh
+tail -f .local/logs/scheduler.log
+```
+
+停止命令：
+
+```bash
+./.local/bin/stop_scheduler.sh
 ```

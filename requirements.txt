@@ -1,7 +1,10 @@
 # Core runtime dependencies
 apscheduler
 beautifulsoup4
+httpx
 motor
+pandas
+playwright
 pydantic
 pydantic-settings
 pymongo
@@ -12,7 +15,6 @@ requests
 pytest
 
 # Optional dependencies for manual A-share sector scripts
-pandas
+akshare
 html5lib
 lxml
-akshare
