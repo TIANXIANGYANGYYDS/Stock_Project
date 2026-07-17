@@ -3,6 +3,7 @@ from .crawler_jobs import (
     ensure_news_indexes,
     register_crawler_jobs,
     register_stock_daily_detail_job,
+    sync_stock_daily_detail_compensation_job,
     sync_stock_daily_detail_job,
 )
 
@@ -11,5 +12,6 @@ __all__ = (
     "ensure_news_indexes",
     "register_crawler_jobs",
     "register_stock_daily_detail_job",
+    "sync_stock_daily_detail_compensation_job",
     "sync_stock_daily_detail_job",
 )

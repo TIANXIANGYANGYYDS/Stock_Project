@@ -40,6 +40,10 @@ STOCK_DAILY_PAGE_CONCURRENCY = 12
 STOCK_DAILY_PROXY_MINUTES = 3
 STOCK_DAILY_PROXY_POOL_SIZE = 6
 STOCK_DAILY_PROXY_CONCURRENCY_PER_IP = 2
+STOCK_DAILY_RETRY_CONCURRENCY = 12
+STOCK_DAILY_RETRY_PAGE_CONCURRENCY = 6
+STOCK_DAILY_TOTAL_MAX_COMPENSATIONS = 3
+STOCK_DAILY_BROWSER_ERROR_EXTRA_COMPENSATIONS = 2
 STOCK_DAILY_TRADE_CALENDAR_LOOKBACK_DAYS = 90
 STOCK_DAILY_STARTUP_MIN_TIME = "16:00"
 
@@ -47,6 +51,18 @@ SYNC_STATUS_RUNNING = "running"
 SYNC_STATUS_SUCCESS = "success"
 SYNC_STATUS_PARTIAL_FAILED = "partial_failed"
 SYNC_STATUS_FAILED = "failed"
+
+BROWSER_RUNTIME_ERROR_TOKENS = (
+    "page.evaluate",
+    "execution context was destroyed",
+    "target page, context or browser has been closed",
+    "page crashed",
+)
+
+
+def _is_browser_runtime_error(error: str) -> bool:
+    normalized_error = error.lower()
+    return any(token in normalized_error for token in BROWSER_RUNTIME_ERROR_TOKENS)
 
 
 @dataclass(frozen=True)
@@ -963,7 +979,9 @@ class StockDailyDetailService:
             "connectionerror",
             "server disconnected",
         )
-        return any(token in normalized_error for token in retryable_tokens)
+        return any(token in normalized_error for token in retryable_tokens) or (
+            _is_browser_runtime_error(error)
+        )
 
     async def sync_one(
         self,
@@ -1247,8 +1265,17 @@ class StockDailyDetailService:
         start_date = str(source_run.get("start_date") or end_date)
         adjust = str(source_run.get("adjust") or "qfq")
 
+        retryable_items = [
+            item
+            for item in failed_items
+            if self._is_retryable_item_error(str(item.get("error") or ""))
+        ]
+        terminal_items = [item for item in failed_items if item not in retryable_items]
+        if not retryable_items:
+            raise ValueError(f"同步批次没有可自动重试的网络失败: {run_id}")
+
         self.ensure_indexes()
-        total = len(failed_items)
+        total = len(retryable_items)
         scope_key = f"retry:{run_id}"
         retry_run_id = self._build_run_id(
             target_trade_date=target_trade_date,
@@ -1270,53 +1297,33 @@ class StockDailyDetailService:
             parent_run_id=run_id,
         )
 
-        success_count = 0
-        failed_count = 0
-        affected_total = 0
-        retry_failed_items: list[dict[str, Any]] = []
-
-        for index, item in enumerate(failed_items, start=1):
-            code = self._normalize_code(item.get("code"))
-            name = item.get("name")
-
-            try:
-                affected = await self.sync_one(
-                    code=code,
-                    name=name,
-                    default_start_date=start_date,
-                    end_date=end_date,
-                    adjust=adjust,
-                    target_trade_date=target_trade_date,
-                )
-                success_count += 1
-                affected_total += affected
-                logger.info(
-                    "stock_daily_detail_retry_one_success index=%s/%s code=%s name=%s affected=%s",
-                    index,
-                    total,
-                    code,
-                    name,
-                    affected,
-                )
-            except Exception as exc:
-                failed_count += 1
-                retry_failed_items.append(
-                    {
-                        "code": code,
-                        "name": name,
-                        "error": (str(exc) or exc.__class__.__name__)[:1000],
-                    }
-                )
-                logger.exception(
-                    "stock_daily_detail_retry_one_failed index=%s/%s code=%s name=%s error=%s",
-                    index,
-                    total,
-                    code,
-                    name,
-                    repr(exc),
-                )
-
-            await self.crawler.sleep_after_request()
+        stock_rows = [
+            (index, self._normalize_code(item.get("code")), item.get("name"))
+            for index, item in enumerate(retryable_items, start=1)
+        ]
+        item_results = await self._sync_stock_rows(
+            stock_rows=stock_rows,
+            total=total,
+            default_start_date=start_date,
+            end_date=end_date,
+            adjust=adjust,
+            target_trade_date=target_trade_date,
+            retry_failed_once=False,
+        )
+        success_count = sum(item.error is None for item in item_results)
+        failed_count = total - success_count
+        affected_total = sum(
+            item.affected for item in item_results if item.error is None
+        )
+        retry_failed_items = [
+            {
+                "code": item.code,
+                "name": item.name,
+                "error": str(item.error)[:1000],
+            }
+            for item in item_results
+            if item.error is not None
+        ]
 
         status = self._decide_run_status(
             expected_count=total,
@@ -1337,7 +1344,74 @@ class StockDailyDetailService:
             failed_items=retry_failed_items,
         )
         self._finish_sync_run(result)
+        self._reconcile_source_run_after_retry(
+            source_run=source_run,
+            retry_result=result,
+            remaining_failed_items=[*terminal_items, *retry_failed_items],
+        )
         return result
+
+    def _reconcile_source_run_after_retry(
+        self,
+        *,
+        source_run: dict[str, Any],
+        retry_result: StockDailyDetailSyncResult,
+        remaining_failed_items: list[dict[str, Any]],
+    ) -> None:
+        """Update the original full-market run with the remaining failures."""
+
+        expected_count = int(source_run.get("expected_count") or 0)
+        success_count = min(
+            expected_count,
+            int(source_run.get("success_count") or 0) + retry_result.success_count,
+        )
+        failed_count = len(remaining_failed_items)
+        status = self._decide_run_status(
+            expected_count=expected_count,
+            success_count=success_count,
+            failed_count=failed_count,
+        )
+        now = now_cn()
+        updates: dict[str, Any] = {
+            "status": status,
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "affected_total": (
+                int(source_run.get("affected_total") or 0)
+                + retry_result.affected_total
+            ),
+            "failed_items": remaining_failed_items,
+            "last_retry_run_id": retry_result.run_id,
+            "last_compensated_at": now,
+            "updated_at": now,
+        }
+        if status == SYNC_STATUS_SUCCESS:
+            updates["completed_at"] = now
+            updates["automatic_retry_exhausted"] = False
+
+        self.sync_run_collection.update_one(
+            {"run_id": source_run["run_id"]},
+            {"$set": updates},
+        )
+
+    def find_latest_incomplete_full_run(
+        self,
+        *,
+        target_trade_date: str,
+        adjust: str = "qfq",
+    ) -> Optional[dict[str, Any]]:
+        return self.sync_run_collection.find_one(
+            {
+                "target_trade_date": target_trade_date,
+                "adjust": adjust,
+                "scope_key": "all",
+                "run_mode": {"$in": ["startup", "scheduled"]},
+                "status": {"$in": [SYNC_STATUS_PARTIAL_FAILED, SYNC_STATUS_FAILED]},
+                "failed_items.0": {"$exists": True},
+            },
+            projection={"_id": 0},
+            sort=[("started_at", -1)],
+        )
 
     def _stock_daily_key(
         self,
@@ -1622,5 +1696,149 @@ async def retry_failed_stock_daily_detail_run(
 
     try:
         return await service.retry_failed_run(run_id)
+    finally:
+        await service.close()
+
+
+async def retry_latest_incomplete_stock_daily_detail_run(
+    target_trade_date: str,
+    *,
+    adjust: str = "qfq",
+    max_automatic_compensations: int = STOCK_DAILY_TOTAL_MAX_COMPENSATIONS,
+) -> Optional[StockDailyDetailSyncResult]:
+    """Automatically retry only the remaining network failures for one day."""
+
+    service = StockDailyDetailService(
+        concurrency=STOCK_DAILY_RETRY_CONCURRENCY,
+        page_concurrency=STOCK_DAILY_RETRY_PAGE_CONCURRENCY,
+    )
+    try:
+        service.ensure_indexes()
+        source_run = service.find_latest_incomplete_full_run(
+            target_trade_date=target_trade_date,
+            adjust=adjust,
+        )
+        if source_run is None:
+            return None
+
+        run_id = str(source_run["run_id"])
+        compensation_count = int(
+            source_run.get("automatic_compensation_count") or 0
+        )
+        browser_retry_enabled = bool(
+            source_run.get("browser_runtime_retry_enabled")
+        ) or any(
+            _is_browser_runtime_error(str(item.get("error") or ""))
+            for item in source_run.get("failed_items") or []
+        )
+        allowed_compensations = max_automatic_compensations
+        if browser_retry_enabled:
+            allowed_compensations += STOCK_DAILY_BROWSER_ERROR_EXTRA_COMPENSATIONS
+            service.sync_run_collection.update_one(
+                {"run_id": run_id},
+                {
+                    "$set": {
+                        "browser_runtime_retry_enabled": True,
+                        "automatic_retry_exhausted": False,
+                        "updated_at": now_cn(),
+                    }
+                },
+            )
+
+        exhausted_without_browser_extension = (
+            source_run.get("automatic_retry_exhausted")
+            and not browser_retry_enabled
+        )
+        if exhausted_without_browser_extension or (
+            compensation_count >= allowed_compensations
+        ):
+            service.sync_run_collection.update_one(
+                {"run_id": run_id},
+                {
+                    "$set": {
+                        "automatic_retry_exhausted": True,
+                        "updated_at": now_cn(),
+                    }
+                },
+            )
+            logger.error(
+                "stock_daily_detail_automatic_retry_exhausted run_id=%s "
+                "target_trade_date=%s remaining=%s attempts=%s allowed_attempts=%s",
+                run_id,
+                target_trade_date,
+                len(source_run.get("failed_items") or []),
+                compensation_count,
+                allowed_compensations,
+            )
+            return None
+
+        try:
+            result = await service.retry_failed_run(run_id)
+        except ValueError as exc:
+            service.sync_run_collection.update_one(
+                {"run_id": run_id},
+                {
+                    "$set": {
+                        "automatic_retry_exhausted": True,
+                        "automatic_retry_stop_reason": str(exc),
+                        "updated_at": now_cn(),
+                    }
+                },
+            )
+            logger.error(
+                "stock_daily_detail_automatic_retry_stopped run_id=%s error=%s",
+                run_id,
+                str(exc),
+            )
+            return None
+
+        next_count = compensation_count + 1
+        source_after_retry = service.sync_run_collection.find_one(
+            {"run_id": run_id},
+            projection={"_id": 0, "status": 1, "failed_count": 1},
+        ) or {}
+        exhausted = (
+            source_after_retry.get("status") != SYNC_STATUS_SUCCESS
+            and next_count >= allowed_compensations
+        )
+        service.sync_run_collection.update_one(
+            {"run_id": run_id},
+            {
+                "$set": {
+                    "automatic_compensation_count": next_count,
+                    "automatic_retry_exhausted": exhausted,
+                    "updated_at": now_cn(),
+                }
+            },
+        )
+        if exhausted:
+            logger.error(
+                "stock_daily_detail_automatic_retry_exhausted run_id=%s "
+                "target_trade_date=%s remaining=%s attempts=%s allowed_attempts=%s",
+                run_id,
+                target_trade_date,
+                source_after_retry.get("failed_count"),
+                next_count,
+                allowed_compensations,
+            )
+        return result
+    finally:
+        await service.close()
+
+
+async def stock_daily_detail_has_incomplete_sync_run(
+    target_trade_date: str,
+    adjust: str = "qfq",
+) -> bool:
+    service = StockDailyDetailService()
+    try:
+        service.ensure_indexes()
+        return (
+            service.find_latest_incomplete_full_run(
+                target_trade_date=target_trade_date,
+                adjust=adjust,
+            )
+            is not None
+        )
     finally:
         await service.close()

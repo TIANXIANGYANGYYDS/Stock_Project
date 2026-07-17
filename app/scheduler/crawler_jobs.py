@@ -170,6 +170,88 @@ async def sync_stock_daily_detail_job(*, run_mode: str = "scheduled") -> None:
         await _run_stock_daily_detail_job(run_mode=run_mode)
 
 
+async def sync_stock_daily_detail_compensation_job(
+    *,
+    target_scope: str,
+    max_automatic_compensations: int,
+) -> None:
+    """Retry only remaining network failures without overlapping the main job."""
+
+    lock = _get_stock_daily_job_lock()
+    if lock.locked():
+        logger.warning(
+            "sync_stock_daily_detail_compensation_skipped target_scope=%s "
+            "reason=job_already_running",
+            target_scope,
+        )
+        return
+
+    async with lock:
+        await _run_stock_daily_detail_compensation_job(
+            target_scope=target_scope,
+            max_automatic_compensations=max_automatic_compensations,
+        )
+
+
+async def _run_stock_daily_detail_compensation_job(
+    *,
+    target_scope: str,
+    max_automatic_compensations: int,
+) -> None:
+    from app.services.stock_daily_detail_service import (
+        STOCK_DAILY_DEFAULT_ADJUST,
+        resolve_a_stock_target_trade_date,
+        retry_latest_incomplete_stock_daily_detail_run,
+    )
+
+    if target_scope == "today":
+        reference_yyyymmdd = today_yyyymmdd()
+    elif target_scope == "previous":
+        reference_yyyymmdd = previous_day_yyyymmdd(today_yyyymmdd())
+    else:
+        raise ValueError(f"unsupported compensation target_scope: {target_scope}")
+
+    decision = await resolve_a_stock_target_trade_date(reference_yyyymmdd)
+    logger.info(
+        "sync_stock_daily_detail_compensation_start target_scope=%s "
+        "target_trade_date=%s max_automatic_compensations=%s",
+        target_scope,
+        decision.target_trade_date,
+        max_automatic_compensations,
+    )
+    try:
+        result = await retry_latest_incomplete_stock_daily_detail_run(
+            decision.target_trade_date,
+            adjust=STOCK_DAILY_DEFAULT_ADJUST,
+            max_automatic_compensations=max_automatic_compensations,
+        )
+        if result is None:
+            logger.info(
+                "sync_stock_daily_detail_compensation_skipped target_scope=%s "
+                "target_trade_date=%s reason=no_retryable_incomplete_run",
+                target_scope,
+                decision.target_trade_date,
+            )
+            return
+        logger.info(
+            "sync_stock_daily_detail_compensation_finished target_scope=%s "
+            "target_trade_date=%s run_id=%s status=%s success=%s failed=%s",
+            target_scope,
+            decision.target_trade_date,
+            result.run_id,
+            result.status,
+            result.success_count,
+            result.failed_count,
+        )
+    except Exception:
+        logger.exception(
+            "sync_stock_daily_detail_compensation_failed target_scope=%s "
+            "target_trade_date=%s",
+            target_scope,
+            decision.target_trade_date,
+        )
+
+
 async def _run_stock_daily_detail_job(*, run_mode: str) -> None:
     """
     执行股票详细日线同步。
@@ -193,10 +275,12 @@ async def _run_stock_daily_detail_job(*, run_mode: str) -> None:
             STOCK_DAILY_DEFAULT_END_DATE,
             STOCK_DAILY_DEFAULT_LIMIT,
             STOCK_DAILY_DEFAULT_ONLY_CODE,
+            STOCK_DAILY_TOTAL_MAX_COMPENSATIONS,
             STOCK_DAILY_STARTUP_MIN_TIME,
             resolve_a_stock_target_trade_date,
             run_stock_daily_detail_sync,
             stock_daily_detail_has_successful_sync_run,
+            stock_daily_detail_has_incomplete_sync_run,
         )
 
         reference_yyyymmdd = STOCK_DAILY_DEFAULT_END_DATE or today_yyyymmdd()
@@ -268,7 +352,19 @@ async def _run_stock_daily_detail_job(*, run_mode: str) -> None:
             )
             return
 
-        await run_stock_daily_detail_sync(
+        has_incomplete_run = await stock_daily_detail_has_incomplete_sync_run(
+            trade_date_decision.target_trade_date,
+            adjust,
+        )
+        if has_incomplete_run:
+            await _run_immediate_stock_daily_detail_compensations(
+                target_trade_date=trade_date_decision.target_trade_date,
+                adjust=adjust,
+                max_automatic_compensations=STOCK_DAILY_TOTAL_MAX_COMPENSATIONS,
+            )
+            return
+
+        result = await run_stock_daily_detail_sync(
             start_date=start_date,
             end_date=end_date,
             adjust=adjust,
@@ -278,10 +374,61 @@ async def _run_stock_daily_detail_job(*, run_mode: str) -> None:
             target_trade_date=trade_date_decision.target_trade_date,
             concurrency=concurrency,
         )
+        if result.failed_count:
+            await _run_immediate_stock_daily_detail_compensations(
+                target_trade_date=trade_date_decision.target_trade_date,
+                adjust=adjust,
+                max_automatic_compensations=STOCK_DAILY_TOTAL_MAX_COMPENSATIONS,
+            )
     except Exception:
         logger.exception("sync_stock_daily_detail_job_failed")
     finally:
         logger.info("sync_stock_daily_detail_job_finished")
+
+
+async def _run_immediate_stock_daily_detail_compensations(
+    *,
+    target_trade_date: str,
+    adjust: str,
+    max_automatic_compensations: int,
+) -> None:
+    """Immediately retry each remaining network-failure batch."""
+
+    from app.services.stock_daily_detail_service import (
+        STOCK_DAILY_BROWSER_ERROR_EXTRA_COMPENSATIONS,
+        retry_latest_incomplete_stock_daily_detail_run,
+    )
+
+    max_immediate_rounds = (
+        max_automatic_compensations
+        + STOCK_DAILY_BROWSER_ERROR_EXTRA_COMPENSATIONS
+    )
+    for attempt in range(1, max_immediate_rounds + 1):
+        result = await retry_latest_incomplete_stock_daily_detail_run(
+            target_trade_date,
+            adjust=adjust,
+            max_automatic_compensations=max_automatic_compensations,
+        )
+        if result is None:
+            logger.info(
+                "sync_stock_daily_detail_immediate_compensation_stopped "
+                "target_trade_date=%s attempt=%s reason=no_retryable_failure_or_exhausted",
+                target_trade_date,
+                attempt,
+            )
+            return
+
+        logger.info(
+            "sync_stock_daily_detail_immediate_compensation_finished "
+            "target_trade_date=%s attempt=%s run_id=%s success=%s failed=%s",
+            target_trade_date,
+            attempt,
+            result.run_id,
+            result.success_count,
+            result.failed_count,
+        )
+        if result.failed_count == 0:
+            return
 
 
 def register_stock_daily_detail_job(
@@ -324,6 +471,34 @@ def register_stock_daily_detail_job(
     )
     logger.info("registered job id=%s", startup_job.id)
 
+    from app.services.stock_daily_detail_service import (
+        STOCK_DAILY_TOTAL_MAX_COMPENSATIONS,
+    )
+
+    compensation_jobs = (
+        (15, 30, "previous", STOCK_DAILY_TOTAL_MAX_COMPENSATIONS, "audit_1530"),
+    )
+    for hour, minute, target_scope, max_compensations, suffix in compensation_jobs:
+        compensation_job = scheduler.add_job(
+            sync_stock_daily_detail_compensation_job,
+            trigger=CronTrigger(
+                hour=hour,
+                minute=minute,
+                timezone="Asia/Shanghai",
+            ),
+            kwargs={
+                "target_scope": target_scope,
+                "max_automatic_compensations": max_compensations,
+            },
+            id=f"sync_stock_daily_detail_{suffix}",
+            name="补偿股票详细日线失败数据",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=60 * 30,
+        )
+        logger.info("registered job id=%s", compensation_job.id)
+
 
 def register_crawler_jobs(
     scheduler: AsyncIOScheduler,
@@ -333,7 +508,9 @@ def register_crawler_jobs(
 
     目前注册：
     - 股票详细日线启动立即同步任务；
-    - 股票详细日线每天 16:30 同步任务。
+    - 股票详细日线每天 16:30 同步任务；
+    - 主批次失败后立即补偿剩余网络失败项；
+    - 每天 15:30 上一交易日缺口审计。
 
     新闻 3 分钟抓取任务仍在 scheduler_app.build_scheduler 中注册，因为它是现有主
     任务，这里只追加新的爬虫类任务。

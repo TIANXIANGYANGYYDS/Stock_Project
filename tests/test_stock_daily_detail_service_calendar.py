@@ -358,3 +358,191 @@ def test_sync_queue_retries_only_network_failures_once(monkeypatch) -> None:
     assert results[0].error is None
     assert results[1].error is None
     assert results[2].error == "page chip unavailable"
+
+
+def test_retry_failed_run_uses_queue_and_reconciles_source(monkeypatch) -> None:
+    daily_service = service.StockDailyDetailService(
+        concurrency=4,
+        page_concurrency=2,
+        request_sleep_seconds=0,
+    )
+    source_run = {
+        "run_id": "source-run",
+        "target_trade_date": "2026-07-14",
+        "start_date": "20260714",
+        "end_date": "20260714",
+        "adjust": "qfq",
+        "expected_count": 3,
+        "success_count": 0,
+        "failed_count": 3,
+        "affected_total": 0,
+        "failed_items": [
+            {"code": "000001", "name": "股票1", "error": "page timeout"},
+            {"code": "000002", "name": "股票2", "error": "net::ERR_FAILED"},
+            {"code": "000003", "name": "股票3", "error": "page chip unavailable"},
+        ],
+    }
+    updates = []
+    captured = {}
+
+    class FakeRunCollection:
+        def find_one(self, query, **kwargs):
+            return dict(source_run) if query.get("run_id") == "source-run" else None
+
+        def update_one(self, query, update, **kwargs):
+            updates.append((query, update))
+
+    async def fake_sync_stock_rows(**kwargs):
+        captured.update(kwargs)
+        return [
+            service.StockDailyDetailItemResult(
+                index=1,
+                total=2,
+                code="000001",
+                name="股票1",
+                affected=1,
+            ),
+            service.StockDailyDetailItemResult(
+                index=2,
+                total=2,
+                code="000002",
+                name="股票2",
+                error="page timeout",
+            ),
+        ]
+
+    daily_service.sync_run_collection = FakeRunCollection()
+    monkeypatch.setattr(daily_service, "ensure_indexes", lambda: None)
+    monkeypatch.setattr(daily_service, "_build_run_id", lambda **kwargs: "retry-run")
+    monkeypatch.setattr(daily_service, "_sync_stock_rows", fake_sync_stock_rows)
+
+    async def run_test():
+        try:
+            return await daily_service.retry_failed_run("source-run")
+        finally:
+            await daily_service.close()
+
+    result = asyncio.run(run_test())
+
+    assert result.expected_count == 2
+    assert result.success_count == 1
+    assert result.failed_count == 1
+    assert captured["retry_failed_once"] is False
+    assert [row[1] for row in captured["stock_rows"]] == ["000001", "000002"]
+    source_update = next(
+        update["$set"]
+        for query, update in updates
+        if query == {"run_id": "source-run"} and "last_retry_run_id" in update["$set"]
+    )
+    assert source_update["status"] == service.SYNC_STATUS_PARTIAL_FAILED
+    assert source_update["success_count"] == 1
+    assert source_update["failed_count"] == 2
+    assert [item["code"] for item in source_update["failed_items"]] == [
+        "000003",
+        "000002",
+    ]
+
+
+def test_automatic_retry_stops_at_compensation_limit(monkeypatch) -> None:
+    updates = []
+
+    class FakeService:
+        def __init__(self, **kwargs):
+            self.sync_run_collection = self
+
+        def ensure_indexes(self):
+            pass
+
+        def find_latest_incomplete_full_run(self, **kwargs):
+            return {
+                "run_id": "source-run",
+                "failed_items": [{"code": "000001", "error": "page timeout"}],
+                "automatic_compensation_count": 2,
+            }
+
+        def update_one(self, query, update):
+            updates.append((query, update))
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(service, "StockDailyDetailService", FakeService)
+
+    result = asyncio.run(
+        service.retry_latest_incomplete_stock_daily_detail_run(
+            "2026-07-14",
+            max_automatic_compensations=2,
+        )
+    )
+
+    assert result is None
+    assert updates[0][0] == {"run_id": "source-run"}
+    assert updates[0][1]["$set"]["automatic_retry_exhausted"] is True
+
+
+def test_browser_runtime_error_is_retryable() -> None:
+    assert service.StockDailyDetailService._is_retryable_item_error(
+        "Error('Page.evaluate: Object')"
+    )
+    assert service.StockDailyDetailService._is_retryable_item_error(
+        "Execution context was destroyed"
+    )
+    assert not service.StockDailyDetailService._is_retryable_item_error(
+        "行情页响应异常: status=404"
+    )
+
+
+def test_browser_runtime_error_gets_two_extra_compensations(monkeypatch) -> None:
+    updates = []
+
+    class FakeService:
+        def __init__(self, **kwargs):
+            self.sync_run_collection = self
+
+        def ensure_indexes(self):
+            pass
+
+        def find_latest_incomplete_full_run(self, **kwargs):
+            return {
+                "run_id": "source-run",
+                "failed_items": [
+                    {"code": "000001", "error": "Error('Page.evaluate: Object')"}
+                ],
+                "automatic_compensation_count": 3,
+                "automatic_retry_exhausted": True,
+            }
+
+        async def retry_failed_run(self, run_id):
+            return service.StockDailyDetailSyncResult(
+                run_id="retry-run",
+                target_trade_date="2026-07-14",
+                adjust="qfq",
+                run_mode="retry",
+                scope_key="retry:source-run",
+                expected_count=1,
+                failed_count=1,
+                status=service.SYNC_STATUS_FAILED,
+            )
+
+        def find_one(self, query, projection=None):
+            return {"status": service.SYNC_STATUS_FAILED, "failed_count": 1}
+
+        def update_one(self, query, update):
+            updates.append((query, update))
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(service, "StockDailyDetailService", FakeService)
+
+    result = asyncio.run(
+        service.retry_latest_incomplete_stock_daily_detail_run(
+            "2026-07-14",
+            max_automatic_compensations=3,
+        )
+    )
+
+    assert result is not None
+    assert updates[0][1]["$set"]["browser_runtime_retry_enabled"] is True
+    assert updates[-1][1]["$set"]["automatic_compensation_count"] == 4
+    assert updates[-1][1]["$set"]["automatic_retry_exhausted"] is False
