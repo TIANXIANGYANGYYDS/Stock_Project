@@ -257,7 +257,7 @@ async def _run_stock_daily_detail_job(*, run_mode: str) -> None:
     执行股票详细日线同步。
 
     run_mode=scheduled:
-        每天 16:30 执行，只同步目标交易日。
+        每天 15:30 执行，只同步目标交易日。
 
     run_mode=startup:
         scheduler 启动后立即执行一次。若参考日期是交易日且当前时间早于
@@ -435,18 +435,18 @@ def register_stock_daily_detail_job(
     scheduler: AsyncIOScheduler,
 ) -> None:
     """
-    注册 16:30 股票详细日线同步任务。
+    注册 15:30 股票详细日线同步任务。
     """
 
     job = scheduler.add_job(
         sync_stock_daily_detail_job,
         trigger=CronTrigger(
-            hour=16,
+            hour=15,
             minute=30,
             timezone="Asia/Shanghai",
         ),
         kwargs={"run_mode": "scheduled"},
-        id="sync_stock_daily_detail_1630",
+        id="sync_stock_daily_detail_1530",
         name="同步股票详细日线数据",
         replace_existing=True,
         max_instances=1,
@@ -476,7 +476,7 @@ def register_stock_daily_detail_job(
     )
 
     compensation_jobs = (
-        (15, 30, "previous", STOCK_DAILY_TOTAL_MAX_COMPENSATIONS, "audit_1530"),
+        (15, 20, "previous", STOCK_DAILY_TOTAL_MAX_COMPENSATIONS, "audit_1520"),
     )
     for hour, minute, target_scope, max_compensations, suffix in compensation_jobs:
         compensation_job = scheduler.add_job(
@@ -508,9 +508,9 @@ def register_crawler_jobs(
 
     目前注册：
     - 股票详细日线启动立即同步任务；
-    - 股票详细日线每天 16:30 同步任务；
+    - 股票详细日线每天 15:30 同步任务；
     - 主批次失败后立即补偿剩余网络失败项；
-    - 每天 15:30 上一交易日缺口审计。
+    - 每天 15:20 上一交易日缺口审计。
 
     新闻 3 分钟抓取任务仍在 scheduler_app.build_scheduler 中注册，因为它是现有主
     任务，这里只追加新的爬虫类任务。

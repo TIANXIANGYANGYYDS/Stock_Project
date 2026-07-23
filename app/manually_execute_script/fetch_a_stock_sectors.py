@@ -33,7 +33,7 @@ except ImportError as e:
 
 from app.crawlers.proxy_provider import (
     ProxyProvider,
-    ShanchenProxyProvider,
+    DailiProxyProvider,
     get_required_proxies,
 )
 
@@ -94,7 +94,7 @@ class AkshareRequestsProxyPatch:
         def patched_request(session, method, url, **kwargs):
             url_text = str(url)
 
-            if "shanchendaili.com" in url_text or "sch.shanchendaili.com" in url_text:
+            if "bapi.51daili.com" in url_text:
                 return original_request(session, method, url, **kwargs)
 
             if provider is None:
@@ -953,8 +953,8 @@ def main() -> None:
     parser.add_argument(
         "--proxy-minutes",
         type=int,
-        default=1,
-        help="闪臣代理 IP 有效分钟数，默认 1",
+        default=3,
+        help="51代理 IP 固定有效3分钟",
     )
     parser.add_argument(
         "--retry",
@@ -1041,7 +1041,7 @@ def main() -> None:
         provider = None
         print("[Proxy] 本次不使用代理池")
     else:
-        provider = ShanchenProxyProvider(minutes=args.proxy_minutes)
+        provider = DailiProxyProvider(minutes=args.proxy_minutes)
         print("[Proxy] 本次使用代理池")
 
     fetched = fetch_ths_industry_boards(

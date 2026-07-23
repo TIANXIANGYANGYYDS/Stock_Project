@@ -14,15 +14,14 @@ import pytest
 from app.crawlers import stock_daily_detail_crawler as crawler_module
 from app.crawlers import proxy_provider as proxy_module
 from app.crawlers.proxy_provider import (
-    AsyncShanchenProxyPool,
-    AsyncShanchenProxyProvider,
+    AsyncDailiProxyPool,
+    AsyncDailiProxyProvider,
     ProxyEndpoint,
-    ShanchenProxyProvider,
+    DailiProxyProvider,
 )
 from app.crawlers.stock_daily_detail_crawler import (
     EastMoneyDataFetcher,
     EastMoneyQuotePageFetcher,
-    LocalQuoteCircuitBreaker,
     NonRetryablePageError,
     StockDailyDetailCrawler,
 )
@@ -49,7 +48,7 @@ def build_daily_df(periods: int = 2) -> pd.DataFrame:
     dataframe.attrs.update(
         {
             "source": EastMoneyQuotePageFetcher.SOURCE,
-            "page_url": EastMoneyQuotePageFetcher.get_quote_url("000049"),
+            "page_url": EastMoneyQuotePageFetcher.get_daily_page_url("000049"),
             "network": "proxy",
             "indicator_source": EastMoneyQuotePageFetcher.RUNTIME_SOURCE,
             "chip_source": EastMoneyQuotePageFetcher.RUNTIME_SOURCE,
@@ -99,20 +98,44 @@ def build_daily_df(periods: int = 2) -> pd.DataFrame:
 
 
 def test_quote_page_urls_match_eastmoney_routes() -> None:
-    assert EastMoneyQuotePageFetcher.get_quote_url("002185") == (
-        "https://quote.eastmoney.com/sz002185.html"
-    )
     assert EastMoneyQuotePageFetcher.get_concept_url("002185") == (
         "https://quote.eastmoney.com/concept/sz002185.html#chart-k-cyq"
     )
-    assert EastMoneyQuotePageFetcher.get_quote_url("600000").endswith("/sh600000.html")
-    assert EastMoneyQuotePageFetcher.get_quote_url("920992").endswith("/bj920992.html")
     assert EastMoneyQuotePageFetcher.get_daily_page_url("002185") == (
-        "https://quote.eastmoney.com/sz002185.html"
+        "https://quote.eastmoney.com/concept/sz002185.html#chart-k-cyq"
+    )
+    assert EastMoneyQuotePageFetcher.get_daily_page_url("600000") == (
+        "https://quote.eastmoney.com/concept/sh600000.html#chart-k-cyq"
     )
     assert EastMoneyQuotePageFetcher.get_daily_page_url("920992") == (
         "https://quote.eastmoney.com/concept/bj920992.html#chart-k-cyq"
     )
+
+
+def test_quote_page_route_only_blocks_heavy_assets() -> None:
+    class FakeRoute:
+        def __init__(self, resource_type: str) -> None:
+            self.request = SimpleNamespace(resource_type=resource_type)
+            self.action = None
+
+        async def abort(self) -> None:
+            self.action = "abort"
+
+        async def continue_(self) -> None:
+            self.action = "continue"
+
+    async def run_test() -> None:
+        for resource_type in ("image", "media", "font"):
+            route = FakeRoute(resource_type)
+            await EastMoneyQuotePageFetcher._abort_heavy_assets(route)
+            assert route.action == "abort"
+
+        for resource_type in ("document", "script", "xhr", "fetch"):
+            route = FakeRoute(resource_type)
+            await EastMoneyQuotePageFetcher._abort_heavy_assets(route)
+            assert route.action == "continue"
+
+    asyncio.run(run_test())
 
 
 def test_kline_lines_to_daily_df_matches_quote_page_schema() -> None:
@@ -233,7 +256,7 @@ class NonRetryableFakeQuotePageFetcher:
         pass
 
 
-def test_daily_history_uses_local_ip_then_rotates_proxy(monkeypatch) -> None:
+def test_daily_history_rotates_proxy_without_local_request(monkeypatch) -> None:
     provider = FakeProxyProvider()
     page_fetcher = FakeQuotePageFetcher(fail_proxy_count=1)
     crawler = StockDailyDetailCrawler(
@@ -257,7 +280,6 @@ def test_daily_history_uses_local_ip_then_rotates_proxy(monkeypatch) -> None:
     dataframe = asyncio.run(run_test())
 
     assert page_fetcher.calls == [
-        None,
         {"http": "http://127.0.0.1:8001", "https": "http://127.0.0.1:8001"},
         {"http": "http://127.0.0.1:8002", "https": "http://127.0.0.1:8002"},
     ]
@@ -266,7 +288,7 @@ def test_daily_history_uses_local_ip_then_rotates_proxy(monkeypatch) -> None:
     assert dataframe.attrs["source"] == EastMoneyQuotePageFetcher.SOURCE
 
 
-def test_non_retryable_page_error_does_not_switch_proxy_or_trip_circuit() -> None:
+def test_non_retryable_page_error_keeps_proxy() -> None:
     provider = FakeProxyProvider()
     page_fetcher = NonRetryableFakeQuotePageFetcher()
     crawler = StockDailyDetailCrawler(
@@ -286,35 +308,6 @@ def test_non_retryable_page_error_does_not_switch_proxy_or_trip_circuit() -> Non
 
     asyncio.run(run_test())
 
-    assert page_fetcher.calls == [None]
-    assert provider.proxy_index == 0
-    assert provider.failures == []
-    assert crawler.local_circuit_breaker.retry_after == 0
-
-
-def test_non_retryable_page_data_error_keeps_proxy() -> None:
-    provider = FakeProxyProvider()
-    page_fetcher = NonRetryableFakeQuotePageFetcher()
-    circuit_breaker = LocalQuoteCircuitBreaker()
-    circuit_breaker.mark_failure(300)
-    crawler = StockDailyDetailCrawler(
-        max_retry=2,
-        proxy_provider=provider,
-        quote_page_fetcher=page_fetcher,
-        local_circuit_breaker=circuit_breaker,
-    )
-
-    async def run_test() -> None:
-        try:
-            with pytest.raises(NonRetryablePageError):
-                await crawler.fetch_stock_daily_hist(
-                    "920680", "20260713", "20260713"
-                )
-        finally:
-            await crawler.close()
-
-    asyncio.run(run_test())
-
     assert len(page_fetcher.calls) == 1
     assert page_fetcher.calls[0] is not None
     assert provider.proxy_index == 1
@@ -322,10 +315,9 @@ def test_non_retryable_page_data_error_keeps_proxy() -> None:
     assert provider.failures == []
 
 
-def test_concurrent_crawlers_only_run_one_local_probe() -> None:
+def test_concurrent_crawlers_always_use_proxy() -> None:
     provider = FakeProxyProvider()
     page_fetcher = FakeQuotePageFetcher()
-    circuit_breaker = LocalQuoteCircuitBreaker()
     semaphore = asyncio.Semaphore(5)
     crawlers = [
         StockDailyDetailCrawler(
@@ -333,7 +325,6 @@ def test_concurrent_crawlers_only_run_one_local_probe() -> None:
             proxy_provider=provider,
             quote_page_fetcher=page_fetcher,
             page_semaphore=semaphore,
-            local_circuit_breaker=circuit_breaker,
         )
         for _ in range(5)
     ]
@@ -357,7 +348,7 @@ def test_concurrent_crawlers_only_run_one_local_probe() -> None:
 
     asyncio.run(run_test())
 
-    assert page_fetcher.calls.count(None) == 1
+    assert page_fetcher.calls.count(None) == 0
     assert len([proxies for proxies in page_fetcher.calls if proxies]) == 5
 
 
@@ -365,9 +356,9 @@ def test_async_proxy_is_reused_until_failure_or_expiry(monkeypatch) -> None:
     monkeypatch.setattr(
         proxy_module,
         "Settings",
-        lambda: SimpleNamespace(proxy_api_key="test-key"),
+        lambda: SimpleNamespace(proxy_51_api_url="http://example.test/getip?time=5&qty=1"),
     )
-    provider = AsyncShanchenProxyProvider(minutes=1)
+    provider = AsyncDailiProxyProvider(minutes=3)
     extraction_count = 0
 
     async def fake_fetch_endpoint() -> ProxyEndpoint:
@@ -401,24 +392,31 @@ def test_proxy_api_count_and_multi_endpoint_json(monkeypatch) -> None:
     monkeypatch.setattr(
         proxy_module,
         "Settings",
-        lambda: SimpleNamespace(proxy_api_key="test-key"),
+        lambda: SimpleNamespace(
+            proxy_51_api_url=(
+                "http://example.test/getip?linePoolIndex=1&packid=22&time=5"
+                "&qty=1&port=1&format=json&dt=2&dtc=5&pid=p&rid=r&uid=1"
+            )
+        ),
     )
-    provider = ShanchenProxyProvider(minutes=1, count=4)
+    provider = DailiProxyProvider(minutes=3, count=4)
     query = parse_qs(urlparse(provider._build_api_url()).query)
     endpoints = provider._extract_endpoints_from_json(
         {
-            "count": "4",
-            "status": "0",
-            "list": [
-                {"sever": "127.0.0.1", "port": 8001, "net_type": 2},
-                {"sever": "127.0.0.1", "port": 8002, "net_type": 2},
-                {"sever": "127.0.0.1", "port": 8003, "net_type": 2},
-                {"sever": "127.0.0.1", "port": 8004, "net_type": 2},
+            "code": 0,
+            "success": "true",
+            "data": [
+                {"ip": "127.0.0.1", "port": "8001"},
+                {"ip": "127.0.0.1", "port": "8002"},
+                {"ip": "127.0.0.1", "port": "8003"},
+                {"ip": "127.0.0.1", "port": "8004"},
             ],
         }
     )
 
-    assert query["count"] == ["4"]
+    assert query["qty"] == ["4"]
+    assert query["time"] == ["5"]
+    assert query["dt"] == ["2"]
     assert [endpoint.port for endpoint in endpoints] == [8001, 8002, 8003, 8004]
 
 
@@ -426,10 +424,10 @@ def test_proxy_pool_limits_each_ip_to_two_pages_and_refills(monkeypatch) -> None
     monkeypatch.setattr(
         proxy_module,
         "Settings",
-        lambda: SimpleNamespace(proxy_api_key="test-key"),
+        lambda: SimpleNamespace(proxy_51_api_url="http://example.test/getip?time=5&qty=1"),
     )
-    provider = AsyncShanchenProxyPool(
-        minutes=1,
+    provider = AsyncDailiProxyPool(
+        minutes=3,
         pool_size=4,
         max_concurrency_per_proxy=2,
     )
@@ -488,6 +486,57 @@ def test_proxy_pool_limits_each_ip_to_two_pages_and_refills(monkeypatch) -> None
             await provider.close()
 
     asyncio.run(run_test())
+
+
+def test_51daili_proxy_pool_builds_api_url_and_parses_response(monkeypatch) -> None:
+    monkeypatch.setattr(
+        proxy_module,
+        "Settings",
+        lambda: SimpleNamespace(
+            proxy_51_api_url=(
+                "http://example.test/getip?linePoolIndex=1&packid=22&time=5"
+                "&qty=1&port=1&format=json&dt=2&dtc=5&pid=p&rid=r&uid=1"
+            )
+        ),
+    )
+    provider = AsyncDailiProxyPool(minutes=3, pool_size=2)
+
+    try:
+        query = parse_qs(urlparse(provider._build_api_url()).query)
+        endpoints = provider._extract_endpoints_from_json(
+            {
+                "code": 0,
+                "success": True,
+                "data": [
+                    {"ip": "127.0.0.1", "port": 8001},
+                    {"ip": "127.0.0.2", "port": "8002"},
+                ],
+            }
+        )
+
+        assert query["packid"] == ["22"]
+        assert query["time"] == ["5"]
+        assert query["qty"] == ["2"]
+        assert query["format"] == ["json"]
+        assert query["pid"] == ["p"]
+        assert query["rid"] == ["r"]
+        assert [endpoint.display() for endpoint in endpoints] == [
+            "127.0.0.1:8001",
+            "127.0.0.2:8002",
+        ]
+    finally:
+        asyncio.run(provider.close())
+
+
+def test_51daili_proxy_pool_rejects_non_fixed_duration(monkeypatch) -> None:
+    monkeypatch.setattr(
+        proxy_module,
+        "Settings",
+        lambda: SimpleNamespace(proxy_51_api_url="http://example.test/getip?time=5"),
+    )
+
+    with pytest.raises(ValueError, match="固定有效3分钟"):
+        AsyncDailiProxyPool(minutes=4)
 
 
 def test_page_values_are_saved_without_local_fill(monkeypatch) -> None:

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Protocol
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 import requests
@@ -13,6 +14,7 @@ from app.core.config import Settings
 
 
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 class ProxyUnavailableError(RuntimeError):
@@ -50,18 +52,36 @@ class AsyncProxyProvider(Protocol):
 
 
 class AsyncRequestRateLimiter:
-    def __init__(self, max_calls_per_second: float = 3.0) -> None:
+    def __init__(self, max_calls_per_second: float = 10.0) -> None:
         if max_calls_per_second <= 0:
             raise ValueError("max_calls_per_second 必须大于 0")
         self._interval_seconds = 1.0 / max_calls_per_second
-        self._lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None
         self._next_allowed_at = 0.0
 
     async def acquire(self) -> None:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
         async with self._lock:
             delay = self._next_allowed_at - time.monotonic()
             if delay > 0:
                 await asyncio.sleep(delay)
+            self._next_allowed_at = time.monotonic() + self._interval_seconds
+
+
+class RequestRateLimiter:
+    def __init__(self, max_calls_per_second: float = 10.0) -> None:
+        if max_calls_per_second <= 0:
+            raise ValueError("max_calls_per_second 必须大于 0")
+        self._interval_seconds = 1.0 / max_calls_per_second
+        self._lock = threading.Lock()
+        self._next_allowed_at = 0.0
+
+    def acquire(self) -> None:
+        with self._lock:
+            delay = self._next_allowed_at - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
             self._next_allowed_at = time.monotonic() + self._interval_seconds
 
 
@@ -89,12 +109,15 @@ class ProxyEndpoint:
         return f"{self.host}:{self.port}"
 
 
-class ShanchenProxyProvider:
-    API_BASE_URL = "https://sch.shanchendaili.com/api.html"
+class DailiProxyProvider:
+    """51代理同步提供器；API 模板中仅 qty 参数会被覆盖。"""
+
+    IP_TTL_MINUTES = 3
+    _api_rate_limiter = RequestRateLimiter(max_calls_per_second=10.0)
 
     def __init__(
         self,
-        minutes: int,
+        minutes: int = IP_TTL_MINUTES,
         *,
         count: int = 1,
         timeout: int = 10,
@@ -103,23 +126,20 @@ class ShanchenProxyProvider:
         if not isinstance(minutes, int):
             raise TypeError("minutes 必须是 int 类型")
 
-        if minutes <= 0:
-            raise ValueError("minutes 必须大于 0")
+        if minutes != self.IP_TTL_MINUTES:
+            raise ValueError("51代理 IP 固定有效3分钟，minutes 必须为 3")
         if not isinstance(count, int):
             raise TypeError("count 必须是 int 类型")
         if not 1 <= count <= 200:
             raise ValueError("count 必须在 1 到 200 之间")
 
-        key = Settings().proxy_api_key.strip()
-
-        if not key:
-            raise ValueError(
-                "未配置闪臣代理 key，请检查 .local/env/.env 中的 PROXY_API_KEY"
-            )
+        api_url = Settings().proxy_51_api_url.strip()
+        if not api_url:
+            raise ValueError("未配置51代理 API，请设置 PROXY_51_API_URL")
 
         self.minutes = minutes
         self.count = count
-        self.key = key
+        self.api_url = api_url
         self.timeout = timeout
         self.refresh_before_seconds = refresh_before_seconds
 
@@ -130,53 +150,30 @@ class ShanchenProxyProvider:
 
     def _build_api_url(self, *, count: Optional[int] = None) -> str:
         """
-        拼接固定参数后的 API URL。
-
-        只允许 time 由 minutes 控制，key 从环境变量读取。
+        保留配置 URL 的全部参数，仅覆盖 qty。
         """
         request_count = self.count if count is None else count
         if not 1 <= request_count <= 200:
             raise ValueError("count 必须在 1 到 200 之间")
-        params = {
-            "action": "get_ip",
-            "key": self.key,
-            "time": self.minutes,
-            "count": request_count,
-            "type": "json",
-            # "province": 215,
-            # "city": 215,
-            "only": 1,
-        }
-        return f"{self.API_BASE_URL}?{urlencode(params)}"
+        parts = urlsplit(self.api_url)
+        params = dict(parse_qsl(parts.query, keep_blank_values=True))
+        params["qty"] = str(request_count)
+        return urlunsplit(
+            (parts.scheme, parts.netloc, parts.path, urlencode(params), parts.fragment)
+        )
 
     def _extract_endpoints_from_json(self, data: Any) -> List[ProxyEndpoint]:
         """
-        解析闪臣普通 get_ip JSON 返回。
-
-        文档示例：
-
-        {
-            "count": "1",
-            "status": "0",
-            "list": [
-                {
-                    "sever": "114.104.100.60",
-                    "port": 9700,
-                    "net_type": 2
-                }
-            ]
-        }
+        解析51代理 timeip/getip JSON 返回。
         """
         if not isinstance(data, dict):
             return []
 
-        status = str(data.get("status", "")).strip()
-        if status and status != "0":
-            info = data.get("info", "未知错误")
-            print(f"[代理池] 代理接口返回失败 status={status}, info={info}")
+        if data.get("code") != 0:
+            print(f"[代理池] 51代理接口返回失败: {data.get('msg', data)}")
             return []
 
-        items = data.get("list")
+        items = data.get("data")
         if not isinstance(items, list) or not items:
             print(f"[代理池] JSON 中没有可用 list: {data}")
             return []
@@ -188,16 +185,10 @@ class ShanchenProxyProvider:
                 print(f"[代理池] list[{index}] 格式异常: {item}")
                 continue
 
-            host = (
-                item.get("sever")
-                or item.get("server")
-                or item.get("ip")
-                or item.get("IP")
-                or item.get("host")
-            )
+            host = item.get("ip")
             port = item.get("port") or item.get("Port")
             if not host or not port:
-                print(f"[代理池] list[{index}] 中未找到 sever/port: {item}")
+                print(f"[代理池] data[{index}] 中未找到 ip/port: {item}")
                 continue
 
             try:
@@ -224,6 +215,7 @@ class ShanchenProxyProvider:
         api_url = self._build_api_url()
 
         try:
+            self._api_rate_limiter.acquire()
             resp = requests.get(api_url, timeout=self.timeout)
             resp.raise_for_status()
 
@@ -247,7 +239,7 @@ class ShanchenProxyProvider:
             return endpoint
 
         except Exception as e:
-            print(f"[代理池] 获取代理失败: {repr(e)}")
+            print(f"[代理池] 获取代理失败: {type(e).__name__}")
             self.last_endpoint = None
             return None
 
@@ -310,7 +302,7 @@ class ShanchenProxyProvider:
         获取 requests 可用的 proxies。
 
         - 有可用当前代理：复用
-        - 没有可用当前代理：从闪臣 API 提取新的
+        - 没有可用当前代理：从51代理 API 提取新的
         - 提取失败：返回 None
         """
         if self._is_current_proxy_valid():
@@ -352,7 +344,7 @@ class ShanchenProxyProvider:
         self._clear_current_proxy()
 
 
-class AsyncShanchenProxyProvider(ShanchenProxyProvider):
+class AsyncDailiProxyProvider(DailiProxyProvider):
     """Async proxy provider used by coroutine-based page crawlers."""
 
     def __init__(
@@ -374,18 +366,20 @@ class AsyncShanchenProxyProvider(ShanchenProxyProvider):
             timeout=timeout,
             trust_env=False,
         )
-        self._lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None
         self._rate_limiter = rate_limiter or AsyncRequestRateLimiter()
 
     async def _fetch_proxy_endpoint_async(self) -> Optional[ProxyEndpoint]:
         api_url = self._build_api_url()
         try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._api_rate_limiter.acquire)
             await self._rate_limiter.acquire()
             response = await self._client.get(api_url)
             response.raise_for_status()
             data = response.json()
         except Exception as exc:
-            logger.warning("proxy_endpoint_fetch_failed error=%s", repr(exc))
+            logger.warning("proxy_endpoint_fetch_failed error=%s", type(exc).__name__)
             self.last_endpoint = None
             return None
 
@@ -397,6 +391,8 @@ class AsyncShanchenProxyProvider(ShanchenProxyProvider):
         return endpoint
 
     async def get_requests_proxies(self) -> Optional[Dict[str, str]]:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
         async with self._lock:
             if self._is_current_proxy_valid():
                 assert self.current_endpoint is not None
@@ -460,8 +456,8 @@ class ProxyPoolStats:
     max_in_flight: int = 0
 
 
-class AsyncShanchenProxyPool(ShanchenProxyProvider):
-    """Batch-fetched proxy pool with bounded concurrency per endpoint."""
+class AsyncDailiProxyPool(DailiProxyProvider):
+    """51代理批量 IP 池，每个 IP 的并发数受控。"""
 
     def __init__(
         self,
@@ -486,11 +482,17 @@ class AsyncShanchenProxyPool(ShanchenProxyProvider):
         self.pool_size = pool_size
         self.max_concurrency_per_proxy = max_concurrency_per_proxy
         self._client = httpx.AsyncClient(timeout=timeout, trust_env=False)
-        self._condition = asyncio.Condition()
+        self._condition_instance: Optional[asyncio.Condition] = None
         self._rate_limiter = rate_limiter or AsyncRequestRateLimiter()
         self._slots: List[_ProxyPoolSlot] = []
         self._fetching = False
         self.stats = ProxyPoolStats()
+
+    @property
+    def _condition(self) -> asyncio.Condition:
+        if self._condition_instance is None:
+            self._condition_instance = asyncio.Condition()
+        return self._condition_instance
 
     def _slot_expire_at(self) -> float:
         usable_ttl_seconds = max(
@@ -530,12 +532,18 @@ class AsyncShanchenProxyPool(ShanchenProxyProvider):
         self.stats.api_request_count += 1
         self.stats.requested_endpoint_count += count
         try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._api_rate_limiter.acquire)
             await self._rate_limiter.acquire()
             response = await self._client.get(self._build_api_url(count=count))
             response.raise_for_status()
             data = response.json()
         except Exception as exc:
-            logger.warning("proxy_pool_fetch_failed count=%s error=%s", count, repr(exc))
+            logger.warning(
+                "proxy_pool_fetch_failed count=%s error=%s",
+                count,
+                type(exc).__name__,
+            )
             return []
 
         endpoints = self._extract_endpoints_from_json(data)
@@ -744,15 +752,7 @@ def request_with_proxy(
 
 
 if __name__ == "__main__":
-    """
-    Linux / macOS:
-        export SHANCHEN_PROXY_KEY="你的闪臣key"
-
-    Windows PowerShell:
-        $env:SHANCHEN_PROXY_KEY="你的闪臣key"
-    """
-
-    provider = ShanchenProxyProvider(minutes=1)
+    provider = DailiProxyProvider(minutes=3)
 
     quick_test_proxy(provider)
 

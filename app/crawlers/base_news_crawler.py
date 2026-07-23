@@ -11,7 +11,7 @@ from typing import Any, ClassVar
 import requests
 
 from app.models import FetchedNews
-from app.crawlers.proxy_provider import ShanchenProxyProvider, quick_test_proxy
+from app.crawlers.proxy_provider import DailiProxyProvider, quick_test_proxy
 
 
 CN_TZ = timezone(timedelta(hours=8))
@@ -111,7 +111,7 @@ class BaseNewsCrawler:
         self,
         *,
         timeout: int = 15,
-        proxy_minutes: int = 1,
+        proxy_minutes: int = 3,
         proxy_retry_times: int = 3,
     ) -> None:
         self.timeout = timeout
@@ -162,7 +162,7 @@ class BaseNewsCrawler:
         return False
     
 
-    def get_proxy_from_provider(self, provider: ShanchenProxyProvider) -> dict[str, str]:
+    def get_proxy_from_provider(self, provider: DailiProxyProvider) -> dict[str, str]:
         proxies = provider.get_requests_proxies()
 
         if proxies is None:
@@ -237,7 +237,7 @@ class BaseNewsCrawler:
         except NewsCrawlerError as e:
             print(f"[WARN] 本地 IP 解析异常，准备切换代理池: {e}")
 
-        provider = ShanchenProxyProvider(minutes=self.proxy_minutes)
+        provider = DailiProxyProvider(minutes=self.proxy_minutes)
 
         try:
             quick_test_proxy(provider)
@@ -570,7 +570,7 @@ class BaseNewsCrawler:
         except NewsCrawlerError as e:
             print(f"[WARN] 本地 IP 解析异常，准备切换代理池: {e}")
 
-        provider = ShanchenProxyProvider(minutes=self.proxy_minutes)
+        provider = DailiProxyProvider(minutes=self.proxy_minutes)
 
         try:
             quick_test_proxy(provider)

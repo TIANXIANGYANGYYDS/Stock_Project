@@ -89,6 +89,39 @@ class Jin10NewsCrawler(BaseNewsCrawler):
         items: list[dict] = []
         seen: set[tuple[str | None, str, str]] = set()
 
+        # 新版首页的服务端渲染结果不再给快讯正文包裹详情页链接，而是把
+        # flash id 放在容器 id 中，例如 flash20260723122707671800。
+        for node in soup.select(".jin-flash-item-container[id^='flash']"):
+            flash_id = node.get("id", "")[len("flash"):]
+            if not flash_id.isdigit():
+                continue
+
+            block_text = self.clean_page_text(node.get_text(" ", strip=True))
+            time_match = re.match(r"(\d{2}:\d{2}:\d{2})\s+", block_text)
+            if not time_match or "解锁VIP快讯" in block_text:
+                continue
+
+            news_time = time_match.group(1)
+            summary = block_text[time_match.end():].strip()
+            if len(summary) < 8:
+                continue
+
+            detail_url = f"{self.detail_base}/detail/{flash_id}"
+            dedup_key = (news_time, summary[:100], detail_url)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            items.append(
+                {
+                    "time": news_time,
+                    "summary": summary[:120].strip(),
+                    "detail_url": detail_url,
+                }
+            )
+
+        if items:
+            return items
+
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
 

@@ -33,7 +33,7 @@ class Settings(BaseSettings):
         alias="LLM_WORKER_BATCH_SIZE",
     )
     llm_worker_idle_sleep_seconds: float = Field(
-        default=5,
+        default=180,
         alias="LLM_WORKER_IDLE_SLEEP_SECONDS",
     )
     llm_worker_error_sleep_seconds: float = Field(
@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     mongo_db_name: str = Field(default="stock_project", alias="MONGO_DB_NAME")
 
     # Proxy
-    proxy_api_key: str = Field(default="", alias="PROXY_API_KEY")
+    proxy_51_api_url: str = Field(default="", alias="PROXY_51_API_URL")
 
     # Log
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")

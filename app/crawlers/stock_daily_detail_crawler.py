@@ -17,7 +17,7 @@ import pandas as pd
 from app.crawlers.proxy_provider import (
     AsyncProxyProvider,
     AsyncRequestRateLimiter,
-    AsyncShanchenProxyProvider,
+    AsyncDailiProxyPool,
     get_required_async_proxies,
 )
 from app.models.stock_daily_detail import (
@@ -405,45 +405,11 @@ class EastMoneyQuotePageFetcher:
 
     SOURCE = "eastmoney.quote_page"
     RUNTIME_SOURCE = "eastmoney.quote_page.runtime"
-    LOCAL_TIMEOUT_MS = 20_000
-    PROXY_TIMEOUT_MS = 20_000
-    LOCAL_TOTAL_TIMEOUT_SECONDS = 55
-    PROXY_TOTAL_TIMEOUT_SECONDS = 50
+    LOCAL_TIMEOUT_MS = 75_000
+    PROXY_TIMEOUT_MS = 175_000
+    LOCAL_TOTAL_TIMEOUT_SECONDS = 100
+    PROXY_TOTAL_TIMEOUT_SECONDS = 180
     ADJUST_LABELS = {"qfq": "前复权", "hfq": "后复权", "": "不复权"}
-    CHART_HOOK = r"""
-        (() => {
-          window.__eastmoneyCharts = [];
-          const wrap = (value) => {
-            if (!value || typeof value !== "object" || value.__stockCrawlerHooked) {
-              return value;
-            }
-            if (typeof value.k === "function" && !value.k.__stockCrawlerHooked) {
-              const OriginalChart = value.k;
-              const WrappedChart = function(...args) {
-                const chart = new OriginalChart(...args);
-                window.__eastmoneyCharts.push(chart);
-                return chart;
-              };
-              WrappedChart.prototype = OriginalChart.prototype;
-              Object.defineProperty(WrappedChart, "__stockCrawlerHooked", {value: true});
-              value.k = WrappedChart;
-            }
-            try {
-              Object.defineProperty(value, "__stockCrawlerHooked", {value: true});
-            } catch (_) {}
-            return value;
-          };
-          let quoteKChart;
-          try {
-            Object.defineProperty(window, "quotekchart", {
-              configurable: true,
-              get() { return quoteKChart; },
-              set(value) { quoteKChart = wrap(value); }
-            });
-          } catch (_) {}
-        })();
-    """
-
     CONCEPT_HOOK = r"""
         (() => {
           const capture = window.__eastmoneyConceptCapture = {
@@ -735,10 +701,6 @@ class EastMoneyQuotePageFetcher:
         return f"{market}{normalized_code}"
 
     @classmethod
-    def get_quote_url(cls, code: str) -> str:
-        return f"https://quote.eastmoney.com/{cls.get_symbol(code)}.html"
-
-    @classmethod
     def get_concept_url(cls, code: str) -> str:
         return (
             f"https://quote.eastmoney.com/concept/{cls.get_symbol(code)}.html"
@@ -747,9 +709,7 @@ class EastMoneyQuotePageFetcher:
 
     @classmethod
     def get_daily_page_url(cls, code: str) -> str:
-        if cls.get_symbol(code).startswith("bj"):
-            return cls.get_concept_url(code)
-        return cls.get_quote_url(code)
+        return cls.get_concept_url(code)
 
     @staticmethod
     def _raise_for_page_response(url: str, response: Any, label: str) -> None:
@@ -850,92 +810,14 @@ class EastMoneyQuotePageFetcher:
 
     @staticmethod
     async def _abort_heavy_assets(route: Any) -> None:
-        if route.request.resource_type in {"image", "media", "font"}:
-            await route.abort()
-        else:
-            await route.continue_()
-
-    async def _fetch_standard_daily_data(
-        self,
-        context: Any,
-        *,
-        code: str,
-        adjust: str,
-        timeout_ms: int,
-        record_response: Callable[[Any], None],
-    ) -> pd.DataFrame:
-        page = await context.new_page()
-        await page.route("**/*", self._abort_heavy_assets)
-        page.on("response", record_response)
-        page.set_default_timeout(timeout_ms)
-        url = self.get_quote_url(code)
-        response = await page.goto(
-            url,
-            wait_until="commit",
-            timeout=timeout_ms,
-        )
-        self._raise_for_page_response(url, response, "行情页")
-
-        await page.wait_for_function(
-            """
-            () => window.__eastmoneyCharts && window.__eastmoneyCharts.some(
-              chart => chart && chart.data && chart.data.k && chart.data.k.length
-            )
-            """,
-            timeout=timeout_ms,
-        )
-        adjust_label = self.ADJUST_LABELS[adjust]
-        current_label = (await page.locator(".kfq_t").inner_text()).strip()
-        if current_label != adjust_label:
-            changed = await page.evaluate(
-                """
-                label => {
-                  const links = Array.from(document.querySelectorAll('.kfq ul li a'));
-                  const target = links.find(link => link.textContent.trim() === label);
-                  if (!target) return false;
-                  target.click();
-                  return true;
-                }
-                """,
-                adjust_label,
-            )
-            if not changed:
-                raise RuntimeError(f"行情页未找到复权选项: {adjust_label}")
-            await page.wait_for_function(
-                "label => document.querySelector('.kfq_t')?.textContent.trim() === label",
-                arg=adjust_label,
-                timeout=timeout_ms,
-            )
-            await page.wait_for_timeout(500)
-
-        rows = await page.evaluate(
-            """
-            async timeoutMs => {
-              const charts = window.__eastmoneyCharts || [];
-              const chart = [...charts].reverse().find(
-                item => item && item.data && item.data.k && item.data.k.length
-              );
-              if (!chart || typeof chart.getOneAllData !== 'function') {
-                throw new Error('未找到东方财富日 K 图表对象');
-              }
-              await Promise.race([
-                chart.getOneAllData(),
-                new Promise((_, reject) => setTimeout(
-                  () => reject(new Error('获取全量日 K 超时')), timeoutMs
-                ))
-              ]);
-              const rows = chart.full_data && chart.full_data.data;
-              if (!Array.isArray(rows) || !rows.length) {
-                throw new Error('东方财富行情页全量日 K 为空');
-              }
-              return rows;
-            }
-            """,
-            timeout_ms,
-        )
-        if not all(isinstance(row, str) for row in rows):
-            raise RuntimeError("东方财富行情页日 K 数据格式不是字符串数组")
-        return EastMoneyDataFetcher._kline_lines_to_daily_df(rows, code=code)
+        try:
+            if route.request.resource_type in {"image", "media", "font"}:
+                await route.abort()
+            else:
+                await route.continue_()
+        except Exception:
+            # A timed-out page can close while Playwright is dispatching a route.
+            return
 
     async def fetch_kline(
         self,
@@ -949,7 +831,6 @@ class EastMoneyQuotePageFetcher:
         if adjust not in self.ADJUST_LABELS:
             raise ValueError(f"unsupported adjust value: {adjust!r}")
         normalized_code = str(code).strip().zfill(6)
-        is_bse = self.get_symbol(normalized_code).startswith("bj")
         start = pd.to_datetime(start_date, format="%Y%m%d", errors="raise").date()
         end = pd.to_datetime(end_date, format="%Y%m%d", errors="raise").date()
         if start > end:
@@ -978,14 +859,13 @@ class EastMoneyQuotePageFetcher:
 
         context = await browser.new_context(**context_options)
         diagnostics: Dict[str, Any] = {
-            "quote_url": self.get_quote_url(normalized_code),
-            "concept_url": self.get_concept_url(normalized_code),
             "daily_page_url": self.get_daily_page_url(normalized_code),
             "network": "proxy" if proxy_server else "local",
             "responses": [],
         }
         indicator_rows: Dict[str, Dict[str, Any]] = {}
         chip_rows: Dict[str, Dict[str, Any]] = {}
+        concept_page: Any = None
 
         def record_response(response: Any) -> None:
             if len(diagnostics["responses"]) >= 300:
@@ -1000,19 +880,7 @@ class EastMoneyQuotePageFetcher:
 
         try:
             async with asyncio.timeout(total_timeout_seconds):
-                await context.add_init_script(self.CHART_HOOK)
                 await context.add_init_script(self.CONCEPT_HOOK)
-                daily_all: Optional[pd.DataFrame] = None
-                if not is_bse:
-                    daily_all = await self._fetch_standard_daily_data(
-                        context,
-                        code=normalized_code,
-                        adjust=adjust,
-                        timeout_ms=timeout_ms,
-                        record_response=record_response,
-                    )
-                    diagnostics["daily_row_count"] = len(daily_all)
-
                 concept_page = await context.new_page()
                 await concept_page.route("**/*", self._abort_heavy_assets)
                 concept_page.on("response", record_response)
@@ -1036,6 +904,33 @@ class EastMoneyQuotePageFetcher:
                 """,
                     timeout=timeout_ms,
                 )
+                adjust_label = self.ADJUST_LABELS[adjust]
+                current_label = (
+                    await concept_page.locator(".chart_cfq .t").inner_text()
+                ).strip()
+                if current_label != adjust_label:
+                    changed = await concept_page.evaluate(
+                        """
+                        label => {
+                          const target = Array.from(
+                            document.querySelectorAll('.chart_cfq li')
+                          ).find(item => item.textContent.trim() === label);
+                          if (!target) return false;
+                          target.click();
+                          return true;
+                        }
+                        """,
+                        adjust_label,
+                    )
+                    if not changed:
+                        raise RuntimeError(f"概念页未找到复权选项: {adjust_label}")
+                    await concept_page.wait_for_function(
+                        "label => document.querySelector('.chart_cfq .t')"
+                        "?.textContent.trim() === label",
+                        arg=adjust_label,
+                        timeout=timeout_ms,
+                    )
+                    await concept_page.wait_for_timeout(500)
                 runtime = await concept_page.evaluate(
                     self.CONCEPT_RUNTIME_JS,
                     {
@@ -1046,27 +941,26 @@ class EastMoneyQuotePageFetcher:
                 )
                 indicator_rows = runtime.get("indicatorRows") or {}
                 chip_rows = runtime.get("chipRows") or {}
-                if is_bse:
-                    daily_all = self._concept_daily_rows_to_df(
-                        runtime.get("dailyRows") or [],
-                        code=normalized_code,
-                    )
-                    diagnostics["daily_row_count"] = len(daily_all)
+                daily_all = self._concept_daily_rows_to_df(
+                    runtime.get("dailyRows") or [],
+                    code=normalized_code,
+                )
+                diagnostics["daily_row_count"] = len(daily_all)
                 diagnostics["runtime"] = runtime.get("diagnostics") or {}
                 self.last_runtime_diagnostics = diagnostics
 
                 if self.strict_page_indicators and not any(indicator_rows.values()):
-                    raise NonRetryablePageError(
+                    raise RuntimeError(
                         "东方财富网页运行时未解析到技术指标；已禁止本地计算。"
                         "请调用 dump_last_runtime_diagnostics() 保存诊断。"
                     )
                 if self.strict_page_chip and not chip_rows:
-                    raise NonRetryablePageError(
+                    raise RuntimeError(
                         "东方财富网页运行时未解析到筹码详情/筹码图；已禁止本地计算。"
                         "请调用 dump_last_runtime_diagnostics() 保存诊断。"
                     )
                 if daily_all is None or daily_all.empty:
-                    raise NonRetryablePageError(
+                    raise RuntimeError(
                         "东方财富网页运行时未解析到基础日 K 数据"
                     )
         except Exception as exc:
@@ -1074,10 +968,20 @@ class EastMoneyQuotePageFetcher:
             self.last_runtime_diagnostics = diagnostics
             raise
         finally:
+            if concept_page is not None:
+                try:
+                    await concept_page.unroute_all(behavior="ignoreErrors")
+                except Exception:
+                    pass
             await context.close()
 
         mask = (daily_all["日期"] >= start) & (daily_all["日期"] <= end)
         result = daily_all.loc[mask].reset_index(drop=True)
+        if result.empty:
+            raise NonRetryablePageError(
+                "东方财富网页在指定日期范围内没有日 K 数据: "
+                f"code={normalized_code}, start={start}, end={end}"
+            )
         result.attrs.update(
             {
                 "source": self.SOURCE,
@@ -1093,35 +997,9 @@ class EastMoneyQuotePageFetcher:
         return result
 
 
-class LocalQuoteCircuitBreaker:
-    def __init__(self) -> None:
-        self.retry_after = 0.0
-        self.local_verified = False
-        self.failure_generation = 0
-        self.probe_lock = asyncio.Lock()
-
-    def can_try_local(self) -> bool:
-        return time.monotonic() >= self.retry_after
-
-    def can_use_verified_local(self) -> bool:
-        return self.local_verified and self.can_try_local()
-
-    def mark_success(self, failure_generation: int) -> None:
-        if failure_generation != self.failure_generation:
-            return
-        self.local_verified = True
-        self.retry_after = 0.0
-
-    def mark_failure(self, cooldown_seconds: float) -> None:
-        self.local_verified = False
-        self.failure_generation += 1
-        self.retry_after = time.monotonic() + cooldown_seconds
-
-
 class StockDailyDetailCrawler:
     """Fetch stock daily details from EastMoney page output only."""
 
-    LOCAL_RETRY_COOLDOWN_SECONDS = 300
     INDICATOR_COLUMNS = (
         "ma5",
         "ma10",
@@ -1158,10 +1036,9 @@ class StockDailyDetailCrawler:
         request_sleep_seconds: float = 0.5,
         max_retry: int = 3,
         proxy_provider: Optional[AsyncProxyProvider] = None,
-        proxy_minutes: int = 1,
+        proxy_minutes: int = 3,
         quote_page_fetcher: Optional[EastMoneyQuotePageFetcher] = None,
         page_semaphore: Optional[asyncio.Semaphore] = None,
-        local_circuit_breaker: Optional[LocalQuoteCircuitBreaker] = None,
         proxy_rate_limiter: Optional[AsyncRequestRateLimiter] = None,
         *,
         strict_page_indicators: bool = True,
@@ -1179,7 +1056,6 @@ class StockDailyDetailCrawler:
             strict_page_chip=strict_page_chip,
         )
         self.page_semaphore = page_semaphore or asyncio.Semaphore(1)
-        self.local_circuit_breaker = local_circuit_breaker or LocalQuoteCircuitBreaker()
         self.proxy_rate_limiter = proxy_rate_limiter or AsyncRequestRateLimiter()
 
     async def close(self) -> None:
@@ -1191,8 +1067,9 @@ class StockDailyDetailCrawler:
 
     def _get_proxy_provider(self) -> AsyncProxyProvider:
         if self.proxy_provider is None:
-            self.proxy_provider = AsyncShanchenProxyProvider(
+            self.proxy_provider = AsyncDailiProxyPool(
                 minutes=self.proxy_minutes,
+                pool_size=1,
                 rate_limiter=self.proxy_rate_limiter,
             )
         return self.proxy_provider
@@ -1330,67 +1207,6 @@ class StockDailyDetailCrawler:
         adjust: str = "qfq",
     ) -> pd.DataFrame:
         normalized_code = self._normalize_code(code)
-        local_attempted = False
-        local_error: Optional[Exception] = None
-        local_probe_owner = False
-        try_local = self.local_circuit_breaker.can_use_verified_local()
-        if not try_local and self.local_circuit_breaker.can_try_local():
-            await self.local_circuit_breaker.probe_lock.acquire()
-            if self.local_circuit_breaker.can_use_verified_local():
-                self.local_circuit_breaker.probe_lock.release()
-                try_local = True
-            elif self.local_circuit_breaker.can_try_local():
-                local_probe_owner = True
-                try_local = True
-            else:
-                self.local_circuit_breaker.probe_lock.release()
-
-        if try_local:
-            local_attempted = True
-            failure_generation = self.local_circuit_breaker.failure_generation
-            try:
-                async with self.page_semaphore:
-                    dataframe = await self.quote_page_fetcher.fetch_kline(
-                        code=normalized_code,
-                        start_date=start_date,
-                        end_date=end_date,
-                        adjust=adjust,
-                    )
-                    if dataframe.empty:
-                        raise RuntimeError("行情页在指定日期范围内没有日 K 数据")
-                self.local_circuit_breaker.mark_success(failure_generation)
-                return dataframe
-            except NonRetryablePageError:
-                raise
-            except Exception as exc:
-                local_error = exc
-                self.local_circuit_breaker.mark_failure(
-                    self.LOCAL_RETRY_COOLDOWN_SECONDS
-                )
-            finally:
-                if local_probe_owner:
-                    self.local_circuit_breaker.probe_lock.release()
-
-        if local_attempted:
-            logger.warning(
-                "eastmoney_quote_page_local_failed code=%s error=%s "
-                "switch=proxy local_retry_after_seconds=%s",
-                normalized_code,
-                repr(local_error),
-                self.LOCAL_RETRY_COOLDOWN_SECONDS,
-            )
-        else:
-            retry_after_seconds = max(
-                0.0,
-                self.local_circuit_breaker.retry_after - time.monotonic(),
-            )
-            logger.info(
-                "eastmoney_quote_page_local_skipped code=%s reason=cooldown "
-                "retry_after_seconds=%.1f",
-                normalized_code,
-                retry_after_seconds,
-            )
-
         last_error: Optional[Exception] = None
         for attempt in range(1, self.max_retry + 1):
             proxies: Optional[Dict[str, str]] = None
@@ -1430,8 +1246,8 @@ class StockDailyDetailCrawler:
                     await asyncio.sleep(sleep_seconds)
 
         raise RuntimeError(
-            "eastmoney quote page failed after local request and "
-            f"{self.max_retry} proxy attempts, code={normalized_code}, "
+            f"eastmoney quote page failed after {self.max_retry} proxy attempts, "
+            f"code={normalized_code}, "
             f"error={last_error!r}"
         )
 

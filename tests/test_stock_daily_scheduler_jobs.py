@@ -17,14 +17,16 @@ def test_registers_main_and_automatic_compensation_jobs() -> None:
 
     jobs = {kwargs["id"]: kwargs for _, kwargs in registered}
     assert set(jobs) == {
-        "sync_stock_daily_detail_1630",
+        "sync_stock_daily_detail_1530",
         "sync_stock_daily_detail_startup",
-        "sync_stock_daily_detail_audit_1530",
+        "sync_stock_daily_detail_audit_1520",
     }
-    assert jobs["sync_stock_daily_detail_audit_1530"]["kwargs"] == {
+    assert jobs["sync_stock_daily_detail_audit_1520"]["kwargs"] == {
         "target_scope": "previous",
-        "max_automatic_compensations": 3,
+        "max_automatic_compensations": 5,
     }
+    assert jobs["sync_stock_daily_detail_1530"]["trigger"].fields[5].expressions[0].first == 15
+    assert jobs["sync_stock_daily_detail_1530"]["trigger"].fields[6].expressions[0].first == 30
 
 
 def test_main_job_compensates_existing_incomplete_run(monkeypatch) -> None:
@@ -80,7 +82,7 @@ def test_main_job_compensates_existing_incomplete_run(monkeypatch) -> None:
     assert calls == [
         (
             ("2026-07-14",),
-            {"adjust": "qfq", "max_automatic_compensations": 3},
+            {"adjust": "qfq", "max_automatic_compensations": 5},
         )
     ]
 
@@ -166,6 +168,6 @@ def test_new_partial_run_is_compensated_immediately(monkeypatch) -> None:
         {
             "target_trade_date": "2026-07-14",
             "adjust": "qfq",
-            "max_automatic_compensations": 3,
+            "max_automatic_compensations": 5,
         }
     ]

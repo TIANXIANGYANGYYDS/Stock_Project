@@ -16,11 +16,10 @@ from pymongo.database import Database
 from app.core.config import get_settings
 from app.crawlers.proxy_provider import (
     AsyncRequestRateLimiter,
-    AsyncShanchenProxyPool,
+    AsyncDailiProxyPool,
 )
 from app.crawlers.stock_daily_detail_crawler import (
     EastMoneyQuotePageFetcher,
-    LocalQuoteCircuitBreaker,
     StockDailyDetailCrawler,
 )
 from app.models.stock_daily_detail import CN_TZ, StockDailyDetail, now_cn
@@ -35,14 +34,14 @@ STOCK_DAILY_DEFAULT_LIMIT: Optional[int] = None
 STOCK_DAILY_DEFAULT_ONLY_CODE: Optional[str] = None
 STOCK_DAILY_REQUEST_SLEEP_SECONDS = 0.5
 STOCK_DAILY_MAX_RETRY = 2
-STOCK_DAILY_DEFAULT_CONCURRENCY = 50
-STOCK_DAILY_PAGE_CONCURRENCY = 12
+STOCK_DAILY_DEFAULT_CONCURRENCY = 80
+STOCK_DAILY_PAGE_CONCURRENCY = 80
 STOCK_DAILY_PROXY_MINUTES = 3
-STOCK_DAILY_PROXY_POOL_SIZE = 6
-STOCK_DAILY_PROXY_CONCURRENCY_PER_IP = 2
-STOCK_DAILY_RETRY_CONCURRENCY = 12
-STOCK_DAILY_RETRY_PAGE_CONCURRENCY = 6
-STOCK_DAILY_TOTAL_MAX_COMPENSATIONS = 3
+STOCK_DAILY_PROXY_POOL_SIZE = 80
+STOCK_DAILY_PROXY_CONCURRENCY_PER_IP = 1
+STOCK_DAILY_RETRY_CONCURRENCY = 80
+STOCK_DAILY_RETRY_PAGE_CONCURRENCY = 80
+STOCK_DAILY_TOTAL_MAX_COMPENSATIONS = 5
 STOCK_DAILY_BROWSER_ERROR_EXTRA_COMPENSATIONS = 2
 STOCK_DAILY_TRADE_CALENDAR_LOOKBACK_DAYS = 90
 STOCK_DAILY_STARTUP_MIN_TIME = "16:00"
@@ -334,7 +333,7 @@ class StockDailyDetailService:
             if proxy_concurrency_per_ip is not None
             else STOCK_DAILY_PROXY_CONCURRENCY_PER_IP
         )
-        self.proxy_rate_limiter = AsyncRequestRateLimiter(max_calls_per_second=3.0)
+        self.proxy_rate_limiter = AsyncRequestRateLimiter(max_calls_per_second=10.0)
         self.proxy_pool_stats_history: list[dict[str, int]] = []
 
         self.crawler = StockDailyDetailCrawler(
@@ -826,14 +825,13 @@ class StockDailyDetailService:
             active_page_capacity + self.proxy_concurrency_per_ip - 1
         ) // self.proxy_concurrency_per_ip
         proxy_pool_size = min(self.proxy_pool_size, max(1, required_proxy_count))
-        shared_proxy_provider = AsyncShanchenProxyPool(
+        shared_proxy_provider = AsyncDailiProxyPool(
             minutes=self.proxy_minutes,
             pool_size=proxy_pool_size,
             max_concurrency_per_proxy=self.proxy_concurrency_per_ip,
             rate_limiter=self.proxy_rate_limiter,
         )
         page_semaphore = asyncio.Semaphore(self.page_concurrency)
-        local_circuit_breaker = LocalQuoteCircuitBreaker()
         crawler_count = min(self.page_concurrency * 2, len(stock_rows))
         crawlers = [
             StockDailyDetailCrawler(
@@ -842,7 +840,6 @@ class StockDailyDetailService:
                 proxy_provider=shared_proxy_provider,
                 quote_page_fetcher=shared_fetcher,
                 page_semaphore=page_semaphore,
-                local_circuit_breaker=local_circuit_breaker,
                 proxy_rate_limiter=self.proxy_rate_limiter,
             )
             for _ in range(crawler_count)
@@ -972,15 +969,13 @@ class StockDailyDetailService:
     @staticmethod
     def _is_retryable_item_error(error: str) -> bool:
         normalized_error = error.lower()
-        retryable_tokens = (
-            "timeout",
-            "proxyunavailableerror",
-            "net::err_",
-            "connectionerror",
-            "server disconnected",
-        )
-        return any(token in normalized_error for token in retryable_tokens) or (
-            _is_browser_runtime_error(error)
+        return not any(
+            token in normalized_error
+            for token in (
+                "status=404",
+                "status=410",
+                "指定日期范围内没有日 k 数据",
+            )
         )
 
     async def sync_one(
@@ -1731,9 +1726,7 @@ async def retry_latest_incomplete_stock_daily_detail_run(
             _is_browser_runtime_error(str(item.get("error") or ""))
             for item in source_run.get("failed_items") or []
         )
-        allowed_compensations = max_automatic_compensations
         if browser_retry_enabled:
-            allowed_compensations += STOCK_DAILY_BROWSER_ERROR_EXTRA_COMPENSATIONS
             service.sync_run_collection.update_one(
                 {"run_id": run_id},
                 {
@@ -1744,33 +1737,6 @@ async def retry_latest_incomplete_stock_daily_detail_run(
                     }
                 },
             )
-
-        exhausted_without_browser_extension = (
-            source_run.get("automatic_retry_exhausted")
-            and not browser_retry_enabled
-        )
-        if exhausted_without_browser_extension or (
-            compensation_count >= allowed_compensations
-        ):
-            service.sync_run_collection.update_one(
-                {"run_id": run_id},
-                {
-                    "$set": {
-                        "automatic_retry_exhausted": True,
-                        "updated_at": now_cn(),
-                    }
-                },
-            )
-            logger.error(
-                "stock_daily_detail_automatic_retry_exhausted run_id=%s "
-                "target_trade_date=%s remaining=%s attempts=%s allowed_attempts=%s",
-                run_id,
-                target_trade_date,
-                len(source_run.get("failed_items") or []),
-                compensation_count,
-                allowed_compensations,
-            )
-            return None
 
         try:
             result = await service.retry_failed_run(run_id)
@@ -1793,34 +1759,16 @@ async def retry_latest_incomplete_stock_daily_detail_run(
             return None
 
         next_count = compensation_count + 1
-        source_after_retry = service.sync_run_collection.find_one(
-            {"run_id": run_id},
-            projection={"_id": 0, "status": 1, "failed_count": 1},
-        ) or {}
-        exhausted = (
-            source_after_retry.get("status") != SYNC_STATUS_SUCCESS
-            and next_count >= allowed_compensations
-        )
         service.sync_run_collection.update_one(
             {"run_id": run_id},
             {
                 "$set": {
                     "automatic_compensation_count": next_count,
-                    "automatic_retry_exhausted": exhausted,
+                    "automatic_retry_exhausted": False,
                     "updated_at": now_cn(),
                 }
             },
         )
-        if exhausted:
-            logger.error(
-                "stock_daily_detail_automatic_retry_exhausted run_id=%s "
-                "target_trade_date=%s remaining=%s attempts=%s allowed_attempts=%s",
-                run_id,
-                target_trade_date,
-                source_after_retry.get("failed_count"),
-                next_count,
-                allowed_compensations,
-            )
         return result
     finally:
         await service.close()

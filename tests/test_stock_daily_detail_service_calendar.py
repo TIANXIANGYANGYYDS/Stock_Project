@@ -302,7 +302,7 @@ def test_sync_queue_uses_coroutine_workers(monkeypatch) -> None:
     assert [item.affected for item in results] == [1] * 20
 
 
-def test_sync_queue_retries_only_network_failures_once(monkeypatch) -> None:
+def test_sync_queue_retries_all_non_terminal_failures_once(monkeypatch) -> None:
     daily_service = service.StockDailyDetailService(
         concurrency=4,
         page_concurrency=2,
@@ -354,7 +354,7 @@ def test_sync_queue_retries_only_network_failures_once(monkeypatch) -> None:
 
     results = asyncio.run(run_test())
 
-    assert attempts == {"000001": 1, "000002": 2, "000003": 1}
+    assert attempts == {"000001": 1, "000002": 2, "000003": 2}
     assert results[0].error is None
     assert results[1].error is None
     assert results[2].error == "page chip unavailable"
@@ -397,17 +397,24 @@ def test_retry_failed_run_uses_queue_and_reconciles_source(monkeypatch) -> None:
         return [
             service.StockDailyDetailItemResult(
                 index=1,
-                total=2,
+                total=3,
                 code="000001",
                 name="股票1",
                 affected=1,
             ),
             service.StockDailyDetailItemResult(
                 index=2,
-                total=2,
+                total=3,
                 code="000002",
                 name="股票2",
                 error="page timeout",
+            ),
+            service.StockDailyDetailItemResult(
+                index=3,
+                total=3,
+                code="000003",
+                name="股票3",
+                error="page chip unavailable",
             ),
         ]
 
@@ -424,11 +431,15 @@ def test_retry_failed_run_uses_queue_and_reconciles_source(monkeypatch) -> None:
 
     result = asyncio.run(run_test())
 
-    assert result.expected_count == 2
+    assert result.expected_count == 3
     assert result.success_count == 1
-    assert result.failed_count == 1
+    assert result.failed_count == 2
     assert captured["retry_failed_once"] is False
-    assert [row[1] for row in captured["stock_rows"]] == ["000001", "000002"]
+    assert [row[1] for row in captured["stock_rows"]] == [
+        "000001",
+        "000002",
+        "000003",
+    ]
     source_update = next(
         update["$set"]
         for query, update in updates
@@ -438,12 +449,12 @@ def test_retry_failed_run_uses_queue_and_reconciles_source(monkeypatch) -> None:
     assert source_update["success_count"] == 1
     assert source_update["failed_count"] == 2
     assert [item["code"] for item in source_update["failed_items"]] == [
-        "000003",
         "000002",
+        "000003",
     ]
 
 
-def test_automatic_retry_stops_at_compensation_limit(monkeypatch) -> None:
+def test_retryable_failures_are_not_permanently_exhausted(monkeypatch) -> None:
     updates = []
 
     class FakeService:
@@ -463,6 +474,18 @@ def test_automatic_retry_stops_at_compensation_limit(monkeypatch) -> None:
         def update_one(self, query, update):
             updates.append((query, update))
 
+        async def retry_failed_run(self, run_id):
+            return service.StockDailyDetailSyncResult(
+                run_id="retry-run",
+                target_trade_date="2026-07-14",
+                adjust="qfq",
+                run_mode="retry",
+                scope_key="retry:source-run",
+                expected_count=1,
+                failed_count=1,
+                status=service.SYNC_STATUS_FAILED,
+            )
+
         async def close(self):
             pass
 
@@ -475,20 +498,30 @@ def test_automatic_retry_stops_at_compensation_limit(monkeypatch) -> None:
         )
     )
 
-    assert result is None
-    assert updates[0][0] == {"run_id": "source-run"}
-    assert updates[0][1]["$set"]["automatic_retry_exhausted"] is True
+    assert result is not None
+    assert updates[-1][0] == {"run_id": "source-run"}
+    assert updates[-1][1]["$set"]["automatic_compensation_count"] == 3
+    assert updates[-1][1]["$set"]["automatic_retry_exhausted"] is False
 
 
-def test_browser_runtime_error_is_retryable() -> None:
+def test_only_missing_pages_are_not_retryable() -> None:
     assert service.StockDailyDetailService._is_retryable_item_error(
         "Error('Page.evaluate: Object')"
     )
     assert service.StockDailyDetailService._is_retryable_item_error(
         "Execution context was destroyed"
     )
+    assert service.StockDailyDetailService._is_retryable_item_error(
+        "page chip unavailable"
+    )
     assert not service.StockDailyDetailService._is_retryable_item_error(
         "行情页响应异常: status=404"
+    )
+    assert not service.StockDailyDetailService._is_retryable_item_error(
+        "行情页响应异常: status=410"
+    )
+    assert not service.StockDailyDetailService._is_retryable_item_error(
+        "东方财富网页在指定日期范围内没有日 K 数据"
     )
 
 
