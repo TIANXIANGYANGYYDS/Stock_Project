@@ -8,6 +8,14 @@ from typing import Generic, Protocol, TypeVar
 from app.core.config import get_settings
 
 
+# 新闻 LLM worker 每轮固定领取 5 条，控制外部模型并发压力和单批处理时长。
+NEWS_LLM_WORKER_BATCH_SIZE = 5
+# 所有轮询 worker 在队列为空时固定等待 180 秒，避免持续查询 MongoDB。
+WORKER_IDLE_SLEEP_SECONDS = 180
+# 所有轮询 worker 遇到未预期异常后固定等待 10 秒再恢复循环。
+WORKER_ERROR_SLEEP_SECONDS = 10
+
+
 class BatchProcessResult(Protocol):
     """
     批处理结果协议。

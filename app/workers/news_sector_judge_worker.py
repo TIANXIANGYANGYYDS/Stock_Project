@@ -3,9 +3,14 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from app.core.config import get_settings
 from app.services import NewsSectorJudgeBatchResult, NewsSectorJudgeService
-from app.workers.base_worker import BasePollingWorker, run_worker_process
+from app.workers.base_worker import (
+    NEWS_LLM_WORKER_BATCH_SIZE,
+    WORKER_ERROR_SLEEP_SECONDS,
+    WORKER_IDLE_SLEEP_SECONDS,
+    BasePollingWorker,
+    run_worker_process,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -30,10 +35,8 @@ class NewsSectorJudgeWorker(BasePollingWorker[NewsSectorJudgeBatchResult]):
         """
         初始化板块判断 worker。
 
-        不传参数时读取统一的 LLM_WORKER_* 配置；测试或临时调试时可以手动覆盖。
+        不传参数时使用 worker 模块的固定批量与等待时长；测试可显式覆盖参数。
         """
-
-        settings = get_settings()
         active_service = service or NewsSectorJudgeService()
 
         super().__init__(
@@ -42,17 +45,17 @@ class NewsSectorJudgeWorker(BasePollingWorker[NewsSectorJudgeBatchResult]):
             batch_size=(
                 batch_size
                 if batch_size is not None
-                else settings.llm_worker_batch_size
+                else NEWS_LLM_WORKER_BATCH_SIZE
             ),
             idle_sleep_seconds=(
                 idle_sleep_seconds
                 if idle_sleep_seconds is not None
-                else settings.llm_worker_idle_sleep_seconds
+                else WORKER_IDLE_SLEEP_SECONDS
             ),
             error_sleep_seconds=(
                 error_sleep_seconds
                 if error_sleep_seconds is not None
-                else settings.llm_worker_error_sleep_seconds
+                else WORKER_ERROR_SLEEP_SECONDS
             ),
             logger=logger,
         )

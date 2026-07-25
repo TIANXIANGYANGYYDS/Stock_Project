@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 from collections.abc import Sequence
@@ -253,12 +252,11 @@ companies
 """.strip()
 
 
-
-
 NEWS_SECTOR_DETAIL_SYSTEM_PROMPT = NEWS_SECTOR_DETAIL_SYSTEM_PROMPT_TEMPLATE
 
 
 def _build_sector_names_text(sector_names: Sequence[str]) -> str:
+    """把待分析行业名称按固定顺序转换为提示词中的项目列表。"""
     return "\n".join(f"- {sector_name}" for sector_name in sector_names)
 
 
@@ -269,6 +267,11 @@ def _build_news_sector_detail_user_prompt(
     publish_time: str,
     sector_names: Sequence[str],
 ) -> str:
+    """组装新闻板块详情阶段的用户提示词。
+
+    标题、正文和发布时间用于提供事件上下文；板块名称会原样列出，要求模型
+    按相同顺序返回，便于后续校验、去重和补齐缺失项。
+    """
     return (
         "新闻标题：\n"
         f"{title or ''}\n\n"
@@ -301,9 +304,12 @@ class NewsSectorDetailLLMAnalyzer(BaseLLM):
     """
 
     def __init__(self, **llm_kwargs: Any) -> None:
+        """初始化详情分析器并准备固定系统提示词和结果适配器。"""
         super().__init__(**llm_kwargs)
 
+        # 详情阶段专用系统约束，规定板块名称、分数、理由和公司字段的输出边界。
         self.system_prompt = NEWS_SECTOR_DETAIL_SYSTEM_PROMPT
+        # Pydantic 适配器，用于把清洗后的数组校验成业务模型列表。
         self._result_adapter = TypeAdapter(list[NewsSectorLLMAnalysis])
 
     async def analyze(
@@ -317,6 +323,12 @@ class NewsSectorDetailLLMAnalyzer(BaseLLM):
         max_tokens: int | None = 3000,
         max_retries: int = 2,
     ) -> list[NewsSectorLLMAnalysis]:
+        """分析一条新闻对输入板块未来 1~3 个交易日的短线影响。
+
+        先规范输入板块并调用统一 LLM 入口，再解析、过滤和校验模型返回值；最终
+        按输入顺序返回每个板块一条记录。缺失、重复或越界的模型输出不会直接泄漏
+        到业务层，而是按安全的中性/空分析结果处理。
+        """
         title = (title or "").strip()
         content = (content or "").strip()
         publish_time = (publish_time or "").strip()
@@ -325,8 +337,7 @@ class NewsSectorDetailLLMAnalyzer(BaseLLM):
         if not title and not content:
             raise ValueError("title 和 content 不能同时为空")
 
-        raw_result = await asyncio.to_thread(
-            self.chat,
+        raw_result = await self.async_chat(
             system_prompt=self.system_prompt,
             user_prompt=_build_news_sector_detail_user_prompt(
                 title=title,
@@ -358,6 +369,12 @@ class NewsSectorDetailLLMAnalyzer(BaseLLM):
     def _normalize_input_sector_names(
         sectors: Sequence[str | NewsSectorLLMAnalysis] | None,
     ) -> tuple[str, ...]:
+        """清洗输入板块名称，去重并确定无有效板块时的兜底板块。
+
+        既接受原始字符串，也接受第一阶段已经生成的板块模型；空值、空字符串和
+        重复名称会被忽略。当输入同时包含“不涉及版块”和其他板块时，移除该兜底项，
+        避免它占用真实板块的输出位置。
+        """
         if not sectors:
             return (OTHER_SECTOR_NAME,)
 
@@ -386,15 +403,18 @@ class NewsSectorDetailLLMAnalyzer(BaseLLM):
 
         if len(names) > 1 and OTHER_SECTOR_NAME in names:
             names = [
-                sector_name
-                for sector_name in names
-                if sector_name != OTHER_SECTOR_NAME
+                sector_name for sector_name in names if sector_name != OTHER_SECTOR_NAME
             ]
 
         return tuple(names)
 
     @staticmethod
     def _loads_json_array(raw_result: str) -> Any:
+        """解析模型原文并确认顶层结构是 JSON 数组。
+
+        允许原文带 Markdown 代码块或少量解释，由公共提取器负责剥离；JSON 非法或
+        顶层不是数组时统一抛出领域异常，调用方可据此触发重试。
+        """
         json_text = BaseLLM.extract_json_text(raw_result)
 
         try:
@@ -418,6 +438,11 @@ class NewsSectorDetailLLMAnalyzer(BaseLLM):
         *,
         valid_sector_names: set[str],
     ) -> list[dict[str, Any]]:
+        """过滤并规整模型数组，保留合法板块和可用的详情字段。
+
+        未知板块、非对象元素、非法分数、空理由以及错误结构都会被丢弃或降级为
+        空分析；分数和公司列表先经过宽容转换，再交给 Pydantic 做最终结构校验。
+        """
         sanitized: list[dict[str, Any]] = []
 
         for item in data:
@@ -480,6 +505,11 @@ class NewsSectorDetailLLMAnalyzer(BaseLLM):
 
     @staticmethod
     def _coerce_score(value: Any) -> int | None:
+        """把模型可能返回的数字、数字字符串或带“分”后缀的值转成整数。
+
+        布尔值、空字符串和无法解析的类型返回 ``None``；结果会限制在业务允许的
+        [-100, 100] 范围内，避免异常值破坏后续校验。
+        """
         if isinstance(value, bool):
             return None
 
@@ -513,6 +543,11 @@ class NewsSectorDetailLLMAnalyzer(BaseLLM):
 
     @staticmethod
     def _coerce_companies(value: Any) -> list[str] | None:
+        """把公司字段规范为去重、最多八项的字符串列表或 ``None``。
+
+        兼容模型返回的分隔字符串和列表结构，并过滤“无明确公司”等占位文本；公司
+        名称本身不做行业推断，保留模型原始表述供上层审计。
+        """
         if value is None:
             return None
 
@@ -542,7 +577,11 @@ class NewsSectorDetailLLMAnalyzer(BaseLLM):
             if not company:
                 continue
 
-            if company.lower() in {"none", "null"} or company in {"无", "无明确公司", "没有"}:
+            if company.lower() in {"none", "null"} or company in {
+                "无",
+                "无明确公司",
+                "没有",
+            }:
                 continue
 
             if company in seen:
@@ -562,6 +601,12 @@ class NewsSectorDetailLLMAnalyzer(BaseLLM):
         result: list[NewsSectorLLMAnalysis],
         input_sector_names: tuple[str, ...],
     ) -> list[NewsSectorLLMAnalysis]:
+        """按输入板块顺序补齐最终结果，并统一空分析和字段格式。
+
+        模型可能漏项、乱序或重复返回；方法只接受输入集合内的首个记录，并为所有
+        缺失板块生成 ``sector_llm_analysis=None``，从而向服务层提供稳定的定长结果。
+        “不涉及版块”始终保持空分析，不参与短线方向判断。
+        """
         result_map: dict[str, NewsLLMAnalysis | None] = {}
 
         for item in result:

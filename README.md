@@ -20,7 +20,7 @@
 | 3  | 每日 K 线分析       | 日终批处理     | 每天 15:30   | 分析趋势、涨跌结构、技术指标 |
 | 4  | 每日 / 实时筹码分析    | 可日终 / 可实时 | 取决于数据源能力   | 判断筹码集中度、主力变化   |
 | 5  | 日内实时行情分析       | 高频交易时段流   | 交易时段每 30 秒 | 实时监控异动、量价、板块联动 |
-| 6  | 同花顺早报 / 晚间复盘分析 | 每日资讯批处理   | 每天 8:00    | 判断当日板块主线、市场情绪  |
+| 6  | 同花顺早报 / 晚间复盘分析 | 每日资讯批处理   | 交易日 9:00  | 判断当日板块主线、市场情绪  |
 
 ---
 
@@ -723,84 +723,123 @@ MA5 / MA10 / MA20 / MA60
 ### 触发方式
 
 ```text
-每天 8:00
+新闻榜单：默认每 5 分钟独立刷新一次
+盘前分析：每个交易日 9:00
 ```
 
 ### 流程
 
 ```text
-8:00 定时任务
+新闻抓取与两阶段 LLM worker
   ↓
-获取同花顺早报
+读取近 72 小时 news_data
+  ├─ 投资倾向榜：只读取 finished 新闻的板块分数
+  └─ 新闻热度榜：同样只读取 finished 新闻的板块分数
   ↓
-获取前一日同花顺晚间复盘
+生成同一截止时点的 news_ranking_snapshots 快照
+
+9:00 盘前任务
   ↓
-清洗正文
+获取同花顺早报和前一交易日复盘
   ↓
-LLM 分析板块、题材、利好方向
+读取当天 `window_end_ts <= 9:00` 的最新 completed 榜单快照并检查新鲜度
   ↓
-生成 today_market_context
+LLM 结合早报、复盘和新闻榜单生成 5 条结构化主线
+  ↓
+按 `analysis_date` 幂等写入 `daily_market_analysis`
   ↓
 供日内行情分析使用
 ```
 
-### 早报 / 复盘表
+手工执行当前交易日：
+
+```bash
+python -m app.scheduler.morning_analysis_jobs
+```
+
+需要重跑历史交易日时，必须先按盘前截止时间重建该日榜单快照，避免使用收盘后的新闻：
+
+```bash
+python -m app.scheduler.news_ranking_jobs --datetime "2026-07-23 08:58"
+python -m app.scheduler.morning_analysis_jobs --date 2026-07-23
+```
+
+这些规则不会随部署环境变化，因此不再放入 `.env`：新闻榜单每 5 分钟刷新、
+回看 72 小时并保留前 12 名；盘前分析固定在北京时间 09:00 执行，榜单超过
+15 分钟标记陈旧；抖音作品固定读取目标博主，并在盘前报告中只采用前一自然日
+发布且 09:00 前已完成分析的最多 3 个作品。常量放在对应的 crawler、service、
+scheduler 或 worker 模块中，并带有单位和用途注释。
+
+盘前分析和抖音观点分析固定使用代码中的 `QwenAnalysisLLM` 配置：模型为
+`qwen3.7-max`，并默认携带 `enable_thinking=true`。环境文件只提供
+`LLM_API_KEY`、`LLM_API_BASE_URL` 和 `LLM_TIMEOUT`，不再允许两个任务通过环境变量
+分别覆盖模型或关闭深度思考。
+
+`MorningAnalysisService` 不会在缺少快照时临时重算榜单。当天快照不存在会明确失败；
+快照超过允许年龄时仍可生成报告，但 `data_quality` 会标记为 `degraded`。
+
+### 独立榜单快照集合
 
 ```python
 {
-    "report_id": "xxx",
-    "source": "ths",
-    "report_type": "morning_report / evening_review",
-    "trade_date": "2026-05-15",
-
-    "title": "...",
-    "content": "...",
-    "raw_content": "...",
-
-    "related_sectors": [],
-    "related_stocks": [],
-
-    "created_at": 1710000000000
+    "snapshot_id": "2026-05-15_1778806680",
+    "biz_date": "2026-05-15",
+    "status": "completed",
+    "window_type": "rolling_72h",
+    "window_hours": 72,
+    "window_start_ts": 0,
+    "window_end_ts": 0,
+    "generated_at": "2026-05-15T08:58:00+08:00",
+    "source_stats": {},
+    "formula_versions": {
+        "investment": "investment_v3",
+        "heat": "heat_v4"
+    },
+    "investment_ranking": [],
+    "heat_ranking": []
 }
 ```
 
-### 当日市场上下文表
+该集合以 `snapshot_id` 作为唯一键。每个交易日只保留两类必要快照：全天最新快照，以及
+配置的盘前截止时点之前最后一份快照；两者相同时只保留一份。这样下午继续刷新排行榜时，
+仍可用固定的 9:00 截止快照补跑盘前任务。盘前实际使用的榜单和版本元数据会复制进
+`daily_market_analysis`，作为不可随后续刷新改变的审计副本。该保留策略面向固定盘前时点，
+不提供任意历史时刻的完整快照回放。
+
+两个榜单都只读取已完成两阶段 LLM 的 `finished` 新闻；具体板块还必须同时具有有效的
+`sector_name`、`score` 和非空 `reason` 才会参与计算。`source_stats` 统计的是时间窗内
+满足状态条件的物理新闻文档；榜单里的
+`news_count` 统计去重后的逻辑事件。当前版本会把规范化标题完全一致、发布时间相距不超过
+15 分钟的副本合并，同一事件映射多个板块时重新分摊权重。投资榜从重复分析结果中选择
+最接近中位数的实际分数；热度榜使用更适合当前新闻量级的计数和爆发尺度，避免大量板块
+同时挤在 97 分附近。
+
+### 实际报告集合
 
 ```python
 {
+    "analysis_date": "2026-05-15",  # 唯一键
     "trade_date": "2026-05-15",
-
-    "market_sentiment": {
-        "label": "strong / neutral / weak",
-        "score": 72,
-        "reason": "..."
+    "prev_trade_date": "2026-05-14",
+    "data_quality": "complete / degraded",
+    "news_window": {},
+    "ranking_snapshot_meta": {
+        "snapshot_id": "...",
+        "window_end_ts": 0,
+        "age_seconds": 120,
+        "is_stale": false
     },
-
-    "main_sectors": [
-        {
-            "sector_name": "机器人",
-            "reason": "政策催化 + 多家公司公告",
-            "priority": 1
-        },
-        {
-            "sector_name": "半导体",
-            "reason": "消息面催化",
-            "priority": 2
-        }
-    ],
-
-    "risk_factors": [
-        "外围市场下跌",
-        "高位题材分歧"
-    ],
-
-    "watch_stocks": [
-        {
-            "code": "xxx",
-            "name": "xxx",
-            "reason": "早报重点提及"
-        }
-    ]
+    "morning_report": {},
+    "previous_review": {},
+    "investment_ranking": [],
+    "heat_ranking": [],
+    "analysis": {
+        "market_style": "...",
+        "mainlines": []
+    },
+    "analysis_model": "qwen3.7-max",
+    "thinking_enabled": true,
+    "prompt_version": "morning_analysis_v3"
 }
 ```
 
@@ -888,12 +927,13 @@ Asia/Shanghai
 | ---------- | -------------------------- | ------------ |
 | 新闻爬虫       | 全天或 7:00 - 23:00           | 每 3 分钟       |
 | LLM 分析     | 常驻 Worker                  | 队列驱动         |
+| 新闻板块榜单快照   | 全天                         | 每 5 分钟       |
 | 日 K 获取     | 15:35 / 15:40              | 每个交易日一次      |
 | 日 K 分析     | K 线入库后                     | 事件驱动         |
 | 筹码日终       | 15:40 / 16:00              | 每个交易日一次      |
 | 实时行情       | 9:30 - 11:30，13:00 - 15:00 | 每 30 秒       |
 | 实时筹码       | 如果支持实时                     | 每 30 秒或只对异动池 |
-| 同花顺早报 / 复盘 | 8:00                       | 每个交易日一次      |
+| 同花顺早报 / 复盘 | 9:00                       | 每个交易日一次      |
 | 清理任务       | 23:30                      | 每日一次         |
 | 日 K 失败补偿   | 主批次失败后立即执行 / 次日 15:30 | 限次自动补偿      |
 
@@ -1303,3 +1343,41 @@ LLM 分析
 ```
 
 这样架构不会推翻重做。
+
+---
+
+# 十二、抖音博主盘前观点输入
+
+`全能的野人` 使用独立链路，不写入 `news_data`，也不参与投资倾向榜和新闻热度榜：
+
+```text
+Scheduler 每 15 分钟发现公开视频
+  → douyin_creator_works
+  → douyin_analysis worker 下载视频
+  → RapidOCR 字幕 + faster-whisper ASR
+  → 专用 LLM 提取结构化行业观点
+  → 09:00 盘前分析以 critical priority 读取前一自然日发布、且 09:00 前完成的结果
+```
+
+启动方式：
+
+```bash
+./.local/bin/start_scheduler.sh
+./.local/bin/workers.sh start douyin_analysis
+./.local/bin/workers.sh status all
+```
+
+抓取失败、转写失败、分析失败分别保留状态；盘前任务在来源暂不可用时标记
+`degraded`，但不会因此阻断同花顺早报、复盘和新闻榜单分析。处理中任务使用
+30 分钟租约和 attempt fencing，worker 异常退出后可安全重领，旧进程的迟到结果
+不会覆盖新结果。盘前日报只复制结构化摘要和行业观点，OCR/ASR 原文仅保留在
+`douyin_creator_works`。
+
+MongoDB 的 BSON Date 保留 UTC 绝对时刻，供排序、租约、重试和 09:00 截止判断
+使用；同一文档同时保存 `published_at_cn`、`first_seen_at_cn`、`fetched_at_cn`、
+`transcript.transcribed_at_cn`、`analysis.analyzed_at_cn` 等 `+08:00` 字符串，供人工
+直接查看北京时间。`*_cn` 字段只用于展示，不参与查询或索引。
+
+抖音观点按盘前日期的前一自然日筛选：例如 7 月 24 日盘前只读取 7 月 23 日发布的
+作品。`publish_ts` 决定来源日，`first_seen_at` 和 `analysis.analyzed_at` 则必须不晚于
+7 月 24 日 09:00；两类时间分开判断，既允许凌晨完成处理，也避免历史补录数据穿越。

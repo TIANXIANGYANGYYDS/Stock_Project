@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 from functools import lru_cache
 from pathlib import Path
@@ -219,6 +218,12 @@ NEWS_SECTOR_JUDGE_SYSTEM_PROMPT = NEWS_SECTOR_JUDGE_SYSTEM_PROMPT_TEMPLATE
 
 
 def _resolve_path(file_path: str | Path) -> Path:
+    """把行业数据文件路径解析为可读取的绝对路径。
+
+    绝对路径保持不变；相对路径统一以项目根目录为基准，避免调用方的当前工作
+    目录影响行业候选集文件定位。
+    """
+
     path = Path(file_path)
 
     if path.is_absolute():
@@ -229,6 +234,12 @@ def _resolve_path(file_path: str | Path) -> Path:
 
 @lru_cache(maxsize=16)
 def _load_ths_industry_data(file_path: str = THS_INDUSTRY_BOARDS_FILE) -> tuple[dict[str, Any], ...]:
+    """读取并校验同花顺行业 JSON 文件，返回可用行业记录的不可变元组。
+
+    函数会校验文件存在、JSON 合法且顶层包含 ``industries`` 数组；数组中的
+    非字典元素会被忽略。结果按文件路径缓存，减少分析器重复初始化时的磁盘读取。
+    """
+
     path = _resolve_path(file_path)
 
     if not path.exists():
@@ -248,7 +259,13 @@ def _load_ths_industry_data(file_path: str = THS_INDUSTRY_BOARDS_FILE) -> tuple[
 
 
 @lru_cache(maxsize=16)
-def _load_ths_industry_board_names(file_path: str = THS_INDUSTRY_BOARDS_FILE) -> tuple[str, ...]:
+def load_ths_industry_board_names(file_path: str = THS_INDUSTRY_BOARDS_FILE) -> tuple[str, ...]:
+    """从行业数据中按原始顺序提取去重后的非空同花顺行业名称。
+
+    返回值用于构造 LLM 候选集和结果白名单；若文件中无法解析出任何行业名称，
+    会立即报错，避免分析器在空候选集上继续运行。结果按文件路径缓存。
+    """
+
     names: list[str] = []
     seen: set[str] = set()
 
@@ -271,6 +288,12 @@ def _load_ths_industry_board_names(file_path: str = THS_INDUSTRY_BOARDS_FILE) ->
 def _load_stock_industry_hint_map(
     file_path: str = THS_INDUSTRY_BOARDS_FILE,
 ) -> dict[str, tuple[str, ...]]:
+    """构建股票名称到所属同花顺行业名称集合的缓存映射。
+
+    映射只接受结构完整的股票记录，同名股票关联的行业会去重并排序；该数据仅
+    作为新闻正文中的本地辅助线索，不会直接替代 LLM 的行业边界判断。
+    """
+
     mapping: dict[str, set[str]] = {}
 
     for industry in _load_ths_industry_data(file_path):
@@ -298,10 +321,14 @@ def _load_stock_industry_hint_map(
 
 
 def _build_industry_board_names_text(names: tuple[str, ...]) -> str:
+    """把行业名称元组渲染为系统提示词使用的逐行项目列表。"""
+
     return "\n".join(f"- {name}" for name in names)
 
 
 def _build_news_sector_judge_system_prompt(names: tuple[str, ...]) -> str:
+    """把行业候选集和固定行业裁决规则填入新闻行业判断系统提示词。"""
+
     return (
         NEWS_SECTOR_JUDGE_SYSTEM_PROMPT_TEMPLATE
         .replace("{industry_board_names_text}", _build_industry_board_names_text(names))
@@ -316,6 +343,12 @@ def _build_stock_industry_hints(
     industry_boards_file: str,
     max_hints: int = 20,
 ) -> str:
+    """从新闻标题和正文中匹配股票名称，生成有限数量的本地行业提示。
+
+    同一“股票名称 + 行业名称”组合只输出一次，并在达到 ``max_hints`` 后停止，
+    防止提示内容无限增长；没有任何匹配时返回明确的“无”。
+    """
+
     text = f"{title or ''}\n{content or ''}"
     hint_map = _load_stock_industry_hint_map(industry_boards_file)
 
@@ -348,6 +381,11 @@ def _build_news_sector_judge_user_prompt(
     publish_time: str,
     industry_boards_file: str,
 ) -> str:
+    """组合新闻标题、正文、发布时间和本地股票行业线索为用户提示词。
+
+    该函数只负责输入序列化和固定任务说明，不判断行业，也不修改传入的新闻内容。
+    """
+
     return (
         "新闻标题：\n"
         f"{title or ''}\n\n"
@@ -362,16 +400,12 @@ def _build_news_sector_judge_user_prompt(
 
 
 class NewsSectorJudgeLLMAnalyzer(BaseLLM):
-    """
-    新闻行业板块判断分析器。
+    """使用通用 LLM 客户端判断单条新闻直接涉及的同花顺行业。
 
-    输入：
-    title
-    content
-    publish_time
-
-    输出：
-    list[NewsSectorLLMAnalysis]
+    分析器启动时从本地行业文件构建候选集、股票提示映射和系统提示词。调用
+    ``analyze`` 后，它把新闻标题、正文和发布时间交给 LLM，再依次执行 JSON
+    数组解析、Pydantic 结构校验、行业白名单过滤、去重和最多三个行业的截断。
+    若没有留下合法行业，最终稳定返回“不涉及版块”，供后续新闻处理流程使用。
     """
 
     def __init__(
@@ -380,12 +414,23 @@ class NewsSectorJudgeLLMAnalyzer(BaseLLM):
         industry_boards_file: str = THS_INDUSTRY_BOARDS_FILE,
         **llm_kwargs: Any,
     ) -> None:
+        """初始化 LLM 客户端，并加载行业候选集和结果结构校验器。
+
+        ``industry_boards_file`` 可用于测试或离线任务指定另一份行业数据文件；
+        ``llm_kwargs`` 原样传给 ``BaseLLM``，用于注入模型客户端配置。
+        """
+
         super().__init__(**llm_kwargs)
 
+        # 行业候选集 JSON 文件路径，构造股票提示时会复用该路径。
         self.industry_boards_file = industry_boards_file
-        self.industry_board_names = _load_ths_industry_board_names(industry_boards_file)
+        # 保持本地文件顺序且已去重的同花顺行业名称元组。
+        self.industry_board_names = load_ths_industry_board_names(industry_boards_file)
+        # LLM 输出允许通过的行业白名单，额外包含“不涉及版块”兜底项。
         self.valid_sector_names = set(self.industry_board_names) | {OTHER_SECTOR_NAME}
+        # 已注入当前行业候选集和固定裁决规则的系统提示词。
         self.system_prompt = _build_news_sector_judge_system_prompt(self.industry_board_names)
+        # 将 LLM JSON 数组校验为新闻行业分析模型列表的 Pydantic 适配器。
         self._result_adapter = TypeAdapter(list[NewsSectorLLMAnalysis])
 
     async def analyze(
@@ -398,6 +443,29 @@ class NewsSectorJudgeLLMAnalyzer(BaseLLM):
         max_tokens: int | None = 3000,
         max_retries: int = 2,
     ) -> list[NewsSectorLLMAnalysis]:
+        """异步判断一条新闻直接涉及的合法行业，并返回规范化结果。
+
+        标题和正文会先去除首尾空白，两者不能同时为空。请求统一通过
+        ``BaseLLM.async_chat`` 在线程中执行，避免阻塞调用方事件循环；模型输出
+        随后必须是 JSON 数组并满足 ``NewsSectorLLMAnalysis`` 结构，最后还会经过
+        白名单、去重、数量上限和“不涉及版块”兜底规则处理。
+
+        Args:
+            title: 新闻标题，可以为空，但不能与正文同时为空。
+            content: 新闻正文，可以为空，但不能与标题同时为空。
+            publish_time: 原始发布时间文本，仅作为模型判断上下文。
+            temperature: 本次 LLM 请求的采样温度。
+            max_tokens: 本次 LLM 请求允许生成的最大 token 数。
+            max_retries: 底层 LLM 请求失败时的最大尝试次数。
+
+        Returns:
+            经过结构和行业白名单校验的行业分析列表，最多包含三个行业。
+
+        Raises:
+            ValueError: 标题和正文同时为空时抛出。
+            LLMResponseError: 模型返回内容不是合法 JSON 数组时抛出。
+        """
+
         title = (title or "").strip()
         content = (content or "").strip()
         publish_time = (publish_time or "").strip()
@@ -405,8 +473,7 @@ class NewsSectorJudgeLLMAnalyzer(BaseLLM):
         if not title and not content:
             raise ValueError("title 和 content 不能同时为空")
 
-        raw_result = await asyncio.to_thread(
-            self.chat,
+        raw_result = await self.async_chat(
             system_prompt=self.system_prompt,
             user_prompt=_build_news_sector_judge_user_prompt(
                 title=title,
@@ -425,6 +492,12 @@ class NewsSectorJudgeLLMAnalyzer(BaseLLM):
 
     @staticmethod
     def _loads_json_array(raw_result: str) -> Any:
+        """从 LLM 原始文本中提取并解析顶层 JSON 数组。
+
+        先复用 ``BaseLLM.extract_json_text`` 处理 Markdown 包裹或夹带文本，再校验
+        JSON 语法和顶层类型；解析失败会统一转换为带新闻行业上下文的响应错误。
+        """
+
         json_text = BaseLLM.extract_json_text(raw_result)
 
         try:
@@ -445,6 +518,14 @@ class NewsSectorJudgeLLMAnalyzer(BaseLLM):
         self,
         result: list[NewsSectorLLMAnalysis],
     ) -> list[NewsSectorLLMAnalysis]:
+        """过滤和规范化已通过 Pydantic 校验的行业判断结果。
+
+        空名称、候选集外名称和重复名称会被丢弃，合法结果按 LLM 原顺序保留并
+        截断到 ``MAX_SECTOR_COUNT``。只要存在具体行业便移除“不涉及版块”；若
+        没有具体行业，则返回唯一的“不涉及版块”结果。行业详情分析字段固定为空，
+        因为本阶段只负责行业归类，不负责利好利空打分。
+        """
+
         normalized: list[NewsSectorLLMAnalysis] = []
         seen: set[str] = set()
 

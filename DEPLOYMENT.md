@@ -37,6 +37,7 @@ python -m pip install --upgrade pip setuptools wheel -i https://pypi.tuna.tsingh
 python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
   apscheduler \
   beautifulsoup4 \
+  exchange_calendars \
   httpx \
   motor \
   pandas \
@@ -52,6 +53,7 @@ python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
 这些包大致对应：
 
 - 调度：`apscheduler`
+- A 股交易日判断：`exchange_calendars`
 - 东方财富行情页抓取：`playwright`（Chromium）
 - 行情表格整理和日期转换：`pandas`（不在本地计算指标或筹码）
 - HTML 解析：`beautifulsoup4`
@@ -84,7 +86,8 @@ python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
 
 ```bash
 python -m pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
-  apscheduler beautifulsoup4 httpx motor pandas playwright pydantic pydantic-settings pymongo python-dotenv requests pytest \
+  apscheduler beautifulsoup4 exchange_calendars httpx motor pandas playwright pydantic pydantic-settings pymongo python-dotenv requests pytest \
+  faster-whisper==1.2.1 rapidocr==3.9.2 \
   akshare \
   html5lib lxml
 ```
@@ -139,3 +142,25 @@ tail -f .local/logs/scheduler.log
 ```bash
 ./.local/bin/stop_scheduler.sh
 ```
+
+## 10. 启动抖音分析 worker
+
+抖音作品发现任务属于 scheduler；视频下载、OCR、ASR 和观点 LLM 属于独立 worker：
+
+```bash
+./.local/bin/workers.sh start douyin_analysis
+tail -f .local/logs/douyin_analysis_worker.log
+```
+
+本机固定使用 CPU `int8` 的 faster-whisper small 模型并启用字幕 OCR。模型应
+提前放到：
+
+```text
+.local/models/faster-whisper-small/
+```
+
+目标博主账号、抓取间隔与范围、ASR 设备、字幕 OCR、30 分钟处理租约和 60 秒
+失败重试均为代码中的固定业务规则，不写入 `.local/env/.env`。环境文件只保留
+API 密钥、服务地址、数据库、代理和日志等级等实际部署差异。
+
+公开页面可能触发平台风控，任务会记录失败并有限重试，不会尝试绕过验证码。

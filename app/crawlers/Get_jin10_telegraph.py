@@ -92,7 +92,7 @@ class Jin10NewsCrawler(BaseNewsCrawler):
         # 新版首页的服务端渲染结果不再给快讯正文包裹详情页链接，而是把
         # flash id 放在容器 id 中，例如 flash20260723122707671800。
         for node in soup.select(".jin-flash-item-container[id^='flash']"):
-            flash_id = node.get("id", "")[len("flash"):]
+            flash_id = node.get("id", "")[len("flash") :]
             if not flash_id.isdigit():
                 continue
 
@@ -102,7 +102,7 @@ class Jin10NewsCrawler(BaseNewsCrawler):
                 continue
 
             news_time = time_match.group(1)
-            summary = block_text[time_match.end():].strip()
+            summary = block_text[time_match.end() :].strip()
             if len(summary) < 8:
                 continue
 
@@ -294,7 +294,9 @@ class Jin10NewsCrawler(BaseNewsCrawler):
 
         return ""
 
-    def normalize_item(self, list_item: dict, detail_item: dict | None) -> FetchedNews | None:
+    def normalize_item(
+        self, list_item: dict, detail_item: dict | None
+    ) -> FetchedNews | None:
         summary = self.clean_page_text(list_item.get("summary") or "")
         fallback_hms = list_item.get("time")
 
@@ -305,7 +307,9 @@ class Jin10NewsCrawler(BaseNewsCrawler):
             detail_publish_str = detail_item.get("publish_datetime_str")
             detail_content = detail_item.get("content") or ""
 
-        publish_ts, publish_time = self.parse_publish_ts(detail_publish_str, fallback_hms)
+        publish_ts, publish_time = self.parse_publish_ts(
+            detail_publish_str, fallback_hms
+        )
         if publish_ts is None:
             return None
 
@@ -322,7 +326,12 @@ class Jin10NewsCrawler(BaseNewsCrawler):
         if not title:
             title = self.build_title_from_content(content)
 
-        event_id = self.build_event_id(content)
+        # 金十详情页包含会随抓取时间变化的推荐区文字，不能用整页正文作为
+        # 唯一键。详情 URL 中的 flash_id 才是同一条快讯的稳定来源标识。
+        detail_url = self.normalize_detail_url(list_item.get("detail_url"))
+        event_id = self.build_event_id(
+            f"{self.source}:{detail_url}" if detail_url else content
+        )
 
         return FetchedNews(
             event_id=event_id,

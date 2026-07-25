@@ -1,6 +1,8 @@
 # Core runtime dependencies
 apscheduler
 beautifulsoup4
+exchange_calendars
+faster-whisper==1.2.1
 httpx
 motor
 pandas
@@ -9,6 +11,7 @@ pydantic
 pydantic-settings
 pymongo
 python-dotenv
+rapidocr==3.9.2
 requests
 
 # Test dependencies

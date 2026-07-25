@@ -53,6 +53,9 @@ class NewsRepository(BaseMongoRepository):
 
         idx_status_publish_ts：
             支持 worker 按状态领取待处理新闻，并优先处理最新新闻。
+
+        idx_publish_ts：
+            支持榜单定时任务统计时间窗口内各处理状态，避免周期性全表扫描。
         """
 
         await self.collection.create_index("event_id", unique=True, name="uk_event_id")
@@ -64,7 +67,10 @@ class NewsRepository(BaseMongoRepository):
             [("status.status", 1), ("publish_ts", -1)],
             name="idx_status_publish_ts",
         )
-
+        await self.collection.create_index(
+            "publish_ts",
+            name="idx_publish_ts",
+        )
     def _build_document(
         self,
         row: News | FetchedNews | dict[str, Any],
@@ -103,7 +109,8 @@ class NewsRepository(BaseMongoRepository):
                 existing_count=0,
             )
 
-        write_result = await self.upsert_many(rows)
+        rows_to_write = await self._exclude_existing_jin10_identities(rows)
+        write_result = await self.upsert_many(rows_to_write)
         inserted_count = 0 if write_result is None else int(getattr(write_result, "upserted_count", 0))
         total_count = len(rows)
 
@@ -112,6 +119,58 @@ class NewsRepository(BaseMongoRepository):
             inserted_count=inserted_count,
             existing_count=max(total_count - inserted_count, 0),
         )
+
+    async def _exclude_existing_jin10_identities(
+        self,
+        rows: Sequence[News | FetchedNews | dict[str, Any]],
+    ) -> list[News | FetchedNews | dict[str, Any]]:
+        """过滤数据库中已按旧事件 ID 入库的同一金十快讯。
+
+        新版金十事件 ID 使用稳定快讯 ID，但历史文档可能仍是内容哈希。方法用
+        ``publish_ts + title`` 查询并排除这些历史重复项，其他来源和新新闻原样保留。
+        """
+        identities = {
+            (int(document.get("publish_ts") or 0), str(document.get("title") or "").strip())
+            for row in rows
+            if (document := self._row_dict(row)).get("source") == "jin10"
+        }
+        identities.discard((0, ""))
+        if not identities:
+            return list(rows)
+
+        existing_rows = await self.find_many(
+            {
+                "source": "jin10",
+                "publish_ts": {"$in": sorted({item[0] for item in identities})},
+            },
+            projection={"_id": 0, "publish_ts": 1, "title": 1},
+        )
+        existing_identities = {
+            (int(row.get("publish_ts") or 0), str(row.get("title") or "").strip())
+            for row in existing_rows
+        }
+        filtered_rows = []
+        for row in rows:
+            document = self._row_dict(row)
+            identity = (
+                int(document.get("publish_ts") or 0),
+                str(document.get("title") or "").strip(),
+            )
+            if document.get("source") == "jin10" and identity in existing_identities:
+                continue
+            filtered_rows.append(row)
+        return filtered_rows
+
+    @staticmethod
+    def _row_dict(row: News | FetchedNews | dict[str, Any]) -> dict[str, Any]:
+        """把新闻模型或字典转换为普通 Python 字典，供身份比较复用。
+
+        Pydantic 模型使用 python 模式导出以保留 datetime 等原生值；原始字典会
+        浅拷贝，避免过滤流程意外修改调用方持有的数据。
+        """
+        if isinstance(row, (News, FetchedNews)):
+            return row.model_dump(mode="python")
+        return dict(row)
 
     async def upsert_one(
         self,
@@ -202,6 +261,30 @@ class NewsRepository(BaseMongoRepository):
             return None
 
         return await self.find_one({"event_id": event_id}, projection={"_id": 0})
+
+    async def list_news_for_ranking_window(
+        self,
+        *,
+        start_ts: int,
+        end_ts: int,
+    ) -> list[dict[str, Any]]:
+        """Read one internally consistent window for ranking input and stats."""
+        return await self.find_many(
+            {
+                "publish_ts": {"$gte": start_ts, "$lte": end_ts},
+            },
+            projection={
+                "_id": 0,
+                "event_id": 1,
+                "source": 1,
+                "title": 1,
+                "publish_time": 1,
+                "publish_ts": 1,
+                "status.status": 1,
+                "sector_llm_analysis": 1,
+            },
+            sort=[("publish_ts", -1)],
+        )
 
     async def claim_next_sector_judge_news(self) -> News | None:
         """
