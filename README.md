@@ -1433,3 +1433,16 @@ MongoDB 只保留两张博主业务集合：`creator_works` 和
 时间、原文/OCR/ASR、A 股观点和处理状态；后者每位博主一条，保存
 `verified_opinions`、`accuracy_score` 和 `pending_opinions`。提取与分析使用 30 分钟租约
 和 attempt fencing；收盘任务通过 Mongo 原子更新完成 pending 到 verified 的迁移。
+
+## 只读查询 API
+
+项目提供独立的 FastAPI 查询层，复用现有 MongoDB 数据，不改变 scheduler、worker 或
+爬虫处理流程。使用 `MyAgent` 环境启动：
+
+```bash
+conda activate MyAgent
+uvicorn app.api.app:create_app --factory --host 0.0.0.0 --port 8100
+```
+
+接口文档和集合对应关系见 [docs/API.md](docs/API.md)，Swagger 地址为
+`http://127.0.0.1:8100/docs`。

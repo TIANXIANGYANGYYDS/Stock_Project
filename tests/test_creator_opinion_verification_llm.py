@@ -100,6 +100,44 @@ def test_verify_uses_only_catalog_refs_and_programmatic_mainline_weight() -> Non
     assert not hasattr(llm, "analyze")
 
 
+def test_verify_accepts_same_day_source_published_before_close() -> None:
+    """收盘前发布的当日作品应能在当日收盘验证。"""
+
+    llm = verifier()
+    llm.chat = lambda **kwargs: json.dumps(  # type: ignore[method-assign]
+        {
+            "evaluations": [
+                {
+                    "opinion_id": "douyin:work-1:1",
+                    "verdict": "corroborated",
+                    "reason": "收盘事实支持观点。",
+                    "evidence_refs": ["facts.sector_relative_return.半导体"],
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    same_day_source = datetime(2026, 7, 24, 2, 0, tzinfo=UTC)
+    same_day_opinion = opinion().model_copy(
+        update={
+            "valid_from": same_day_source,
+            "valid_until": datetime(2026, 7, 24, 8, 0, tzinfo=UTC),
+        }
+    )
+
+    result = asyncio.run(
+        llm.verify(
+            opinions=[same_day_opinion],
+            source_published_at=same_day_source,
+            evidence=evidence(),
+            evaluation_date="2026-07-24",
+            source_window_start="2026-07-23",
+        )
+    )
+
+    assert result[0].verdict == "corroborated"
+
+
 def test_verify_accepts_auditable_web_evidence() -> None:
     """验证联网结果会保留 URL、标题和原文引用，并允许其支持理由数据。"""
 

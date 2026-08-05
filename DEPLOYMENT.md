@@ -190,3 +190,23 @@ MongoDB 只保留 `creator_works` 与 `creator_opinion_analyses` 两张博主业
 后者每位博主一条，保存已验证观点、累计准确性评分和待验证观点。迁移脚本会在备份后
 删除 `creator_work_processing`、`creator_crawl_checkpoints` 和
 `creator_daily_verifications`，运行中的 scheduler/worker 必须在迁移前停止。
+
+## 12. 启动只读查询 API
+
+API 与 scheduler、worker 独立运行，只查询现有 MongoDB 集合，不创建任务队列或写入新的
+业务集合。使用 `MyAgent` 环境启动：
+
+```bash
+conda activate MyAgent
+cd /home/txy/Agent_first/Stock_Project
+uvicorn app.api.app:create_app --factory --host 0.0.0.0 --port 8100
+```
+
+启动后可检查：
+
+```bash
+curl http://127.0.0.1:8100/api/v1/health
+curl http://127.0.0.1:8100/openapi.json
+```
+
+完整查询路径和参数见 [docs/API.md](docs/API.md)。

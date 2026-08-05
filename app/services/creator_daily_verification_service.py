@@ -281,6 +281,7 @@ class CreatorDailyVerificationService:
                     due_works=due_groups[creator_id],
                     missing_due_opinion_ids=missing_due_by_creator[creator_id],
                     score_day=score_day,
+                    source_window_start=decision.prev_trade_date,
                     as_of=active_as_of,
                     evidence=evidence,
                 )
@@ -303,6 +304,7 @@ class CreatorDailyVerificationService:
         due_works: Sequence[tuple[CreatorWork, list[CreatorOpinion]]],
         missing_due_opinion_ids: Collection[str],
         score_day: date,
+        source_window_start: date | str,
         as_of: datetime,
         evidence: CreatorMarketEvidence,
     ) -> CreatorDailyVerificationRunResult:
@@ -330,7 +332,7 @@ class CreatorDailyVerificationService:
                     work=selected_work,
                     evidence=evidence,
                     evaluation_date=score_day,
-                    source_window_start=work.published_at.astimezone(CN_TZ).date(),
+                    source_window_start=source_window_start,
                     market_mainline_targets=self._market_mainline_targets(evidence),
                 )
                 records.extend(

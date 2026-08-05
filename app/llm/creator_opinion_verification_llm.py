@@ -150,7 +150,7 @@ class CreatorOpinionVerificationLLMAnalyzer(QwenAnalysisLLM):
         if active_source_start >= evaluation_day:
             raise ValueError("作品来源窗口起点必须早于评价日")
         source_day = source_published_at.astimezone(CN_TZ).date()
-        if not active_source_start <= source_day < evaluation_day:
+        if not active_source_start <= source_day <= evaluation_day:
             raise ValueError("作品发布时间不在本次收盘验证来源窗口内")
         market_close = datetime.combine(evaluation_day, time(15), tzinfo=CN_TZ)
         if evidence.as_of.astimezone(CN_TZ) < market_close:

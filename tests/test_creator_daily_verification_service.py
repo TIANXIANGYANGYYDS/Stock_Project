@@ -213,6 +213,7 @@ def test_run_moves_due_opinions_and_isolates_creator_failure() -> None:
     assert len(opinions.settlements[0][1]) == 1
     assert opinions.docs["creator-1"].pending_opinions == []
     assert len(opinions.docs["creator-1"].verified_opinions) == 1
+    assert verifier.calls[0]["source_window_start"] == "2026-07-23"
 
 
 def test_run_skips_market_evidence_when_no_opinion_is_due() -> None:
