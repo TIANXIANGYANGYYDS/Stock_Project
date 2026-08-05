@@ -9,6 +9,12 @@ LOG_DIR = LOCAL_DIR / "logs"
 
 
 def main() -> None:
+    """打印本项目在当前机器上的启动、停止、状态检查和日志查看命令。
+
+    该入口只根据项目根目录拼接本地运维路径并输出说明，不启动服务、不读取
+    环境变量，也不会修改 ``.local`` 目录中的任何文件。
+    """
+
     print("Stock_Project 启动说明")
     print("本地脚本、日志、运行状态统一放在 .local 目录，不上传。")
     print(f"本地目录: {LOCAL_DIR}")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 from datetime import datetime
 from typing import Any
@@ -17,28 +18,29 @@ MORNING_ANALYSIS_JOB_ID = "morning_market_analysis"
 async def _run_morning_analysis(
     *,
     reference_datetime: datetime | None = None,
+    persist: bool = True,
 ) -> Any:
     """
     构造盘前分析服务，并按业务模块固定的数据窗口参数执行一次分析。
 
     `reference_datetime` 可用于手工历史执行或测试；服务内部仍会判断该日期是否
-    为交易日，并以固定的 09:00 作为新闻和博主观点的可用截止点。
+    为交易日，并以固定的 08:20 作为新闻和博主观点的可用截止点。
     """
     from app.services.morning_analysis_service import (
         MORNING_ANALYSIS_CREATOR_LIMIT,
-        MORNING_ANALYSIS_MAX_CREATOR_AGE_HOURS,
+        MORNING_ANALYSIS_CREATOR_WORK_LIMIT,
         MORNING_ANALYSIS_MAX_RANKING_AGE_MINUTES,
         MORNING_ANALYSIS_RANKING_LIMIT,
         MorningAnalysisService,
     )
-
     service = MorningAnalysisService()
     return await service.run(
         reference_datetime=reference_datetime,
+        persist=persist,
         ranking_limit=MORNING_ANALYSIS_RANKING_LIMIT,
         max_snapshot_age_minutes=MORNING_ANALYSIS_MAX_RANKING_AGE_MINUTES,
-        max_creator_age_hours=MORNING_ANALYSIS_MAX_CREATOR_AGE_HOURS,
         creator_limit=MORNING_ANALYSIS_CREATOR_LIMIT,
+        creator_work_limit=MORNING_ANALYSIS_CREATOR_WORK_LIMIT,
     )
 
 
@@ -100,6 +102,16 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(description="手工生成指定交易日的盘前市场分析")
     parser.add_argument("--date", help="分析日期，格式 YYYY-MM-DD；默认使用今天")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="完整执行取数和分析但不写入 MongoDB",
+    )
+    parser.add_argument(
+        "--print-analysis",
+        action="store_true",
+        help="在完成后输出最终风险结论和五条行业主线 JSON",
+    )
     args = parser.parse_args()
 
     reference_datetime = None
@@ -114,9 +126,31 @@ if __name__ == "__main__":
             minute=MORNING_ANALYSIS_MINUTE,
         )
     run_result = asyncio.run(
-        _run_morning_analysis(reference_datetime=reference_datetime)
+        _run_morning_analysis(
+            reference_datetime=reference_datetime,
+            persist=not args.dry_run,
+        )
     )
     if run_result.skipped:
         print(f"skipped: {run_result.reason}")
     else:
-        print(f"completed: {run_result.report.analysis_date}")
+        mode = "dry-run" if args.dry_run else "completed"
+        print(f"{mode}: {run_result.report.analysis_date}")
+        if args.print_analysis:
+            print(
+                json.dumps(
+                    {
+                        "analysis_date": run_result.report.analysis_date,
+                        "data_quality": run_result.report.data_quality,
+                        "source_analysis_memos": (
+                            run_result.report.source_analysis_memos
+                        ),
+                        "scenario_analysis_memos": (
+                            run_result.report.scenario_analysis_memos
+                        ),
+                        "analysis": run_result.report.analysis.model_dump(mode="json"),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )

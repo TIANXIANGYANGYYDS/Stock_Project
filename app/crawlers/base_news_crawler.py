@@ -1,9 +1,8 @@
-# app/crawlers/base_news_crawler.py
+# 文件：app/crawlers/base_news_crawler.py
 
 from __future__ import annotations
 
 import re
-import time
 import hashlib
 from datetime import datetime, timezone, timedelta
 from typing import Any, ClassVar
@@ -18,16 +17,20 @@ CN_TZ = timezone(timedelta(hours=8))
 
 
 class NewsCrawlerError(Exception):
+    """新闻抓取、响应解析或统一数据校验失败时使用的基础异常。"""
+
     pass
 
 
 class NewsCrawlerBlockedError(NewsCrawlerError):
+    """目标站点返回明确反爬状态或验证页面时抛出的专用异常。"""
+
     pass
 
 
 class BaseNewsCrawler:
     """
-    新闻爬虫 Base 类。
+    新闻爬虫基类。
 
     只负责：
     1. 请求能力
@@ -44,8 +47,10 @@ class BaseNewsCrawler:
     - 状态流转
     """
 
+    #: 子类必须声明的稳定新闻来源标识，用于写入 ``FetchedNews.source``。
     source: ClassVar[str]
 
+    #: 可直接判定请求受限、需要切换网络出口的 HTTP 状态码集合。
     blocked_status_codes: ClassVar[set[int]] = {
         403,
         407,
@@ -56,6 +61,7 @@ class BaseNewsCrawler:
         503,
     }
 
+    #: 响应正文中代表验证码、频控或访问拒绝的强特征词列表。
     blocked_keywords: ClassVar[list[str]] = [
         "access denied",
         "captcha",
@@ -66,16 +72,21 @@ class BaseNewsCrawler:
         "验证码",
     ]
 
+    #: 所有新闻站点正文都需要移除的分享、收藏等界面噪声正则。
     common_noise_patterns: ClassVar[list[str]] = [
         r"分享[:：]?\s*微信扫码分享",
         r"分享\s*收藏\s*详情\s*复制",
         r"分享|收藏|详情|复制",
     ]
 
+    #: 子类扩展的站点特有正文噪声正则。
     site_noise_patterns: ClassVar[list[str]] = []
+    #: 子类扩展的重复区域起点正则，命中后只保留前半段正文。
     site_duplicate_split_patterns: ClassVar[list[str]] = []
+    #: 子类扩展的正文开头冗余前缀正则。
     site_leading_content_patterns: ClassVar[list[str]] = []
 
+    #: 新闻正文开头常见来源和日期播报前缀的清洗正则。
     source_prefix_patterns: ClassVar[list[str]] = [
         r"^财联社\d{1,2}月\d{1,2}日电[，,]?\s*",
         r"^金十数据\d{1,2}月\d{1,2}日讯[，,]?\s*",
@@ -83,6 +94,7 @@ class BaseNewsCrawler:
         r"^证券时报[·\-—]?e公司\d{1,2}月\d{1,2}日讯[，,]?\s*",
     ]
 
+    #: 标题开头不承载主题信息、生成标题时应删除的弱语义前缀。
     weak_title_prefix_patterns: ClassVar[list[str]] = [
         r"^据报道[，,]\s*",
         r"^据悉[，,]\s*",
@@ -92,6 +104,7 @@ class BaseNewsCrawler:
         r"^媒体报道称[，,]\s*",
     ]
 
+    #: 生成去重正文时用于统一中英文标点的替换映射。
     punctuation_replacements: ClassVar[dict[str, str]] = {
         "，": ",",
         "。": ".",
@@ -114,12 +127,17 @@ class BaseNewsCrawler:
         proxy_minutes: int = 3,
         proxy_retry_times: int = 3,
     ) -> None:
-        self.timeout = timeout
-        self.proxy_minutes = proxy_minutes
-        self.proxy_retry_times = proxy_retry_times
+        """初始化公共 HTTP 请求与代理回退参数。
+
+        ``timeout`` 控制单次请求超时；``proxy_minutes`` 是代理提供器申请的
+        有效分钟数；``proxy_retry_times`` 控制本地出口失败后的代理尝试次数。
+        """
+        self.timeout = timeout  #: 单次 HTTP 请求的超时秒数。
+        self.proxy_minutes = proxy_minutes  #: 向代理服务申请的 IP 有效分钟数。
+        self.proxy_retry_times = proxy_retry_times  #: 本地请求失败后的代理重试上限。
 
     # =========================
-    # HTTP / proxy
+    # HTTP 请求与代理
     # =========================
 
     def is_blocked_response(self, resp: requests.Response) -> bool:
@@ -160,9 +178,14 @@ class BaseNewsCrawler:
                 return True
 
         return False
-    
+
 
     def get_proxy_from_provider(self, provider: DailiProxyProvider) -> dict[str, str]:
+        """从代理提供器取得并校验 requests 可直接使用的代理映射。
+
+        返回值必须同时含 ``http`` 和 ``https`` 键；提供器返回空值、非字典或
+        键不完整时抛出 :class:`NewsCrawlerError`，避免发出配置不明的请求。
+        """
         proxies = provider.get_requests_proxies()
 
         if proxies is None:
@@ -184,6 +207,12 @@ class BaseNewsCrawler:
         headers: dict[str, str] | None = None,
         proxies: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        """发送一次 GET 请求并返回顶层为字典的 JSON 响应。
+
+        方法统一应用实例超时、反爬识别和 HTTP 状态检查；响应不是合法 JSON
+        或顶层不是对象时转为 :class:`NewsCrawlerError`，受限响应则抛出
+        :class:`NewsCrawlerBlockedError`。
+        """
         resp = requests.get(
             url,
             params=params,
@@ -216,9 +245,10 @@ class BaseNewsCrawler:
         params: dict[str, Any] | None = None,
         headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
-        """
-        优先本地 IP。
-        本地 IP 失败 / 被封后才走代理池。
+        """优先以本地网络请求 JSON，受限、网络或解析失败后切换代理重试。
+
+        代理使用前执行一次连通性诊断；每次结果通知提供器继续复用或淘汰当前
+        端点，耗尽 ``proxy_retry_times`` 后抛出包含最后异常的统一爬虫错误。
         """
         try:
             return self.request_json(
@@ -272,10 +302,11 @@ class BaseNewsCrawler:
         raise NewsCrawlerError(f"fetch failed after proxy retries: {last_error}")
 
     # =========================
-    # text normalize
+    # 文本规范化
     # =========================
 
     def strip_news_source_prefix(self, text: str) -> str:
+        """删除正文开头匹配的来源、日期播报前缀并返回去空白文本。"""
         text = (text or "").strip()
 
         for pattern in self.source_prefix_patterns:
@@ -284,13 +315,14 @@ class BaseNewsCrawler:
         return text.strip()
 
     def clean_page_text(self, text: str) -> str:
+        """把页面文本中的不换行空格和连续空白折叠为单个普通空格。"""
         if not text:
             return ""
 
         text = text.replace("\xa0", " ")
         text = re.sub(r"\s+", " ", text)
         return text.strip()
-    
+
     def strip_news_source_suffix(self, text: str) -> str:
         """
         去掉正文尾部来源署名。
@@ -319,6 +351,11 @@ class BaseNewsCrawler:
         return text
 
     def clean_news_content(self, content: str, fallback: str = "") -> str:
+        """按公共规则和子类站点规则清洗一段新闻正文。
+
+        空正文先使用 ``fallback``；随后删除界面噪声、重复推荐区域、方括号标题、
+        站点开头模式以及首尾来源署名，最终保留可展示的规范化正文。
+        """
         content = self.clean_page_text(content)
         fallback = self.clean_page_text(fallback)
 
@@ -353,6 +390,7 @@ class BaseNewsCrawler:
         return content
 
     def remove_weak_title_prefix(self, text: str) -> str:
+        """移除“据悉”“消息称”等不承载主题信息的标题开头短语。"""
         text = (text or "").strip()
 
         for pattern in self.weak_title_prefix_patterns:
@@ -361,8 +399,10 @@ class BaseNewsCrawler:
         return text.strip()
 
     def build_title_from_content(self, content: str, max_len: int = 80) -> str:
-        """
-        没有标题时，从正文生成标题。
+        """从清洗后的正文首句或首个分句生成不超过 ``max_len`` 的标题。
+
+        来源和弱语义前缀先被移除；优先在句号、问叹号或分号处截断，其次使用
+        逗号、冒号或换行，仍过长时按字符上限截断。
         """
         text = self.strip_news_source_prefix(content)
         text = self.remove_weak_title_prefix(text)
@@ -419,9 +459,10 @@ class BaseNewsCrawler:
         return title, content
 
     def normalize_content_for_event_id(self, content: str) -> str:
-        """
-        event_id 用的正文规范化。
-        必须与入库 content 使用同一套严格清洗逻辑。
+        """按入库正文的同一严格清洗口径生成事件身份计算文本。
+
+        共用清洗函数保证后续以正文硬去重时，``event_id`` 与持久化内容不会因
+        标点、空白或来源噪声使用不同规范。
         """
         return self.strict_clean_content_for_dedup(content)
 
@@ -453,8 +494,10 @@ class BaseNewsCrawler:
 
 
     def build_event_id(self, content: str) -> str:
-        """
-        event_id = md5(normalized_content)
+        """对规范化正文计算 MD5，生成稳定的三十二位十六进制事件 ID。
+
+        严格规范化意外得到空文本时回退到原正文去空白值，避免散列输入被静默
+        替换为与调用方内容完全无关的数据。
         """
         normalized_content = self.normalize_content_for_event_id(content)
 
@@ -464,10 +507,15 @@ class BaseNewsCrawler:
         return hashlib.md5(normalized_content.encode("utf-8")).hexdigest()
 
     # =========================
-    # time / result utils
+    # 时间与结果工具
     # =========================
 
     def format_publish_time(self, ts: Any) -> tuple[int | None, str | None]:
+        """把秒或毫秒 Unix 时间戳转换为秒值和北京时间字符串。
+
+        输入为空或不能转换为整数时返回 ``(None, None)``；大于 ``10**12`` 的
+        值按毫秒时间戳处理，成功时格式化为 ``YYYY-MM-DD HH:MM:SS``。
+        """
         if ts is None:
             return None, None
 
@@ -490,6 +538,11 @@ class BaseNewsCrawler:
         rows: list[FetchedNews | None],
         limit: int | None = None,
     ) -> list[FetchedNews]:
+        """过滤空记录并按事件 ID 去重、按发布时间倒序排列新闻。
+
+        ``None`` 或正文为空的记录不会进入结果；相同 ``event_id`` 只保留输入中
+        首次出现的一条，指定 ``limit`` 时再截取排序后的前若干条。
+        """
         seen = set()
         cleaned: list[FetchedNews] = []
 
@@ -512,7 +565,7 @@ class BaseNewsCrawler:
             return cleaned[:limit]
 
         return cleaned
-    
+
     def request_text(
         self,
         url: str,
@@ -521,6 +574,11 @@ class BaseNewsCrawler:
         headers: dict[str, str] | None = None,
         proxies: dict[str, str] | None = None,
     ) -> str:
+        """发送一次 GET 请求并返回按响应编码解码后的页面文本。
+
+        方法统一应用实例超时、反爬识别与状态检查；缺少可靠编码或服务端声明
+        ISO-8859-1 时使用 requests 推测编码，受限响应抛出专用异常。
+        """
         resp = requests.get(
             url,
             params=params,

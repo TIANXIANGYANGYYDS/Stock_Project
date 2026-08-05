@@ -15,31 +15,53 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SourceIngestionResult:
+    """记录单个新闻来源在本轮抓取中的数量和错误摘要。"""
+
+    # 新闻来源稳定标识，例如 cls、jin10 或 10jqka。
     source: str
+    # 该来源本轮成功返回、尚未跨来源去重的新闻条数。
     fetched_count: int = 0
+    # 抓取失败时的异常文本；成功时为 None。
     error_message: Optional[str] = None
 
 
 @dataclass
 class NewsIngestionResult:
+    """汇总一次多来源新闻抓取、去重和数据库写入的统计结果。"""
+
+    # 所有来源抓取条数之和，包含来源间重复事件。
     total_fetched_count: int
+    # 按 event_id 做本轮内存去重后的事件数。
     unique_count: int
+    # 本轮实际新写入数据库的事件数。
     inserted_count: int
+    # 去重后已存在于数据库、未重复插入的事件数。
     existing_count: int
+    # 本轮抓取结果中因 event_id 重复而移除的条数。
     duplicate_count: int = 0
+    # 各来源的独立抓取统计与错误信息。
     source_results: List[SourceIngestionResult] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
 class _CrawlerSource:
+    """把来源标识与其同步抓取函数绑定为一个不可变执行项。"""
+
+    # 用于日志和统计的新闻来源标识。
     source: str
+    # 无参数同步抓取函数，返回该来源的标准化新闻列表。
     fetcher: Callable[[], List[FetchedNews]]
 
 
 @dataclass
 class _CrawlerFetchResult:
+    """保存一个抓取函数的标准化行及可选错误，供主流程统一汇总。"""
+
+    # 本结果所属的新闻来源标识。
     source: str
+    # 抓取成功得到的标准化新闻；失败时为空列表。
     rows: List[FetchedNews]
+    # 抓取异常文本；成功时为 None。
     error_message: Optional[str] = None
 
 
@@ -69,9 +91,19 @@ class NewsIngestionService:
         jin10_crawler: Optional[Jin10NewsCrawler] = None,
         tonghuashun_crawler: Optional[TonghuashunNewsCrawler] = None,
     ):
+        """创建新闻入库服务并允许调用方替换仓储或任一来源爬虫。
+
+        未注入的依赖使用生产默认实现；注入点主要供测试和独立运行场景隔离
+        数据库与外部网络。构造过程本身不会创建索引或执行抓取。
+        """
+
+        # 负责新闻索引创建、幂等写入和数据库重复判断的仓储。
         self.news_repository = news_repository or NewsRepository()
+        # 财联社最新新闻同步爬虫。
         self.cls_crawler = cls_crawler or CLSNewsCrawler()
+        # 金十快讯同步爬虫。
         self.jin10_crawler = jin10_crawler or Jin10NewsCrawler()
+        # 同花顺电报同步爬虫。
         self.tonghuashun_crawler = tonghuashun_crawler or TonghuashunNewsCrawler()
 
     async def ensure_indexes(self) -> None:
@@ -83,8 +115,10 @@ class NewsIngestionService:
         await self.news_repository.create_indexes()
 
     async def ingest_latest_news(self) -> NewsIngestionResult:
-        """
-        执行一次最新新闻抓取入库。
+        """并发抓取全部新闻源，对事件去重后批量写入仓储。
+
+        单一来源失败会记录在对应来源结果中，不阻断其他来源；返回值汇总各来源抓取量、
+        去重前后数量以及 MongoDB 新增、更新和跳过统计，供调度与监控调用方使用。
         """
         crawler_sources = self._build_crawler_sources()
 
@@ -124,6 +158,8 @@ class NewsIngestionService:
         )
 
     def _build_crawler_sources(self) -> List[_CrawlerSource]:
+        """按固定来源顺序构造本轮要并发执行的抓取任务描述。"""
+
         return [
             _CrawlerSource(
                 source="cls",
@@ -143,6 +179,8 @@ class NewsIngestionService:
         self,
         fetcher: Callable[[], List[FetchedNews]],
     ) -> List[FetchedNews]:
+        """在线程池中运行同步爬虫，避免阻塞当前 asyncio 事件循环。"""
+
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, fetcher)
 
@@ -150,6 +188,12 @@ class NewsIngestionService:
         self,
         crawler_source: _CrawlerSource,
     ) -> _CrawlerFetchResult:
+        """执行一个来源的一次抓取，并把异常转换为可汇总的失败结果。
+
+        单来源失败不会向外传播或取消其他来源任务；异常仍写入日志，并在结果中
+        保留错误文本供调度日志和监控使用。
+        """
+
         try:
             rows = await self._run_fetcher_in_thread(crawler_source.fetcher)
 
@@ -174,6 +218,11 @@ class NewsIngestionService:
         self,
         rows: List[FetchedNews],
     ) -> List[FetchedNews]:
+        """按 ``event_id`` 保留每个事件首次出现的行，并按发布时间倒序返回。
+
+        ``publish_ts`` 缺失时按 0 排序，因此会自然落在有明确发布时间的新闻之后。
+        """
+
         unique_rows: Dict[str, FetchedNews] = {}
 
         for row in rows:
@@ -189,7 +238,7 @@ class NewsIngestionService:
         )
 
 if __name__ == "__main__":
-    
+
     service = NewsIngestionService()
     result = asyncio.run(service.ingest_latest_news())
 

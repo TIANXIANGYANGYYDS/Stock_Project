@@ -13,11 +13,21 @@ from app.crawlers.base_news_crawler import BaseNewsCrawler, CN_TZ
 
 
 class Jin10NewsCrawler(BaseNewsCrawler):
+    """抓取金十首页快讯候选及详情页正文并生成统一新闻记录。
+
+    首页只用于发现快讯 ID、时间和摘要，详情页用于补充完整发布时间与正文；
+    详情地址会严格限制在金十快讯域名和 ``/detail/`` 路径下。
+    """
+
+    #: 持久化新闻时使用的金十来源标识。
     source = "jin10"
 
+    #: 用于发现最新快讯候选项的金十首页地址。
     base_url = "https://www.jin10.com/"
+    #: 用于拼接和校验快讯详情地址的固定来源站点。
     detail_base = "https://flash.jin10.com"
 
+    #: 请求金十首页及详情页时使用的桌面浏览器请求头。
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -28,15 +38,18 @@ class Jin10NewsCrawler(BaseNewsCrawler):
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
 
+    #: 正文清洗时删除的金十详情页固定导航和品牌噪声。
     site_noise_patterns = [
         r"首页\s*快讯详情",
         r"JIN10\.COM\s*I\s*一个交易工具",
     ]
 
+    #: 遇到详情页推荐区重复正文标记时截断内容的正则列表。
     site_duplicate_split_patterns = [
         r"\s*[-—]\s*金十数据(?:\s*书签)?\s+\d{4}-\d{2}-\d{2}\s+周.\s+\d{2}:\d{2}:\d{2}\s+",
     ]
 
+    #: 清洗正文开头的图示标签、日期播报前缀和来源前缀的正则列表。
     site_leading_content_patterns = [
         r"^金十图示[：:]\s*",
         r"^(.{4,80}?)\s+金十数据\d{1,2}月\d{1,2}日讯[，,:：]?\s*",
@@ -44,18 +57,26 @@ class Jin10NewsCrawler(BaseNewsCrawler):
     ]
 
     def fetch_home_html(self) -> str:
+        """请求金十首页并返回 HTML，网络失败时沿用基类代理回退策略。"""
         return self.request_text_with_local_first(
             self.base_url,
             headers=self.headers,
         )
 
     def fetch_detail_html(self, detail_url: str) -> str:
+        """请求一个已经校验过的金十快讯详情地址并返回 HTML 文本。"""
         return self.request_text_with_local_first(
             detail_url,
             headers=self.headers,
         )
 
     def normalize_detail_url(self, href: str | None) -> str | None:
+        """规范化并校验一个候选金十详情链接。
+
+        协议相对地址和站内相对地址会补全；非 HTTP(S)、非
+        ``flash.jin10.com`` 域名或非 ``/detail/`` 路径均返回 ``None``，
+        防止爬虫跟随页面中的无关或外部链接。
+        """
         href = (href or "").strip()
         if not href:
             return None
@@ -80,9 +101,10 @@ class Jin10NewsCrawler(BaseNewsCrawler):
         return href
 
     def parse_flash_list(self, html: str) -> list[dict]:
-        """
-        从金十首页提取候选快讯。
-        这里仍然只做列表页候选提取，正文以详情页为准。
+        """从金十首页提取时间、摘要和稳定详情地址组成的候选快讯。
+
+        优先解析新版带 ``flash`` 容器 ID 的服务端渲染结构，无结果时回退到详情
+        链接遍历；VIP 占位、摘要过短和重复候选会被过滤，正文仍以详情页为准。
         """
         soup = BeautifulSoup(html, "html.parser")
 
@@ -176,8 +198,10 @@ class Jin10NewsCrawler(BaseNewsCrawler):
         return items
 
     def fetch_detail(self, detail_url: str) -> dict | None:
-        """
-        抓取详情页，提取完整发布时间和正文。
+        """抓取并解析一个金十详情页的完整发布时间和正文。
+
+        地址校验失败或请求异常返回 ``None``；成功时删除详情页导航、品牌和分享
+        噪声，返回供首页候选合并使用的原始字段字典。
         """
         detail_url = self.normalize_detail_url(detail_url)
         if not detail_url:
@@ -297,6 +321,12 @@ class Jin10NewsCrawler(BaseNewsCrawler):
     def normalize_item(
         self, list_item: dict, detail_item: dict | None
     ) -> FetchedNews | None:
+        """合并首页候选与可选详情数据，构造一条金十快讯模型。
+
+        详情发布时间和正文优先，首页时间与摘要作为兜底；无法得到有效时间或
+        正文时返回 ``None``。事件 ID 优先基于稳定详情 URL，避免推荐区变化
+        导致同一快讯在不同抓取批次产生不同身份。
+        """
         summary = self.clean_page_text(list_item.get("summary") or "")
         fallback_hms = list_item.get("time")
 
@@ -345,6 +375,11 @@ class Jin10NewsCrawler(BaseNewsCrawler):
         )
 
     def fetch_latest_telegraphs(self) -> list[FetchedNews]:
+        """抓取最近二十条金十候选、详情并返回去重后的新闻列表。
+
+        每条候选按顺序请求详情且短暂限速，然后合并、清洗并按 ``event_id``
+        去重；结果由基类按发布时间倒序排列。
+        """
         limit = 20
         detail_limit = None
         sleep_seconds = 0.2
@@ -375,8 +410,9 @@ class Jin10NewsCrawler(BaseNewsCrawler):
 
 
 def fetch_latest_telegraphs() -> list[FetchedNews]:
-    """
-    保留原来的函数入口，避免外部调用方大面积改动。
+    """构造金十爬虫并返回最新快讯，保留历史函数式调用入口。
+
+    该入口包含首页发现、详情补全、规范化和内存去重，不负责持久化。
     """
     return Jin10NewsCrawler().fetch_latest_telegraphs()
 

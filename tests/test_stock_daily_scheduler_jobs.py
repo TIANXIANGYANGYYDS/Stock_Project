@@ -171,3 +171,43 @@ def test_new_partial_run_is_compensated_immediately(monkeypatch) -> None:
             "max_automatic_compensations": 5,
         }
     ]
+
+
+def test_startup_full_sync_uses_low_concurrency(monkeypatch) -> None:
+    """确认服务重启补数不会沿用日常逆向任务的二十并发。"""
+
+    captured = {}
+
+    async def fake_resolve(reference_yyyymmdd):
+        return SimpleNamespace(
+            reference_trade_date="2026-07-14",
+            target_trade_date="2026-07-14",
+            target_yyyymmdd="20260714",
+            is_reference_trade_day=True,
+        )
+
+    async def always_false(*args, **kwargs):
+        return False
+
+    async def fake_full_sync(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(failed_count=0)
+
+    monkeypatch.setattr(crawler_jobs, "today_yyyymmdd", lambda: "20260714")
+    monkeypatch.setattr(crawler_jobs, "is_after_startup_min_time", lambda _: True)
+    monkeypatch.setattr(daily_service, "resolve_a_stock_target_trade_date", fake_resolve)
+    monkeypatch.setattr(
+        daily_service,
+        "stock_daily_detail_has_successful_sync_run",
+        always_false,
+    )
+    monkeypatch.setattr(
+        daily_service,
+        "stock_daily_detail_has_incomplete_sync_run",
+        always_false,
+    )
+    monkeypatch.setattr(daily_service, "run_stock_daily_detail_sync", fake_full_sync)
+
+    asyncio.run(crawler_jobs._run_stock_daily_detail_job(run_mode="startup"))
+
+    assert captured["concurrency"] == 8

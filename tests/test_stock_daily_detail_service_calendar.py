@@ -188,6 +188,23 @@ def test_validate_sync_items_rejects_local_indicator_source() -> None:
         asyncio.run(daily_service.close())
 
 
+def test_validate_sync_items_accepts_reverse_sources() -> None:
+    daily_service = service.StockDailyDetailService()
+    item = build_complete_item()
+    item.source.daily = service.EastMoneyReverseFetcher.SOURCE
+    item.source.indicator = service.EastMoneyReverseFetcher.INDICATOR_SOURCE
+    item.source.chip = service.EastMoneyReverseFetcher.CHIP_SOURCE
+
+    try:
+        daily_service._validate_sync_items_for_target_date(
+            [item],
+            target_trade_date="2026-06-26",
+            code="920992",
+        )
+    finally:
+        asyncio.run(daily_service.close())
+
+
 def test_sync_one_reads_only_missing_write_range(
     monkeypatch,
 ) -> None:
@@ -232,39 +249,46 @@ def test_sync_one_reads_only_missing_write_range(
     assert captured["end_date"] == "20260710"
 
 
-def test_sync_queue_uses_coroutine_workers(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("configured_concurrency", "expected_concurrency"),
+    [(None, 20), (8, 8)],
+)
+def test_reverse_queue_caps_workers_and_candidate_ip_budget(
+    monkeypatch,
+    configured_concurrency,
+    expected_concurrency,
+) -> None:
     daily_service = service.StockDailyDetailService(
-        concurrency=50,
-        page_concurrency=3,
-        proxy_minutes=3,
-        proxy_pool_size=8,
-        proxy_concurrency_per_ip=2,
+        concurrency=configured_concurrency,
         request_sleep_seconds=0,
     )
+    manager_configs = []
     worker_instances = []
-    processed_codes = []
-    rate_limiters = []
-    proxy_providers = []
+
+    class FakeReverseManager:
+        def __init__(self, **kwargs):
+            manager_configs.append(kwargs)
+
+        def report_stats(self):
+            return {"manager": {}, "provider": {}}
+
+        async def close(self):
+            pass
 
     class FakeWorkerCrawler:
         def __init__(self, **kwargs):
-            self.sleep_count = 0
-            self.closed = False
-            rate_limiters.append(kwargs["proxy_rate_limiter"])
-            proxy_providers.append(kwargs["proxy_provider"])
-            worker_instances.append(self)
+            worker_instances.append(kwargs)
 
         async def sleep_after_request(self):
-            self.sleep_count += 1
+            pass
 
         async def close(self):
-            self.closed = True
+            pass
 
-    async def fake_sync_one_with_crawler(*, crawler, code, **kwargs):
-        processed_codes.append(code)
-        await asyncio.sleep(0)
+    async def fake_sync_one_with_crawler(**kwargs):
         return 1
 
+    monkeypatch.setattr(service, "TargetAwareProxyManager", FakeReverseManager)
     monkeypatch.setattr(service, "StockDailyDetailCrawler", FakeWorkerCrawler)
     monkeypatch.setattr(
         daily_service,
@@ -273,39 +297,41 @@ def test_sync_queue_uses_coroutine_workers(monkeypatch) -> None:
     )
 
     async def run_test():
-        stock_rows = [(index, f"{index:06d}", f"股票{index}") for index in range(1, 21)]
         try:
+            stock_rows = [
+                (index, f"{index:06d}", f"股票{index}")
+                for index in range(1, 501)
+            ]
             return await daily_service._sync_stock_rows(
                 stock_rows=stock_rows,
                 total=len(stock_rows),
-                default_start_date="20260710",
-                end_date="20260710",
+                default_start_date="20260730",
+                end_date="20260730",
                 adjust="qfq",
-                target_trade_date="2026-07-10",
+                target_trade_date="2026-07-30",
+                retry_failed_once=False,
             )
         finally:
             await daily_service.close()
 
     results = asyncio.run(run_test())
 
-    assert len(worker_instances) == 6
-    assert len({id(limiter) for limiter in rate_limiters}) == 1
-    assert rate_limiters[0] is daily_service.proxy_rate_limiter
-    assert len({id(provider) for provider in proxy_providers}) == 1
-    assert proxy_providers[0].pool_size == 2
-    assert proxy_providers[0].minutes == 3
-    assert proxy_providers[0].max_concurrency_per_proxy == 2
-    assert len(daily_service.proxy_pool_stats_history) == 1
-    assert sum(item.sleep_count for item in worker_instances) == 20
-    assert all(item.closed for item in worker_instances)
-    assert set(processed_codes) == {f"{index:06d}" for index in range(1, 21)}
-    assert [item.affected for item in results] == [1] * 20
+    assert len(results) == 500
+    assert len(worker_instances) == expected_concurrency
+    assert len({id(item["reverse_fetcher"]) for item in worker_instances}) == 1
+    assert manager_configs == [
+        {
+            "pool_size": expected_concurrency,
+            "request_interval_seconds": 1.2,
+            "max_target_requests_per_proxy": 40,
+            "max_candidate_count": 40,
+        }
+    ]
 
 
 def test_sync_queue_retries_all_non_terminal_failures_once(monkeypatch) -> None:
     daily_service = service.StockDailyDetailService(
         concurrency=4,
-        page_concurrency=2,
         request_sleep_seconds=0,
     )
     attempts: dict[str, int] = {}
@@ -323,9 +349,9 @@ def test_sync_queue_retries_all_non_terminal_failures_once(monkeypatch) -> None:
     async def fake_sync_one_with_crawler(*, code, **kwargs):
         attempts[code] = attempts.get(code, 0) + 1
         if code == "000002" and attempts[code] == 1:
-            raise TimeoutError("page timeout")
+            raise TimeoutError("reverse request timeout")
         if code == "000003":
-            raise RuntimeError("page chip unavailable")
+            raise RuntimeError("reverse chip unavailable")
         return 1
 
     monkeypatch.setattr(service, "StockDailyDetailCrawler", FakeWorkerCrawler)
@@ -357,13 +383,12 @@ def test_sync_queue_retries_all_non_terminal_failures_once(monkeypatch) -> None:
     assert attempts == {"000001": 1, "000002": 2, "000003": 2}
     assert results[0].error is None
     assert results[1].error is None
-    assert results[2].error == "page chip unavailable"
+    assert results[2].error == "reverse chip unavailable"
 
 
 def test_retry_failed_run_uses_queue_and_reconciles_source(monkeypatch) -> None:
     daily_service = service.StockDailyDetailService(
         concurrency=4,
-        page_concurrency=2,
         request_sleep_seconds=0,
     )
     source_run = {
@@ -377,9 +402,9 @@ def test_retry_failed_run_uses_queue_and_reconciles_source(monkeypatch) -> None:
         "failed_count": 3,
         "affected_total": 0,
         "failed_items": [
-            {"code": "000001", "name": "股票1", "error": "page timeout"},
+            {"code": "000001", "name": "股票1", "error": "reverse request timeout"},
             {"code": "000002", "name": "股票2", "error": "net::ERR_FAILED"},
-            {"code": "000003", "name": "股票3", "error": "page chip unavailable"},
+            {"code": "000003", "name": "股票3", "error": "reverse chip unavailable"},
         ],
     }
     updates = []
@@ -407,14 +432,14 @@ def test_retry_failed_run_uses_queue_and_reconciles_source(monkeypatch) -> None:
                 total=3,
                 code="000002",
                 name="股票2",
-                error="page timeout",
+                error="reverse request timeout",
             ),
             service.StockDailyDetailItemResult(
                 index=3,
                 total=3,
                 code="000003",
                 name="股票3",
-                error="page chip unavailable",
+                error="reverse chip unavailable",
             ),
         ]
 
@@ -467,7 +492,9 @@ def test_retryable_failures_are_not_permanently_exhausted(monkeypatch) -> None:
         def find_latest_incomplete_full_run(self, **kwargs):
             return {
                 "run_id": "source-run",
-                "failed_items": [{"code": "000001", "error": "page timeout"}],
+                "failed_items": [
+                    {"code": "000001", "error": "reverse request timeout"}
+                ],
                 "automatic_compensation_count": 2,
             }
 
@@ -504,78 +531,19 @@ def test_retryable_failures_are_not_permanently_exhausted(monkeypatch) -> None:
     assert updates[-1][1]["$set"]["automatic_retry_exhausted"] is False
 
 
-def test_only_missing_pages_are_not_retryable() -> None:
+def test_only_terminal_reverse_failures_are_not_retryable() -> None:
     assert service.StockDailyDetailService._is_retryable_item_error(
-        "Error('Page.evaluate: Object')"
-    )
-    assert service.StockDailyDetailService._is_retryable_item_error(
-        "Execution context was destroyed"
+        "ReverseNetworkError('connection reset')"
     )
     assert service.StockDailyDetailService._is_retryable_item_error(
-        "page chip unavailable"
+        "reverse chip unavailable"
     )
     assert not service.StockDailyDetailService._is_retryable_item_error(
-        "行情页响应异常: status=404"
+        "逆向接口响应异常: status=404"
     )
     assert not service.StockDailyDetailService._is_retryable_item_error(
-        "行情页响应异常: status=410"
+        "逆向接口响应异常: status=410"
     )
     assert not service.StockDailyDetailService._is_retryable_item_error(
-        "东方财富网页在指定日期范围内没有日 K 数据"
+        "指定日期范围内没有日 K 数据"
     )
-
-
-def test_browser_runtime_error_gets_two_extra_compensations(monkeypatch) -> None:
-    updates = []
-
-    class FakeService:
-        def __init__(self, **kwargs):
-            self.sync_run_collection = self
-
-        def ensure_indexes(self):
-            pass
-
-        def find_latest_incomplete_full_run(self, **kwargs):
-            return {
-                "run_id": "source-run",
-                "failed_items": [
-                    {"code": "000001", "error": "Error('Page.evaluate: Object')"}
-                ],
-                "automatic_compensation_count": 3,
-                "automatic_retry_exhausted": True,
-            }
-
-        async def retry_failed_run(self, run_id):
-            return service.StockDailyDetailSyncResult(
-                run_id="retry-run",
-                target_trade_date="2026-07-14",
-                adjust="qfq",
-                run_mode="retry",
-                scope_key="retry:source-run",
-                expected_count=1,
-                failed_count=1,
-                status=service.SYNC_STATUS_FAILED,
-            )
-
-        def find_one(self, query, projection=None):
-            return {"status": service.SYNC_STATUS_FAILED, "failed_count": 1}
-
-        def update_one(self, query, update):
-            updates.append((query, update))
-
-        async def close(self):
-            pass
-
-    monkeypatch.setattr(service, "StockDailyDetailService", FakeService)
-
-    result = asyncio.run(
-        service.retry_latest_incomplete_stock_daily_detail_run(
-            "2026-07-14",
-            max_automatic_compensations=3,
-        )
-    )
-
-    assert result is not None
-    assert updates[0][1]["$set"]["browser_runtime_retry_enabled"] is True
-    assert updates[-1][1]["$set"]["automatic_compensation_count"] == 4
-    assert updates[-1][1]["$set"]["automatic_retry_exhausted"] is False

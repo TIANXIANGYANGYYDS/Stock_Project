@@ -2,18 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 import logging
 import math
 import random
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, TypeVar
+from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar
 
 import httpx
 import pandas as pd
 
+from app.crawlers.eastmoney_reverse_fetcher import EastMoneyReverseFetcher
 from app.crawlers.proxy_provider import (
     AsyncProxyProvider,
     AsyncRequestRateLimiter,
@@ -43,50 +42,47 @@ _T = TypeVar("_T")
 CN_TZ = timezone(timedelta(hours=8))
 
 
-class NonRetryablePageError(RuntimeError):
-    """A deterministic page error that changing the network cannot fix."""
-
-
 class EastMoneyDataFetcher:
-    """Fetch EastMoney stock-list/calendar reference data."""
+    """通过东方财富公开 JSON 接口读取股票清单、交易日和基础日 K 数据。
 
+    实例按代理地址复用独立的 httpx 客户端，避免本地连接和不同代理连接池混用；
+    多个备用域名按顺序尝试，所有返回值在进入上层组装流程前完成结构校验。
+    """
+
+    #: 东方财富日 K 接口的主域名与历史数据备用域名，按顺序尝试。
     KLINE_URLS = (
         "https://push2.eastmoney.com/api/qt/stock/kline/get",
         "https://push2his.eastmoney.com/api/qt/stock/kline/get",
     )
+    #: A 股实时列表接口的多个可用域名，单页请求失败时顺序回退。
     CLIST_URLS = (
         "https://push2delay.eastmoney.com/api/qt/clist/get",
         "https://push2.eastmoney.com/api/qt/clist/get",
         "https://82.push2.eastmoney.com/api/qt/clist/get",
     )
+    #: 股票列表接口的沪深京 A 股市场筛选表达式。
     CLIST_FS = "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048"
+    #: 股票列表所需代码、名称、价格、成交量、成交额和更新时间字段。
     CLIST_FIELDS = "f12,f14,f2,f5,f6,f124"
+    #: 默认连接超时和读取超时秒数组合。
     DEFAULT_TIMEOUT = (5, 12)
+    #: 日 K 接口固定请求的基础元数据字段集合。
     KLINE_FIELDS1 = "f1,f2,f3,f4,f5,f6"
+    #: 日 K 接口返回日期、OHLC、量额和涨跌指标的字段集合。
     KLINE_FIELDS2 = "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61"
+    #: 东方财富日 K 接口要求的固定访问令牌参数。
     UT = "7eea3edcaed734bea9cbfc24409ed989"
+    #: 东方财富股票列表接口要求的固定访问令牌参数。
     CLIST_UT = "bd1d9ddb04089700cf9c27f6f7426281"
-
-    DAILY_COLUMNS = [
-        "日期",
-        "开盘",
-        "收盘",
-        "最高",
-        "最低",
-        "成交量",
-        "成交额",
-        "振幅",
-        "涨跌幅",
-        "涨跌额",
-        "换手率",
-    ]
 
     def __init__(
         self,
         *,
         timeout: tuple[int, int] = DEFAULT_TIMEOUT,
     ) -> None:
-        self.timeout = timeout
+        """初始化超时、东方财富请求头和按代理地址分组的客户端缓存。"""
+        self.timeout = timeout  #: httpx 使用的 ``(连接超时, 读取超时)`` 秒数。
+        #: 东方财富 JSON 接口使用的统一桌面浏览器请求头。
         self.headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -96,9 +92,11 @@ class EastMoneyDataFetcher:
             "Referer": "https://quote.eastmoney.com/",
             "Accept": "application/json,text/plain,*/*",
         }
+        #: 以代理 URL 为键复用的异步客户端；``None`` 键代表本地直连客户端。
         self._clients: Dict[Optional[str], httpx.AsyncClient] = {}
 
     async def close(self) -> None:
+        """关闭所有本地和代理 httpx 客户端，并清空客户端缓存。"""
         for client in self._clients.values():
             await client.aclose()
         self._clients.clear()
@@ -107,6 +105,11 @@ class EastMoneyDataFetcher:
         self,
         proxies: Optional[Dict[str, str]],
     ) -> httpx.AsyncClient:
+        """返回与给定代理映射匹配的复用客户端，必要时创建新客户端。
+
+        代理映射必须至少含 ``https`` 或 ``http`` 地址；每个代理 URL 使用独立
+        连接池，避免更换代理后复用旧连接。空映射使用禁用环境代理的直连客户端。
+        """
         proxy = None
         if proxies:
             proxy = proxies.get("https") or proxies.get("http")
@@ -131,12 +134,14 @@ class EastMoneyDataFetcher:
 
     @staticmethod
     def get_secid(code: str) -> str:
+        """把六位股票代码转换为东方财富 ``市场.代码`` 形式的 ``secid``。"""
         normalized_code = str(code).strip().zfill(6)
         market_code = 1 if normalized_code.startswith("6") else 0
         return f"{market_code}.{normalized_code}"
 
     @staticmethod
     def _get_fqt(adjust: str) -> str:
+        """把复权口径映射为接口 ``fqt`` 值，不支持的口径抛出 ``ValueError``。"""
         try:
             return {"": "0", "qfq": "1", "hfq": "2"}[adjust]
         except KeyError as exc:
@@ -149,6 +154,11 @@ class EastMoneyDataFetcher:
         params: Dict[str, Any],
         proxies: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
+        """请求一个东方财富 JSON 地址并校验 HTTP、JSON 和业务返回码。
+
+        成功时保证返回顶层字典；非 JSON、非对象或非零 ``rc`` 都转换为带响应
+        摘要的 ``RuntimeError``，便于上层备用域名与代理重试逻辑处理。
+        """
         response = await self._get_client(proxies).get(
             url,
             params=params,
@@ -173,6 +183,7 @@ class EastMoneyDataFetcher:
 
     @staticmethod
     def _extract_kline_lines(payload: Dict[str, Any]) -> List[str]:
+        """从日 K 响应中提取字符串行列表；无数据返回空列表，类型异常则报错。"""
         data = payload.get("data")
         if not isinstance(data, dict):
             return []
@@ -193,6 +204,11 @@ class EastMoneyDataFetcher:
         proxies: Optional[Dict[str, str]] = None,
         secid: Optional[str] = None,
     ) -> List[str]:
+        """按备用域名顺序获取指定证券和日期范围的原始日 K CSV 行。
+
+        ``secid`` 可用于指数等无普通股票代码的请求；所有域名均失败时重抛最后
+        一个异常，接口正常但没有 K 线时返回空列表。
+        """
         params: Dict[str, Any] = {
             "secid": secid or self.get_secid(code or ""),
             "ut": self.UT,
@@ -239,6 +255,7 @@ class EastMoneyDataFetcher:
         *,
         proxies: Optional[Dict[str, str]] = None,
     ) -> tuple[str, ...]:
+        """以沪指日 K 日期作为交易日历，返回范围内排序去重的日期元组。"""
         lines = await self._fetch_kline_lines(
             code=None,
             adjust="",
@@ -255,6 +272,11 @@ class EastMoneyDataFetcher:
         proxies: Optional[Dict[str, str]] = None,
         target_trade_date: Optional[str] = None,
     ) -> pd.DataFrame:
+        """分页抓取沪深京股票代码和名称，并可过滤到指定日期有成交的股票。
+
+        退市名称、零成交和无有效更新时间的记录会被排除；结果按代码去重，
+        ``DataFrame.attrs['latest_trade_date']`` 保存接口观察到的最近成交日期。
+        """
         page = 1
         page_size = 500
         rows: List[Dict[str, str]] = []
@@ -340,11 +362,13 @@ class EastMoneyDataFetcher:
 
     @staticmethod
     def _is_delisting_stock_name(name: str) -> bool:
+        """判断股票名称是否使用“退市”前缀或“退”后缀标记已退市证券。"""
         normalized_name = str(name).strip()
         return normalized_name.startswith("退市") or normalized_name.endswith("退")
 
     @staticmethod
     def _extract_traded_stock_date(item: Dict[str, Any]) -> Optional[str]:
+        """从列表项提取最近有效成交日期，量额或更新时间无效时返回 ``None``。"""
         try:
             volume = float(item.get("f5"))
             amount = float(item.get("f6"))
@@ -364,6 +388,7 @@ class EastMoneyDataFetcher:
         *,
         target_trade_date: Optional[str],
     ) -> bool:
+        """判断列表项是否在目标交易日有有效成交；未指定日期时全部通过。"""
         if target_trade_date is None:
             return True
         return (
@@ -371,635 +396,14 @@ class EastMoneyDataFetcher:
             == target_trade_date
         )
 
-    @classmethod
-    def _kline_lines_to_daily_df(
-        cls,
-        lines: Sequence[str],
-        *,
-        code: str,
-    ) -> pd.DataFrame:
-        if not lines:
-            return pd.DataFrame(columns=[*cls.DAILY_COLUMNS, "股票代码"])
-
-        rows = [line.split(",") for line in lines]
-        bad_row = next(
-            (row for row in rows if len(row) != len(cls.DAILY_COLUMNS)),
-            None,
-        )
-        if bad_row is not None:
-            raise RuntimeError(
-                "eastmoney kline row width mismatch, "
-                f"expected={len(cls.DAILY_COLUMNS)}, actual={len(bad_row)}, row={bad_row!r}"
-            )
-
-        dataframe = pd.DataFrame(rows, columns=cls.DAILY_COLUMNS)
-        dataframe["股票代码"] = str(code).strip().zfill(6)
-        dataframe["日期"] = pd.to_datetime(dataframe["日期"], errors="coerce").dt.date
-        for column in cls.DAILY_COLUMNS[1:]:
-            dataframe[column] = pd.to_numeric(dataframe[column], errors="coerce")
-        return dataframe
-
-
-class EastMoneyQuotePageFetcher:
-    """Read daily, indicator and chip data from EastMoney page runtimes."""
-
-    SOURCE = "eastmoney.quote_page"
-    RUNTIME_SOURCE = "eastmoney.quote_page.runtime"
-    LOCAL_TIMEOUT_MS = 75_000
-    PROXY_TIMEOUT_MS = 175_000
-    LOCAL_TOTAL_TIMEOUT_SECONDS = 100
-    PROXY_TOTAL_TIMEOUT_SECONDS = 180
-    ADJUST_LABELS = {"qfq": "前复权", "hfq": "后复权", "": "不复权"}
-    CONCEPT_HOOK = r"""
-        (() => {
-          const capture = window.__eastmoneyConceptCapture = {
-            klines: [],
-            chipFills: [],
-            network: [],
-            errors: []
-          };
-          const rememberNetwork = (url, body, kind) => {
-            try {
-              const text = typeof body === "string" ? body : JSON.stringify(body);
-              if (!text || text.length > 2500000) return;
-              capture.network.push({url: String(url || ""), kind, body: text});
-              if (capture.network.length > 120) capture.network.shift();
-            } catch (error) {
-              capture.errors.push(String(error));
-            }
-          };
-
-          if (typeof window.fetch === "function") {
-            const originalFetch = window.fetch;
-            window.fetch = async function(...args) {
-              const response = await originalFetch.apply(this, args);
-              try {
-                response.clone().text().then(
-                  text => rememberNetwork(response.url, text, "fetch")
-                );
-              } catch (_) {}
-              return response;
-            };
-          }
-          if (window.XMLHttpRequest) {
-            const originalOpen = XMLHttpRequest.prototype.open;
-            XMLHttpRequest.prototype.open = function(method, url, ...rest) {
-              this.__eastmoneyUrl = url;
-              return originalOpen.call(this, method, url, ...rest);
-            };
-            const originalSend = XMLHttpRequest.prototype.send;
-            XMLHttpRequest.prototype.send = function(...args) {
-              this.addEventListener("loadend", () => {
-                try {
-                  rememberNetwork(
-                    this.responseURL || this.__eastmoneyUrl,
-                    this.responseText,
-                    "xhr"
-                  );
-                } catch (_) {}
-              });
-              return originalSend.apply(this, args);
-            };
-          }
-
-          const wrapLibrary = value => {
-            if (!value || typeof value !== "object" || value.__crawlerWrapped) {
-              return value;
-            }
-            const Original = value.kline;
-            if (typeof Original === "function" && !Original.__crawlerWrapped) {
-              const Wrapped = function(...args) {
-                const Target = new.target === Wrapped ? Original : new.target;
-                const chart = Reflect.construct(Original, args, Target || Original);
-                capture.klines.push(chart);
-                return chart;
-              };
-              Object.setPrototypeOf(Wrapped, Original);
-              Wrapped.prototype = Original.prototype;
-              Object.defineProperty(Wrapped, "__crawlerWrapped", {value: true});
-              value.kline = Wrapped;
-            }
-            Object.defineProperty(value, "__crawlerWrapped", {value: true});
-            return value;
-          };
-          let quoteChart;
-          try {
-            Object.defineProperty(window, "quotechart2022", {
-              configurable: true,
-              get() { return quoteChart; },
-              set(value) { quoteChart = wrapLibrary(value); }
-            });
-          } catch (_) {}
-
-          const proto = window.CanvasRenderingContext2D?.prototype;
-          if (!proto) return;
-          const paths = new WeakMap();
-          const originalBeginPath = proto.beginPath;
-          const originalMoveTo = proto.moveTo;
-          const originalLineTo = proto.lineTo;
-          const originalFill = proto.fill;
-          proto.beginPath = function(...args) {
-            paths.set(this, []);
-            return originalBeginPath.apply(this, args);
-          };
-          proto.moveTo = function(x, y, ...args) {
-            const path = paths.get(this);
-            if (path) path.push({op: "M", x, y});
-            return originalMoveTo.call(this, x, y, ...args);
-          };
-          proto.lineTo = function(x, y, ...args) {
-            const path = paths.get(this);
-            if (path) path.push({op: "L", x, y});
-            return originalLineTo.call(this, x, y, ...args);
-          };
-          proto.fill = function(...args) {
-            try {
-              if (this.canvas?.closest(".quotechart2022_c_cyq")) {
-                capture.chipFills.push(
-                  (paths.get(this) || []).map(point => ({...point}))
-                );
-              }
-            } catch (_) {}
-            return originalFill.apply(this, args);
-          };
-        })();
-    """
-
-    CONCEPT_RUNTIME_JS = r"""
-        async ({startDate, endDate, chipHistoryDays}) => {
-          const capture = window.__eastmoneyConceptCapture;
-          const chart = [...(capture?.klines || [])].reverse().find(
-            item => item?.data?.full_klines?.length
-          );
-          if (!chart) throw new Error("未找到东方财富概念页 K 线运行时对象");
-
-          const pause = () => new Promise(resolve => requestAnimationFrame(resolve));
-          const number = value => {
-            if (value === null || value === undefined || value === "-") return null;
-            const parsed = Number(String(value).replace(/[% ,]/g, ""));
-            return Number.isFinite(parsed) ? parsed : null;
-          };
-          const indicatorRows = {};
-          const mergeSeries = (series, fields) => {
-            for (const row of series || []) {
-              if (!Array.isArray(row) || !row[0]) continue;
-              const target = indicatorRows[String(row[0])] ||= {};
-              fields.forEach((field, index) => {
-                const parsed = number(row[index + 1]);
-                if (parsed !== null) target[field] = parsed;
-              });
-            }
-          };
-          const clickIndicator = (selector, label) => {
-            const element = Array.from(document.querySelectorAll(selector)).find(
-              item => item.textContent.trim() === label
-            );
-            if (!element) return false;
-            element.click();
-            return true;
-          };
-
-          const buttons = {};
-          buttons.MA = clickIndicator(".main_zb li", "均线");
-          await pause();
-          mergeSeries(chart.common_data.main_indicator_data_source, [
-            "ma5", "ma10", "ma20", "ma30", "ma60"
-          ]);
-          mergeSeries(chart.common_data.volume_ma_data_source, [
-            "vol_ma5", "vol_ma10"
-          ]);
-
-          buttons.BOLL = clickIndicator(".main_zb li", "BOLL");
-          await pause();
-          mergeSeries(chart.common_data.main_indicator_data_source, [
-            "boll_mid", "boll_upper", "boll_lower"
-          ]);
-
-          const secondary = {
-            RSI: ["rsi6", "rsi12", "rsi24"],
-            KDJ: ["kdj_k", "kdj_d", "kdj_j"],
-            MACD: ["macd_dif", "macd_dea", "macd_hist"],
-            WR: ["wr10", "wr6"],
-            CCI: ["cci14"]
-          };
-          for (const [name, fields] of Object.entries(secondary)) {
-            buttons[name] = clickIndicator(".f_zb li", name);
-            await pause();
-            mergeSeries(chart.common_data.indicator_data_source, fields);
-          }
-
-          const parsePercent = value => {
-            const parsed = number(value);
-            return parsed === null ? null : parsed / 100;
-          };
-          const parseRange = value => {
-            const matches = String(value || "").match(/\d+(?:\.\d+)?/g) || [];
-            return matches.slice(0, 2).map(Number);
-          };
-          const chipRows = {};
-          const klines = chart.data.full_klines || [];
-          const indexes = klines
-            .map((item, index) => ({date: String(item.date), index}))
-            .filter(item => item.date >= startDate && item.date <= endDate)
-            .slice(-chipHistoryDays);
-
-          for (const item of indexes) {
-            capture.chipFills = [];
-            chart.event.trigger("change_data_index", item.index);
-            const values = Array.from(
-              document.querySelectorAll(
-                ".quotechart2022_c_cyq_info .qcyq_t_v"
-              )
-            ).map(element => element.textContent.trim());
-            if (values.length < 7 || values[0] !== item.date) continue;
-
-            const paths = capture.chipFills.slice(-2);
-            const red = (paths[0] || []).slice(0, -2);
-            const blue = (paths[1] || []).slice(0, -3);
-            const points = [...red, ...blue].filter(point => point.op === "L");
-            const range90 = parseRange(values[3]);
-            const range70 = parseRange(values[5]);
-            const row = {
-              profit_ratio: parsePercent(values[1]),
-              avg_cost: number(values[2]),
-              cost_90_low: range90[0] ?? null,
-              cost_90_high: range90[1] ?? null,
-              cost_90_concentration: parsePercent(values[4]),
-              cost_70_low: range70[0] ?? null,
-              cost_70_high: range70[1] ?? null,
-              cost_70_concentration: parsePercent(values[6])
-            };
-            if (points.length === 150) {
-              row.chart_x = points.map(point => Number(point.x.toFixed(12)));
-              row.chart_y = points.map(point => Number((
-                chart.common_data.y_max - point.y * chart.common_data.y_scale
-              ).toFixed(4)));
-            }
-            chipRows[item.date] = row;
-          }
-
-          return {
-            dailyRows: klines.map(item => ({
-              date: String(item.date),
-              open: number(item.open),
-              close: number(item.close),
-              high: number(item.high),
-              low: number(item.low),
-              volume: number(item.volume),
-              amount: number(item.volume_money),
-              amplitude: number(item.zf),
-              pctChange: number(item.zdf),
-              changeAmount: number(item.zde),
-              turnover: number(item.hsl)
-            })),
-            indicatorRows,
-            chipRows,
-            diagnostics: {
-              conceptChartCount: capture.klines.length,
-              conceptKlineCount: klines.length,
-              conceptFirstDate: klines[0]?.date || null,
-              conceptLastDate: klines[klines.length - 1]?.date || null,
-              indicatorButtons: buttons,
-              indicatorDateCount: Object.keys(indicatorRows).length,
-              chipDateCount: Object.keys(chipRows).length,
-              capturedFetchXhrCount: capture.network.length,
-              capturedFetchXhr: capture.network.slice(-40).map(entry => ({
-                url: entry.url,
-                kind: entry.kind,
-                bodyPreview: entry.body.slice(0, 1000)
-              })),
-              runtimeErrors: capture.errors
-            }
-          };
-        }
-    """
-
-    def __init__(
-        self,
-        *,
-        headless: bool = True,
-        strict_page_indicators: bool = True,
-        strict_page_chip: bool = True,
-    ) -> None:
-        self.headless = headless
-        self.strict_page_indicators = strict_page_indicators
-        self.strict_page_chip = strict_page_chip
-        self._playwright: Any = None
-        self._browser: Any = None
-        self._browser_lock = asyncio.Lock()
-        self.last_runtime_diagnostics: Dict[str, Any] = {}
-
-    @staticmethod
-    def get_symbol(code: str) -> str:
-        normalized_code = str(code).strip().zfill(6)
-        if normalized_code.startswith(("4", "8", "9")):
-            market = "bj"
-        elif normalized_code.startswith("6"):
-            market = "sh"
-        else:
-            market = "sz"
-        return f"{market}{normalized_code}"
-
-    @classmethod
-    def get_concept_url(cls, code: str) -> str:
-        return (
-            f"https://quote.eastmoney.com/concept/{cls.get_symbol(code)}.html"
-            "#chart-k-cyq"
-        )
-
-    @classmethod
-    def get_daily_page_url(cls, code: str) -> str:
-        return cls.get_concept_url(code)
-
-    @staticmethod
-    def _raise_for_page_response(url: str, response: Any, label: str) -> None:
-        status = None if response is None else response.status
-        if response is not None and response.status == 200:
-            return
-        message = f"{label}响应异常: url={url}, status={status}"
-        if status in {404, 410}:
-            raise NonRetryablePageError(message)
-        raise RuntimeError(message)
-
-    @staticmethod
-    def _concept_daily_rows_to_df(
-        rows: Sequence[Dict[str, Any]],
-        *,
-        code: str,
-    ) -> pd.DataFrame:
-        columns = {
-            "date": "日期",
-            "open": "开盘",
-            "close": "收盘",
-            "high": "最高",
-            "low": "最低",
-            "volume": "成交量",
-            "amount": "成交额",
-            "amplitude": "振幅",
-            "pctChange": "涨跌幅",
-            "changeAmount": "涨跌额",
-            "turnover": "换手率",
-        }
-        if not rows:
-            return pd.DataFrame(
-                columns=[*EastMoneyDataFetcher.DAILY_COLUMNS, "股票代码"]
-            )
-        dataframe = pd.DataFrame(rows).rename(columns=columns)
-        missing = [column for column in columns.values() if column not in dataframe]
-        if missing:
-            raise RuntimeError(f"东方财富概念页日 K 缺少字段: {missing}")
-        dataframe = dataframe[list(columns.values())].copy()
-        dataframe["股票代码"] = str(code).strip().zfill(6)
-        dataframe["日期"] = pd.to_datetime(
-            dataframe["日期"], errors="coerce"
-        ).dt.date
-        for column in EastMoneyDataFetcher.DAILY_COLUMNS[1:]:
-            dataframe[column] = pd.to_numeric(dataframe[column], errors="coerce")
-        return dataframe
-
-    def dump_last_runtime_diagnostics(self, path: str | Path) -> Path:
-        target = Path(path)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(
-            json.dumps(
-                self.last_runtime_diagnostics,
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        return target
-
-    async def close(self) -> None:
-        if self._browser is not None:
-            await self._browser.close()
-            self._browser = None
-        if self._playwright is not None:
-            await self._playwright.stop()
-            self._playwright = None
-
-    async def _ensure_browser(self) -> Any:
-        if self._browser is not None and self._browser.is_connected():
-            return self._browser
-
-        async with self._browser_lock:
-            if self._browser is not None and self._browser.is_connected():
-                return self._browser
-            try:
-                from playwright.async_api import async_playwright
-            except ImportError as exc:
-                raise RuntimeError(
-                    "缺少 playwright，请在 MyAgent 环境安装 playwright 并执行 "
-                    "`python -m playwright install chromium`"
-                ) from exc
-
-            self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(
-                headless=self.headless
-            )
-            return self._browser
-
-    @staticmethod
-    def _proxy_server(proxies: Optional[Dict[str, str]]) -> Optional[str]:
-        if not proxies:
-            return None
-        server = proxies.get("https") or proxies.get("http")
-        if not server:
-            raise RuntimeError(f"代理配置缺少 http/https 地址: {proxies!r}")
-        return server
-
-    @staticmethod
-    async def _abort_heavy_assets(route: Any) -> None:
-        try:
-            if route.request.resource_type in {"image", "media", "font"}:
-                await route.abort()
-            else:
-                await route.continue_()
-        except Exception:
-            # A timed-out page can close while Playwright is dispatching a route.
-            return
-
-    async def fetch_kline(
-        self,
-        code: str,
-        start_date: str,
-        end_date: str,
-        adjust: str = "qfq",
-        *,
-        proxies: Optional[Dict[str, str]] = None,
-    ) -> pd.DataFrame:
-        if adjust not in self.ADJUST_LABELS:
-            raise ValueError(f"unsupported adjust value: {adjust!r}")
-        normalized_code = str(code).strip().zfill(6)
-        start = pd.to_datetime(start_date, format="%Y%m%d", errors="raise").date()
-        end = pd.to_datetime(end_date, format="%Y%m%d", errors="raise").date()
-        if start > end:
-            raise ValueError("start_date cannot be later than end_date")
-
-        proxy_server = self._proxy_server(proxies)
-        timeout_ms = self.PROXY_TIMEOUT_MS if proxy_server else self.LOCAL_TIMEOUT_MS
-        total_timeout_seconds = (
-            self.PROXY_TOTAL_TIMEOUT_SECONDS
-            if proxy_server
-            else self.LOCAL_TOTAL_TIMEOUT_SECONDS
-        )
-        browser = await self._ensure_browser()
-        context_options: Dict[str, Any] = {
-            "locale": "zh-CN",
-            "service_workers": "block",
-            "viewport": {"width": 1680, "height": 1050},
-            "user_agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        }
-        if proxy_server:
-            context_options["proxy"] = {"server": proxy_server}
-
-        context = await browser.new_context(**context_options)
-        diagnostics: Dict[str, Any] = {
-            "daily_page_url": self.get_daily_page_url(normalized_code),
-            "network": "proxy" if proxy_server else "local",
-            "responses": [],
-        }
-        indicator_rows: Dict[str, Dict[str, Any]] = {}
-        chip_rows: Dict[str, Dict[str, Any]] = {}
-        concept_page: Any = None
-
-        def record_response(response: Any) -> None:
-            if len(diagnostics["responses"]) >= 300:
-                return
-            diagnostics["responses"].append(
-                {
-                    "status": response.status,
-                    "resource_type": response.request.resource_type,
-                    "url": response.url,
-                }
-            )
-
-        try:
-            async with asyncio.timeout(total_timeout_seconds):
-                await context.add_init_script(self.CONCEPT_HOOK)
-                concept_page = await context.new_page()
-                await concept_page.route("**/*", self._abort_heavy_assets)
-                concept_page.on("response", record_response)
-                concept_page.set_default_timeout(timeout_ms)
-                concept_url = self.get_concept_url(normalized_code)
-                concept_response = await concept_page.goto(
-                    concept_url,
-                    wait_until="commit",
-                    timeout=timeout_ms,
-                )
-                self._raise_for_page_response(
-                    concept_url,
-                    concept_response,
-                    "东方财富概念页",
-                )
-                await concept_page.wait_for_function(
-                    """
-                () => window.__eastmoneyConceptCapture?.klines?.some(
-                  chart => chart?.data?.full_klines?.length
-                )
-                """,
-                    timeout=timeout_ms,
-                )
-                adjust_label = self.ADJUST_LABELS[adjust]
-                current_label = (
-                    await concept_page.locator(".chart_cfq .t").inner_text()
-                ).strip()
-                if current_label != adjust_label:
-                    changed = await concept_page.evaluate(
-                        """
-                        label => {
-                          const target = Array.from(
-                            document.querySelectorAll('.chart_cfq li')
-                          ).find(item => item.textContent.trim() === label);
-                          if (!target) return false;
-                          target.click();
-                          return true;
-                        }
-                        """,
-                        adjust_label,
-                    )
-                    if not changed:
-                        raise RuntimeError(f"概念页未找到复权选项: {adjust_label}")
-                    await concept_page.wait_for_function(
-                        "label => document.querySelector('.chart_cfq .t')"
-                        "?.textContent.trim() === label",
-                        arg=adjust_label,
-                        timeout=timeout_ms,
-                    )
-                    await concept_page.wait_for_timeout(500)
-                runtime = await concept_page.evaluate(
-                    self.CONCEPT_RUNTIME_JS,
-                    {
-                        "startDate": start.strftime("%Y-%m-%d"),
-                        "endDate": end.strftime("%Y-%m-%d"),
-                        "chipHistoryDays": max(1, (end - start).days + 1),
-                    },
-                )
-                indicator_rows = runtime.get("indicatorRows") or {}
-                chip_rows = runtime.get("chipRows") or {}
-                daily_all = self._concept_daily_rows_to_df(
-                    runtime.get("dailyRows") or [],
-                    code=normalized_code,
-                )
-                diagnostics["daily_row_count"] = len(daily_all)
-                diagnostics["runtime"] = runtime.get("diagnostics") or {}
-                self.last_runtime_diagnostics = diagnostics
-
-                if self.strict_page_indicators and not any(indicator_rows.values()):
-                    raise RuntimeError(
-                        "东方财富网页运行时未解析到技术指标；已禁止本地计算。"
-                        "请调用 dump_last_runtime_diagnostics() 保存诊断。"
-                    )
-                if self.strict_page_chip and not chip_rows:
-                    raise RuntimeError(
-                        "东方财富网页运行时未解析到筹码详情/筹码图；已禁止本地计算。"
-                        "请调用 dump_last_runtime_diagnostics() 保存诊断。"
-                    )
-                if daily_all is None or daily_all.empty:
-                    raise RuntimeError(
-                        "东方财富网页运行时未解析到基础日 K 数据"
-                    )
-        except Exception as exc:
-            diagnostics["error"] = repr(exc)
-            self.last_runtime_diagnostics = diagnostics
-            raise
-        finally:
-            if concept_page is not None:
-                try:
-                    await concept_page.unroute_all(behavior="ignoreErrors")
-                except Exception:
-                    pass
-            await context.close()
-
-        mask = (daily_all["日期"] >= start) & (daily_all["日期"] <= end)
-        result = daily_all.loc[mask].reset_index(drop=True)
-        if result.empty:
-            raise NonRetryablePageError(
-                "东方财富网页在指定日期范围内没有日 K 数据: "
-                f"code={normalized_code}, start={start}, end={end}"
-            )
-        result.attrs.update(
-            {
-                "source": self.SOURCE,
-                "page_url": self.get_daily_page_url(normalized_code),
-                "network": "proxy" if proxy_server else "local",
-                "indicator_source": self.RUNTIME_SOURCE,
-                "chip_source": self.RUNTIME_SOURCE,
-                "indicator_rows": indicator_rows,
-                "chip_rows": chip_rows,
-                "runtime_diagnostics": diagnostics,
-            }
-        )
-        return result
-
-
 class StockDailyDetailCrawler:
-    """Fetch stock daily details from EastMoney page output only."""
+    """协调东方财富股票清单与日线数据，构造完整日线详情模型。
 
+    日线、指标和筹码只通过逆向 HTTP 协议获取。该层负责统一字段、合并指标与
+    筹码并建立来源元数据，但不负责持久化。
+    """
+
+    #: 逆向指标字典允许合并进日线表的完整字段白名单。
     INDICATOR_COLUMNS = (
         "ma5",
         "ma10",
@@ -1037,35 +441,34 @@ class StockDailyDetailCrawler:
         max_retry: int = 3,
         proxy_provider: Optional[AsyncProxyProvider] = None,
         proxy_minutes: int = 3,
-        quote_page_fetcher: Optional[EastMoneyQuotePageFetcher] = None,
-        page_semaphore: Optional[asyncio.Semaphore] = None,
+        reverse_fetcher: Optional[EastMoneyReverseFetcher] = None,
         proxy_rate_limiter: Optional[AsyncRequestRateLimiter] = None,
-        *,
-        strict_page_indicators: bool = True,
-        strict_page_chip: bool = True,
     ) -> None:
-        self.request_sleep_seconds = request_sleep_seconds
-        self.max_retry = max(1, max_retry)
-        self.proxy_provider = proxy_provider
-        self._owns_proxy_provider = proxy_provider is None
-        self.proxy_minutes = proxy_minutes
-        self.em_fetcher = EastMoneyDataFetcher()
-        self._owns_quote_page_fetcher = quote_page_fetcher is None
-        self.quote_page_fetcher = quote_page_fetcher or EastMoneyQuotePageFetcher(
-            strict_page_indicators=strict_page_indicators,
-            strict_page_chip=strict_page_chip,
-        )
-        self.page_semaphore = page_semaphore or asyncio.Semaphore(1)
-        self.proxy_rate_limiter = proxy_rate_limiter or AsyncRequestRateLimiter()
+        """初始化重试、代理和数据抓取依赖。
+
+        外部注入的逆向抓取器不由本实例关闭。股票清单和交易日接口保留独立的
+        本地优先、代理回退逻辑；逐股日线只走逆向抓取器。
+        """
+        self.request_sleep_seconds = request_sleep_seconds  #: 业务请求后的基础节流秒数。
+        self.max_retry = max(1, max_retry)  #: 每类代理请求至少执行一次的最大尝试数。
+        self.proxy_provider = proxy_provider  #: 可注入、也可延迟创建的异步代理提供器。
+        self._owns_proxy_provider = proxy_provider is None  #: 是否由本实例负责关闭代理提供器。
+        self.proxy_minutes = proxy_minutes  #: 延迟创建 51 代理池时使用的固定 IP 有效分钟数。
+        self.em_fetcher = EastMoneyDataFetcher()  #: 获取股票清单和交易日 JSON 的轻量客户端。
+        self._owns_reverse_fetcher = reverse_fetcher is None
+        self.reverse_fetcher = reverse_fetcher
+        self.proxy_rate_limiter = proxy_rate_limiter or AsyncRequestRateLimiter()  #: 创建代理池时复用的 API 限流器。
 
     async def close(self) -> None:
-        if self._owns_quote_page_fetcher:
-            await self.quote_page_fetcher.close()
+        """关闭本实例拥有的逆向抓取器、JSON 客户端和代理提供器。"""
+        if self._owns_reverse_fetcher and self.reverse_fetcher is not None:
+            await self.reverse_fetcher.close()
         await self.em_fetcher.close()
         if self._owns_proxy_provider and self.proxy_provider is not None:
             await self.proxy_provider.close()
 
     def _get_proxy_provider(self) -> AsyncProxyProvider:
+        """返回现有代理提供器，或延迟创建容量为一的异步 51 代理池。"""
         if self.proxy_provider is None:
             self.proxy_provider = AsyncDailiProxyPool(
                 minutes=self.proxy_minutes,
@@ -1078,6 +481,11 @@ class StockDailyDetailCrawler:
         self,
         proxies: Optional[Dict[str, str]] = None,
     ) -> None:
+        """兼容通知单代理或租约型代理池本次请求成功。
+
+        优先调用带具体映射的 ``on_success_for``；否则回退协议的 ``on_success``，
+        并在实现返回 awaitable 时等待完成。
+        """
         if self.proxy_provider is not None:
             on_success_for = getattr(self.proxy_provider, "on_success_for", None)
             if callable(on_success_for):
@@ -1092,6 +500,11 @@ class StockDailyDetailCrawler:
         exc: Exception,
         proxies: Optional[Dict[str, str]] = None,
     ) -> None:
+        """兼容通知单代理或租约型代理池本次请求失败及异常原因。
+
+        带映射通知可准确归还对应池槽位；传统实现则接收普通失败回调。异步回调
+        会被等待，确保下一次重试前代理状态已经更新。
+        """
         if self.proxy_provider is not None:
             on_failure_for = getattr(self.proxy_provider, "on_failure_for", None)
             if callable(on_failure_for):
@@ -1106,6 +519,11 @@ class StockDailyDetailCrawler:
         api_name: str,
         fetcher: Callable[[Optional[Dict[str, str]]], Awaitable[_T]],
     ) -> _T:
+        """先以本地网络调用抓取函数，失败后按指数退避切换代理重试。
+
+        ``fetcher`` 接收 ``None`` 表示直连，接收映射表示代理请求。每次代理结果
+        都回报提供器；耗尽次数后用最后异常构造包含 API 名的 ``RuntimeError``。
+        """
         try:
             return await fetcher(None)
         except Exception as exc:
@@ -1147,9 +565,15 @@ class StockDailyDetailCrawler:
         *,
         target_trade_date: Optional[str] = None,
     ) -> pd.DataFrame:
+        """获取并校验 A 股代码名称清单，可限定为目标交易日有成交的股票。
+
+        结果只保留“代码”“名称”两列，代码统一为六位并去重；底层 DataFrame
+        的来源属性会复制到规范化结果。
+        """
         async def fetch_eastmoney_list(
             proxies: Optional[Dict[str, str]],
         ) -> pd.DataFrame:
+            """执行一次股票清单请求，并把空结果转为可触发重试的异常。"""
             result = await self.em_fetcher.fetch_stock_list(
                 proxies=proxies,
                 target_trade_date=target_trade_date,
@@ -1181,9 +605,11 @@ class StockDailyDetailCrawler:
         start_date: str,
         end_date: str,
     ) -> tuple[str, ...]:
+        """按本地优先和代理回退策略获取日期范围内的非空交易日元组。"""
         async def fetch_non_empty_dates(
             proxies: Optional[Dict[str, str]],
         ) -> tuple[str, ...]:
+            """执行一次交易日请求，并把空日历转为可触发重试的异常。"""
             result = await self.em_fetcher.fetch_trade_dates(
                 start_date=start_date,
                 end_date=end_date,
@@ -1206,49 +632,18 @@ class StockDailyDetailCrawler:
         end_date: str,
         adjust: str = "qfq",
     ) -> pd.DataFrame:
-        normalized_code = self._normalize_code(code)
-        last_error: Optional[Exception] = None
-        for attempt in range(1, self.max_retry + 1):
-            proxies: Optional[Dict[str, str]] = None
-            try:
-                async with self.page_semaphore:
-                    proxies = await get_required_async_proxies(
-                        self._get_proxy_provider()
-                    )
-                    dataframe = await self.quote_page_fetcher.fetch_kline(
-                        code=normalized_code,
-                        start_date=start_date,
-                        end_date=end_date,
-                        adjust=adjust,
-                        proxies=proxies,
-                    )
-                if dataframe.empty:
-                    raise RuntimeError("行情页在指定日期范围内没有日 K 数据")
-                await self._notify_proxy_success(proxies)
-                return dataframe
-            except NonRetryablePageError:
-                await self._notify_proxy_success(proxies)
-                raise
-            except Exception as exc:
-                last_error = exc
-                await self._notify_proxy_failure(exc, proxies)
-                if attempt < self.max_retry:
-                    sleep_seconds = min(2**attempt, 10) + random.random()
-                    logger.warning(
-                        "eastmoney_quote_page_proxy_failed code=%s attempt=%s/%s "
-                        "error=%s sleep=%.2fs",
-                        normalized_code,
-                        attempt,
-                        self.max_retry,
-                        repr(exc),
-                        sleep_seconds,
-                    )
-                    await asyncio.sleep(sleep_seconds)
+        """通过逆向 HTTP 协议抓取指定区间的日 K、指标和筹码数据。
 
-        raise RuntimeError(
-            f"eastmoney quote page failed after {self.max_retry} proxy attempts, "
-            f"code={normalized_code}, "
-            f"error={last_error!r}"
+        IP 复用、轮换、连接恢复与熔断由目标感知管理器负责。
+        """
+        normalized_code = self._normalize_code(code)
+        if self.reverse_fetcher is None:
+            self.reverse_fetcher = EastMoneyReverseFetcher()
+        return await self.reverse_fetcher.fetch_kline(
+            code=normalized_code,
+            start_date=start_date,
+            end_date=end_date,
+            adjust=adjust,
         )
 
     async def build_stock_daily_details(
@@ -1260,6 +655,12 @@ class StockDailyDetailCrawler:
         adjust: str = "qfq",
         write_start_date: Optional[str] = None,
     ) -> List[StockDailyDetail]:
+        """抓取并组装一只股票日期范围内的完整 ``StockDailyDetail`` 列表。
+
+        基础日 K 先统一列名和类型，再按交易日合并逆向技术指标和筹码数据；
+        ``write_start_date`` 只影响最终模型输出范围，来源、参考 URL 和网络出口
+        会写入每条记录的审计字段。
+        """
         code = self._normalize_code(code)
         raw_daily_df = await self.fetch_stock_daily_hist(
             code=code,
@@ -1271,26 +672,26 @@ class StockDailyDetailCrawler:
             return []
 
         daily_df = self._standardize_daily_df(raw_daily_df, code=code, name=name)
-        daily_with_indicators = self._merge_page_indicators(
+        daily_with_indicators = self._merge_indicators(
             daily_df,
             raw_daily_df.attrs.get("indicator_rows") or {},
         )
-        chip_map = self._build_page_chip_map(raw_daily_df.attrs.get("chip_rows") or {})
+        chip_map = self._build_chip_map(raw_daily_df.attrs.get("chip_rows") or {})
         daily_source = str(
-            raw_daily_df.attrs.get("source") or EastMoneyQuotePageFetcher.SOURCE
+            raw_daily_df.attrs.get("source") or EastMoneyReverseFetcher.SOURCE
         )
         page_url = str(
             raw_daily_df.attrs.get("page_url")
-            or EastMoneyQuotePageFetcher.get_daily_page_url(code)
+            or EastMoneyReverseFetcher.get_daily_page_url(code)
         )
         network = raw_daily_df.attrs.get("network")
         indicator_source = str(
             raw_daily_df.attrs.get("indicator_source")
-            or EastMoneyQuotePageFetcher.RUNTIME_SOURCE
+            or EastMoneyReverseFetcher.INDICATOR_SOURCE
         )
         chip_source = str(
             raw_daily_df.attrs.get("chip_source")
-            or EastMoneyQuotePageFetcher.RUNTIME_SOURCE
+            or EastMoneyReverseFetcher.CHIP_SOURCE
         )
         return self._build_models(
             daily_with_indicators,
@@ -1311,6 +712,11 @@ class StockDailyDetailCrawler:
         code: str,
         name: Optional[str],
     ) -> pd.DataFrame:
+        """校验并把东方财富中文日 K 列转换为内部英文列和交易日期字段。
+
+        缺少必需列立即报错；日期按升序排列，股票代码和名称由调用上下文覆盖，
+        所有行情值使用 pandas 宽松数值转换。
+        """
         rename_columns = {
             "日期": "date",
             "股票代码": "code",
@@ -1353,27 +759,37 @@ class StockDailyDetailCrawler:
             dataframe[column] = pd.to_numeric(dataframe[column], errors="coerce")
         return dataframe.sort_values("date").reset_index(drop=True)
 
-    def _merge_page_indicators(
+    def _merge_indicators(
         self,
         dataframe: pd.DataFrame,
         indicator_rows: Dict[str, Dict[str, Any]],
     ) -> pd.DataFrame:
+        """按交易日把逆向指标白名单合并进基础日线表副本。
+
+        所有指标列先置空，逆向结果中的值经有限浮点数规范化后逐格写入，未生成
+        的指标保持 ``None``，不会以本地计算值替代。
+        """
         result = dataframe.copy()
         for column in self.INDICATOR_COLUMNS:
             result[column] = None
         for index, row in result.iterrows():
-            page_values = indicator_rows.get(str(row["trade_date"])) or {}
+            indicator_values = indicator_rows.get(str(row["trade_date"])) or {}
             for column in self.INDICATOR_COLUMNS:
-                if column in page_values:
+                if column in indicator_values:
                     result.at[index, column] = self._normalize_float(
-                        page_values[column]
+                        indicator_values[column]
                     )
         return result
 
-    def _build_page_chip_map(
+    def _build_chip_map(
         self,
         rows: Dict[str, Dict[str, Any]],
     ) -> Dict[str, ChipDistribution]:
+        """把逆向筹码字典转换为按交易日索引的类型化筹码分布模型。
+
+        曲线横纵坐标必须同时存在且长度相等才建立 ``ChipChart``；比例、成本和
+        集中度分别按既定精度舍入，无效数值保留为空。
+        """
         chip_map: Dict[str, ChipDistribution] = {}
         for trade_date, row in rows.items():
             chart_x = self._normalize_number_list(row.get("chart_x"))
@@ -1417,6 +833,11 @@ class StockDailyDetailCrawler:
         indicator_source: str,
         chip_source: str,
     ) -> List[StockDailyDetail]:
+        """逐行构造最终日线详情模型，并附加指标、筹码与数据来源审计信息。
+
+        早于 ``write_start_date`` 的行跳过；每个数值按业务精度规范化，没有当日
+        筹码时明确写入 ``unavailable`` 来源标识。
+        """
         items: List[StockDailyDetail] = []
         for row in dataframe.to_dict("records"):
             trade_date = str(row["trade_date"])
@@ -1489,7 +910,7 @@ class StockDailyDetailCrawler:
                         network=network,
                         indicator=indicator_source,
                         chip=(
-                            chip_source if chip is not None else "unavailable_on_page"
+                            chip_source if chip is not None else "unavailable"
                         ),
                     ),
                 )
@@ -1497,14 +918,17 @@ class StockDailyDetailCrawler:
         return items
 
     async def sleep_after_request(self) -> None:
+        """按基础节流时间加最多 0.2 秒随机抖动异步等待，分散连续请求。"""
         await asyncio.sleep(self.request_sleep_seconds + random.random() * 0.2)
 
     @staticmethod
     def _normalize_code(value: Any) -> str:
+        """把任意股票代码值去空白并左补零为六位字符串。"""
         return str(value).strip().zfill(6)
 
     @staticmethod
     def _normalize_float(value: Any) -> Optional[float]:
+        """把值转换为有限浮点数；空值、NaN、无穷或非法文本返回 ``None``。"""
         if value is None:
             return None
         try:
@@ -1524,16 +948,19 @@ class StockDailyDetailCrawler:
         value: Any,
         digits: int = 4,
     ) -> Optional[float]:
+        """规范化浮点输入并按 ``digits`` 位小数舍入，无效值保持 ``None``。"""
         number = cls._normalize_float(value)
         return None if number is None else round(number, digits)
 
     @classmethod
     def _normalize_int(cls, value: Any) -> Optional[int]:
+        """把有效有限数值截断转换为整数，无效值返回 ``None``。"""
         number = cls._normalize_float(value)
         return None if number is None else int(number)
 
     @classmethod
     def _normalize_number_list(cls, value: Any) -> List[float]:
+        """从列表中保留可转换的有限浮点数；非列表输入返回空列表。"""
         if not isinstance(value, list):
             return []
         return [

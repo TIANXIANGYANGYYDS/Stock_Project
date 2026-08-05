@@ -24,24 +24,28 @@ for package in (
     importlib.import_module(package)
 
 optional_modules = {
-    "app.crawlers.douyin_creator_crawler",
+    "app.crawlers.creator_platforms.douyin",
     "app.crawlers.ths_market_review_crawler",
     "app.crawlers.ths_morning_report_crawler",
-    "app.llm.douyin_creator_analysis_llm",
+    "app.llm.creator_content_analysis_llm",
+    "app.llm.creator_opinion_verification_llm",
     "app.llm.morning_analysis_llm",
     "app.models.daily_market_analysis",
-    "app.models.douyin_creator_work",
+    "app.models.creator_monitoring",
     "app.models.news_ranking_snapshot",
     "app.repositories.daily_market_analysis_repository",
-    "app.repositories.douyin_creator_work_repository",
+    "app.repositories.creator_monitoring_repository",
     "app.repositories.news_ranking_snapshot_repository",
-    "app.services.douyin_creator_analysis_service",
-    "app.services.douyin_creator_ingestion_service",
+    "app.services.creator_content_extraction_service",
+    "app.services.creator_ingestion_service",
+    "app.services.creator_opinion_analysis_service",
+    "app.services.creator_opinion_verification_service",
     "app.services.morning_analysis_service",
     "app.services.news_ranking_service",
     "app.services.news_ranking_snapshot_service",
     "app.services.trading_calendar_service",
-    "app.workers.douyin_creator_analysis_worker",
+    "app.workers.creator_content_extraction_worker",
+    "app.workers.creator_opinion_analysis_worker",
 }
 unexpected = sorted(optional_modules.intersection(sys.modules))
 if unexpected:

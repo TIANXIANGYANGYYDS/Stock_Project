@@ -1,14 +1,16 @@
 # Core runtime dependencies
 apscheduler
 beautifulsoup4
+curl_cffi==0.9.0
 exchange_calendars
 faster-whisper==1.2.1
 httpx
 motor
+opencc-python-reimplemented==0.1.7
 pandas
-playwright
 pydantic
 pydantic-settings
+eval-type-backport; python_version < "3.9"
 pymongo
 python-dotenv
 rapidocr==3.9.2

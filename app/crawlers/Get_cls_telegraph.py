@@ -1,4 +1,4 @@
-# app/crawlers/Get_cls_telegraph.py
+# 文件：app/crawlers/Get_cls_telegraph.py
 
 from __future__ import annotations
 
@@ -15,13 +15,23 @@ from app.crawlers.base_news_crawler import BaseNewsCrawler, NewsCrawlerError
 
 
 class CLSNewsCrawler(BaseNewsCrawler):
+    """通过财联社 Web/WAP 公开接口抓取并规范化最新电报。
+
+    Web v1 接口是首选数据源并需要签名；请求失败时回退到 WAP 接口。
+    两种响应最终共用相同的正文清洗、时间转换和事件去重逻辑。
+    """
+
+    #: 持久化新闻时使用的财联社来源标识。
     source = "cls"
 
     # 旧接口 https://www.cls.cn/nodeapi/telegraphList 当前已经返回 404。
     # 当前优先使用 Web 端 v1 roll 接口，失败后兜底 WAP 端 nodeapi/telegraphs。
+    #: 当前首选的财联社 Web 端滚动电报接口。
     web_base_url = "https://www.cls.cn/v1/roll/get_roll_list"
+    #: Web 接口不可用时调用的财联社移动端兜底接口。
     wap_base_url = "https://m.cls.cn/nodeapi/telegraphs"
 
+    #: 调用 Web 端接口时使用的桌面浏览器请求头。
     web_headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -35,6 +45,7 @@ class CLSNewsCrawler(BaseNewsCrawler):
         "Pragma": "no-cache",
     }
 
+    #: 调用 WAP 端接口时使用的移动浏览器请求头。
     wap_headers = {
         "User-Agent": (
             "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
@@ -107,9 +118,10 @@ class CLSNewsCrawler(BaseNewsCrawler):
         last_time: int | None = None,
         rn: int = 20,
     ) -> dict[str, str]:
-        """
-        WAP 端兜底接口参数。
-        这个接口通常不需要 sign。
+        """构造财联社 WAP 兜底接口的分页和刷新参数。
+
+        未指定 ``last_time`` 时使用当前 Unix 秒；数量和时间统一转换为字符串，
+        该接口不加入 Web v1 所需的签名字段。
         """
         if last_time is None:
             last_time = int(time.time())
@@ -149,8 +161,9 @@ class CLSNewsCrawler(BaseNewsCrawler):
         )
 
     def clean_html_text(self, value: Any) -> str:
-        """
-        财联社 content 偶尔可能包含 HTML 标签或实体，这里统一清掉。
+        """把财联社字段中的 HTML 实体、标签和连续空白转换为纯文本。
+
+        ``None`` 返回空字符串，其他类型先转为字符串再清洗，结果去除首尾空白。
         """
         if value is None:
             return ""
@@ -215,6 +228,11 @@ class CLSNewsCrawler(BaseNewsCrawler):
         )
 
     def fetch_web_latest_payload(self, rn: int) -> dict[str, Any]:
+        """从首选 Web v1 接口获取包含最近 ``rn`` 条电报的原始响应。
+
+        方法负责构造带签名参数并沿用基类的本地网络/代理回退策略；响应结构
+        的具体兼容处理留给 :meth:`find_items`。
+        """
         params = self.build_web_latest_params(rn=rn)
 
         return self.request_json_with_local_first(
@@ -224,6 +242,11 @@ class CLSNewsCrawler(BaseNewsCrawler):
         )
 
     def fetch_wap_latest_payload(self, rn: int) -> dict[str, Any]:
+        """从 WAP 兜底接口获取包含最近 ``rn`` 条电报的原始响应。
+
+        WAP 参数不需要 Web 签名，但网络访问仍使用基类统一的本地优先与
+        代理重试策略。
+        """
         params = self.build_wap_latest_params(rn=rn)
 
         return self.request_json_with_local_first(
@@ -233,9 +256,10 @@ class CLSNewsCrawler(BaseNewsCrawler):
         )
 
     def fetch_latest_payload(self, rn: int) -> dict[str, Any]:
-        """
-        优先 Web v1 接口。
-        如果 Web v1 失败，再走 WAP 端兜底接口。
+        """优先请求 Web v1 响应，失败后使用 WAP 接口完成同批次兜底。
+
+        两个接口都失败时抛出包含两侧异常的 :class:`NewsCrawlerError`，并以 WAP
+        异常作为直接原因，便于调用方诊断最终失败点。
         """
         web_error: Exception | None = None
 
@@ -252,9 +276,10 @@ class CLSNewsCrawler(BaseNewsCrawler):
             ) from wap_error
 
     def fetch_latest_news(self) -> list[FetchedNews]:
-        """
-        获取财联社最新快讯。
-        不做入库，不做 LLM。
+        """抓取、解析并去重最近二十条财联社快讯。
+
+        响应项逐条规范化，无效记录被过滤，结果按发布时间倒序返回；本方法不做
+        数据库写入，也不触发 LLM 分析。
         """
         rn = 20
 
@@ -270,8 +295,9 @@ class CLSNewsCrawler(BaseNewsCrawler):
 
 
 def fetch_latest_news() -> list[FetchedNews]:
-    """
-    函数式入口，方便外部直接调用。
+    """构造财联社爬虫并返回最新快讯，供脚本和旧调用方直接使用。
+
+    具体的 Web/WAP 回退、清洗与去重均由 :class:`CLSNewsCrawler` 完成。
     """
     crawler = CLSNewsCrawler()
     return crawler.fetch_latest_news()

@@ -37,6 +37,15 @@ def _get_indexes_lock() -> asyncio.Lock:
 
 
 def _get_stock_daily_job_lock() -> asyncio.Lock:
+    """返回当前进程共用的股票日线同步任务锁。
+
+    锁在首次使用时才创建，供定时主任务、启动补数和失败补偿
+    共用，防止同一 scheduler 进程内并发写入同一交易日数据。
+
+    返回值：
+        当前 asyncio 运行环境中复用的进程内互斥锁。
+    """
+
     global _stock_daily_job_lock
 
     if _stock_daily_job_lock is None:
@@ -67,11 +76,11 @@ def _serialize_source_results(source_results: List[Any]) -> List[Dict[str, Any]]
     """
     把新闻抓取结果中的 source_results 转成可安全打日志的 dict 列表。
 
-    Args:
+    参数：
         source_results:
             NewsIngestionService 返回的每个来源抓取结果。
 
-    Returns:
+    返回值：
         只包含 source、fetched_count、error_message 的列表，避免日志里直接打印复杂对象。
     """
 
@@ -156,7 +165,14 @@ def is_after_startup_min_time(min_time: str) -> bool:
 
 
 async def sync_stock_daily_detail_job(*, run_mode: str = "scheduled") -> None:
-    """Serialize startup and scheduled stock sync jobs within this process."""
+    """串行启动补数和定时日线同步任务。
+
+    已有任务持有进程内锁时直接记录跳过，否则持锁调用实际
+    同步逻辑。该入口不负责跨进程互斥。
+
+    参数：
+        run_mode: 任务触发模式，由底层逻辑区分 scheduled 和 startup 口径。
+    """
 
     lock = _get_stock_daily_job_lock()
     if lock.locked():
@@ -175,7 +191,15 @@ async def sync_stock_daily_detail_compensation_job(
     target_scope: str,
     max_automatic_compensations: int,
 ) -> None:
-    """Retry only remaining network failures without overlapping the main job."""
+    """串行执行指定日期范围的日线网络失败补偿。
+
+    当主同步或其他补偿任务正在运行时跳过本次调度；获得锁后
+    只重试持久化运行记录中仍未成功的网络错误。
+
+    参数：
+        target_scope: 补偿目标范围，仅支持 ``today`` 或 ``previous``。
+        max_automatic_compensations: 允许该运行记录自动补偿的次数上限。
+    """
 
     lock = _get_stock_daily_job_lock()
     if lock.locked():
@@ -198,6 +222,20 @@ async def _run_stock_daily_detail_compensation_job(
     target_scope: str,
     max_automatic_compensations: int,
 ) -> None:
+    """解析补偿目标交易日，并重试最新的未完成日线运行记录。
+
+    ``today`` 以当前北京日期为参考，``previous`` 先回退一个自然日，
+    再由 A 股交易日历解析实际目标日。服务层没有可重试记录时
+    记录跳过；重试异常会被捕获并写入调度日志。
+
+    参数：
+        target_scope: 待解析的目标范围，必须为 ``today`` 或 ``previous``。
+        max_automatic_compensations: 传给服务层的自动补偿次数上限。
+
+    异常：
+        ValueError: target_scope 不是受支持的范围。
+    """
+
     from app.services.stock_daily_detail_service import (
         STOCK_DAILY_DEFAULT_ADJUST,
         resolve_a_stock_target_trade_date,
@@ -275,6 +313,7 @@ async def _run_stock_daily_detail_job(*, run_mode: str) -> None:
             STOCK_DAILY_DEFAULT_END_DATE,
             STOCK_DAILY_DEFAULT_LIMIT,
             STOCK_DAILY_DEFAULT_ONLY_CODE,
+            STOCK_DAILY_STARTUP_CONCURRENCY,
             STOCK_DAILY_TOTAL_MAX_COMPENSATIONS,
             STOCK_DAILY_STARTUP_MIN_TIME,
             resolve_a_stock_target_trade_date,
@@ -287,7 +326,12 @@ async def _run_stock_daily_detail_job(*, run_mode: str) -> None:
         adjust = STOCK_DAILY_DEFAULT_ADJUST
         only_code = STOCK_DAILY_DEFAULT_ONLY_CODE
         limit = STOCK_DAILY_DEFAULT_LIMIT
-        concurrency = STOCK_DAILY_DEFAULT_CONCURRENCY
+        # 日常 15:30 主任务维持原吞吐；服务恢复时降低并发，避免启动峰值打满内存。
+        concurrency = (
+            STOCK_DAILY_STARTUP_CONCURRENCY
+            if run_mode == "startup"
+            else STOCK_DAILY_DEFAULT_CONCURRENCY
+        )
 
         trade_date_decision = await resolve_a_stock_target_trade_date(
             reference_yyyymmdd
@@ -392,18 +436,17 @@ async def _run_immediate_stock_daily_detail_compensations(
     adjust: str,
     max_automatic_compensations: int,
 ) -> None:
-    """Immediately retry each remaining network-failure batch."""
+    """立即逐轮补偿当日股票明细同步中仍可重试的网络失败项。
+
+    每轮只交给服务层处理最近未完成批次的剩余失败股票；达到自动补偿上限，
+    或服务层返回无可重试项时停止。
+    """
 
     from app.services.stock_daily_detail_service import (
-        STOCK_DAILY_BROWSER_ERROR_EXTRA_COMPENSATIONS,
         retry_latest_incomplete_stock_daily_detail_run,
     )
 
-    max_immediate_rounds = (
-        max_automatic_compensations
-        + STOCK_DAILY_BROWSER_ERROR_EXTRA_COMPENSATIONS
-    )
-    for attempt in range(1, max_immediate_rounds + 1):
+    for attempt in range(1, max_automatic_compensations + 1):
         result = await retry_latest_incomplete_stock_daily_detail_run(
             target_trade_date,
             adjust=adjust,

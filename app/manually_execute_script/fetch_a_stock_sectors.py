@@ -1,6 +1,8 @@
-# app/manually_execute_script/fetch_a_stock_sectors.py
+# 文件：app/manually_execute_script/fetch_a_stock_sectors.py
 # python app/manually_execute_script/fetch_a_stock_sectors.py
 # 这个脚本用于获取同花顺行业板块列表及其成份股，输出到单个 JSON 文件。
+# 直接执行时必须先注入项目根目录，再导入项目模块。
+# ruff: noqa: E402
 
 from __future__ import annotations
 
@@ -77,13 +79,26 @@ class AkshareRequestsProxyPatch:
         request_sleep_seconds: float = 1.0,
         request_timeout: int = 20,
     ) -> None:
+        """保存代理、重试、退避和超时策略，等待进入上下文后安装补丁。"""
+
+        # AKShare 内部 requests 请求使用的代理提供器；None 表示直连。
         self.provider = provider
+        # 单个 HTTP 请求更换代理后最多尝试的次数。
         self.request_retry = request_retry
+        # 相邻请求重试之间按尝试次数放大的基础等待秒数。
         self.request_sleep_seconds = request_sleep_seconds
+        # 未由 AKShare 显式指定时注入的单请求超时秒数。
         self.request_timeout = request_timeout
+        # 进入上下文时保存的原始 Session.request，退出时用于恢复全局状态。
         self._original_request = None
 
     def __enter__(self) -> "AkshareRequestsProxyPatch":
+        """临时替换 ``requests.Session.request``，为 AKShare 请求注入代理重试。
+
+        代理供应商自身请求保持原样以避免递归；无代理时只补默认超时。安装完成后
+        返回当前上下文对象，退出时由 ``__exit__`` 恢复原函数。
+        """
+
         self._original_request = requests.sessions.Session.request
         original_request = self._original_request
         provider = self.provider
@@ -92,6 +107,8 @@ class AkshareRequestsProxyPatch:
         request_timeout = self.request_timeout
 
         def patched_request(session, method, url, **kwargs):
+            """执行一次被代理策略包装的 requests 请求，并上报代理成败。"""
+
             url_text = str(url)
 
             if "bapi.51daili.com" in url_text:
@@ -146,11 +163,15 @@ class AkshareRequestsProxyPatch:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
+        """恢复进入上下文前的 requests 方法，不吞掉业务异常。"""
+
         if self._original_request is not None:
             requests.sessions.Session.request = self._original_request
 
 
 def _to_str(value: Any) -> Optional[str]:
+    """把任意标量规范化为非空字符串，并把 None、NaN 和空白视为缺失。"""
+
     if value is None:
         return None
 
@@ -162,6 +183,8 @@ def _to_str(value: Any) -> Optional[str]:
 
 
 def _to_code(value: Any) -> Optional[str]:
+    """规范化股票或板块代码文本，移除浮点尾缀并补齐六位纯数字代码。"""
+
     text = _to_str(value)
 
     if not text:
@@ -179,6 +202,8 @@ def _to_code(value: Any) -> Optional[str]:
 
 
 def _extract_code_from_any_value(value: Any) -> Optional[str]:
+    """从任意可字符串化值中提取边界清晰的首个六位数字代码。"""
+
     text = _to_str(value)
 
     if not text:
@@ -193,6 +218,8 @@ def _extract_code_from_any_value(value: Any) -> Optional[str]:
 
 
 def _dedup_keep_order(items: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
+    """按指定非空字段保留字典列表中首次出现的项，同时维持原始顺序。"""
+
     seen = set()
     result: List[Dict[str, Any]] = []
 
@@ -220,6 +247,12 @@ def _call_akshare_with_retry(
     request_sleep_seconds: float = 1.0,
     request_timeout: int = 20,
 ) -> pd.DataFrame:
+    """在可选 requests 代理补丁内调用 AKShare，并对空表和整体失败重试。
+
+    内层补丁处理单个 HTTP 请求换代理，外层循环处理一次完整 AKShare 函数调用
+    失败；成功只接受非空 DataFrame，最终失败包装为带数据源名称的 RuntimeError。
+    """
+
     last_err: Optional[Exception] = None
 
     for attempt in range(1, retry + 1):
@@ -257,6 +290,8 @@ def _call_akshare_with_retry(
 
 
 def _get_ak_func(func_name: str) -> Optional[Callable[..., Any]]:
+    """按名称获取当前 AKShare 版本中的可调用函数，不存在时返回 None。"""
+
     func = getattr(ak, func_name, None)
 
     if callable(func):
@@ -266,6 +301,11 @@ def _get_ak_func(func_name: str) -> Optional[Callable[..., Any]]:
 
 
 def _extract_industry_name_id(row: pd.Series) -> Tuple[Optional[str], Optional[str]]:
+    """从 AKShare 不同版本的候选列中提取行业名称和六位行业 ID。
+
+    常见代码列都缺失时会扫描整行文本寻找六位数字，以兼容字段名称变化。
+    """
+
     name = (
         _to_str(row.get("name"))
         or _to_str(row.get("板块"))
@@ -292,6 +332,8 @@ def _extract_industry_name_id(row: pd.Series) -> Tuple[Optional[str], Optional[s
 
 
 def _normalize_industry_list_df(df: pd.DataFrame) -> List[Dict[str, Any]]:
+    """把 AKShare 行业表转换为统一的 name/id/stocks 结构并按 ID 去重。"""
+
     industries: List[Dict[str, Any]] = []
 
     for _, row in df.iterrows():
@@ -323,6 +365,12 @@ def _fetch_ths_industry_boards(
     request_sleep_seconds: float,
     request_timeout: int,
 ) -> List[Dict[str, Any]]:
+    """调用 AKShare 同花顺行业列表接口并返回已校验的标准化行业集合。
+
+    当前 AKShare 缺少目标函数、请求最终失败或结果无法解析出行业时均明确抛错，
+    防止后续覆盖已有 JSON 为意外空列表。
+    """
+
     industry_name_func = _get_ak_func("stock_board_industry_name_ths")
 
     if industry_name_func is None:
@@ -350,6 +398,8 @@ def _fetch_ths_industry_boards(
 
 
 def _extract_stock_name_id(row: pd.Series) -> Tuple[Optional[str], Optional[str]]:
+    """从同花顺表格常见列名中提取股票名称和规范化代码。"""
+
     stock_name = (
         _to_str(row.get("名称"))
         or _to_str(row.get("股票名称"))
@@ -368,6 +418,8 @@ def _extract_stock_name_id(row: pd.Series) -> Tuple[Optional[str], Optional[str]
 
 
 def _normalize_stocks_df(df: pd.DataFrame) -> List[Dict[str, str]]:
+    """把成份股 DataFrame 转为 name/id 字典列表，过滤残缺行并按代码去重。"""
+
     stocks: List[Dict[str, str]] = []
 
     for _, row in df.iterrows():
@@ -387,6 +439,8 @@ def _normalize_stocks_df(df: pd.DataFrame) -> List[Dict[str, str]]:
 
 
 def _parse_stocks_by_regex(html: str) -> List[Dict[str, str]]:
+    """在 pandas 表格解析不可用时，从同花顺股票链接和相邻名称单元格兜底解析。"""
+
     pattern = re.compile(
         r'<td>\s*<a[^>]+stockpage\.10jqka\.com\.cn/(\d{6})/?[^>]*>\s*\1\s*</a>\s*</td>\s*'
         r'<td>\s*<a[^>]+stockpage\.10jqka\.com\.cn/\1/?[^>]*>\s*([^<]+?)\s*</a>\s*</td>',
@@ -416,7 +470,7 @@ class DirectTHSIndustryStockFetcher:
     """
     直接请求同花顺行业板块 AJAX 表格，获取前 N 页行业成份股。
 
-    URL:
+    地址：
         http://q.10jqka.com.cn/thshy/detail/field/199112/order/desc/page/{page}/ajax/1/code/{industry_id}/
 
     说明：
@@ -435,24 +489,43 @@ class DirectTHSIndustryStockFetcher:
         ths_cookie: Optional[str] = None,
         hexin_v: Optional[str] = None,
     ) -> None:
+        """保存行业分页请求的代理、认证头、重试和超时配置，并创建复用会话。"""
+
+        # 同花顺请求使用的代理提供器；None 表示直接访问。
         self.provider = provider
+        # 每个 AJAX 页面请求最多尝试的次数。
         self.request_retry = request_retry
+        # 请求失败后的线性退避基础秒数。
         self.request_sleep_seconds = request_sleep_seconds
+        # requests 单次网络请求超时秒数。
         self.request_timeout = request_timeout
+        # 可选浏览器 Cookie，用于提高受风控页面的访问成功率。
         self.ths_cookie = ths_cookie
+        # 可选同花顺 hexin-v 请求头值。
         self.hexin_v = hexin_v
+        # 跨行业和分页复用连接的 requests 会话。
         self.session = requests.Session()
 
     def _build_url(self, industry_id: str, page: int) -> str:
+        """构造指定行业和页码的同花顺 AJAX 成份股表格地址。"""
+
         return (
             f"{THS_BASE_URL}/thshy/detail/field/199112/"
             f"order/desc/page/{page}/ajax/1/code/{industry_id}/"
         )
 
     def _build_referer(self, industry_id: str) -> str:
+        """构造与行业 AJAX 请求匹配的详情页 Referer。"""
+
         return f"{THS_BASE_URL}/thshy/detail/code/{industry_id}/"
 
     def _request_text(self, url: str, referer: str) -> str:
+        """携带可选认证头和代理请求 HTML，并在失败时换代理退避重试。
+
+        方法处理页面编码、HTTP 错误和 401/403 风控提示；成功或失败都会通知代理
+        提供器，以便淘汰不可用 IP。所有尝试耗尽后重新抛出最后一个异常。
+        """
+
         headers = dict(THS_AJAX_HEADERS)
         headers["Referer"] = referer
 
@@ -517,6 +590,12 @@ class DirectTHSIndustryStockFetcher:
         raise last_err
 
     def _parse_stocks_from_html(self, html: str) -> List[Dict[str, str]]:
+        """从行业 AJAX HTML 中解析成份股，并识别反爬跳转页。
+
+        优先选择同时包含“代码”和“名称”的 pandas 表格；无法获得有效行时再使用
+        链接正则兜底。空内容或无表格页面返回空列表。
+        """
+
         if not html:
             return []
 
@@ -565,6 +644,12 @@ class DirectTHSIndustryStockFetcher:
         max_pages: int = 5,
         page_sleep_seconds: float = 0.2,
     ) -> List[Dict[str, str]]:
+        """顺序抓取一个行业的有限页成份股，并按股票代码增量去重。
+
+        首页失败表示该行业不可用并返回空列表；后续页失败、空页或无新增股票只停止
+        当前行业分页，不影响其他行业。页间可按配置休眠以降低风控概率。
+        """
+
         industry_name = industry["name"]
         industry_id = industry["id"]
 
@@ -638,6 +723,11 @@ def _fill_industry_stocks_direct(
     board_sleep_seconds: float,
     page_sleep_seconds: float,
 ) -> None:
+    """逐行业抓取成份股并原位写入 ``stocks`` 字段，同时输出进度。
+
+    行业之间和同一行业分页之间使用独立等待参数，便于控制整体请求节奏。
+    """
+
     total = len(industries)
 
     for index, industry in enumerate(industries, start=1):
@@ -662,6 +752,8 @@ def _fill_industry_stocks_direct(
 
 
 def _normalize_existing_stock(item: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """兼容旧 JSON 字段名并规范化一条股票；名称或代码缺失时返回 None。"""
+
     stock_name = (
         _to_str(item.get("name"))
         or _to_str(item.get("stock_name"))
@@ -685,6 +777,11 @@ def _normalize_existing_stock(item: Dict[str, Any]) -> Optional[Dict[str, str]]:
 
 
 def _normalize_existing_industry(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """兼容旧 JSON 行业及成份股字段，返回去重后的统一行业结构。
+
+    无法解析行业名称或 ID 时整条丢弃；内部无效成份股仅局部过滤。
+    """
+
     industry_name = (
         _to_str(item.get("name"))
         or _to_str(item.get("industry_name"))
@@ -722,6 +819,12 @@ def _normalize_existing_industry(item: Dict[str, Any]) -> Optional[Dict[str, Any
 
 
 def _load_existing_result(out_file: Path) -> Dict[str, Any]:
+    """读取并规范化已有行业 JSON，文件缺失或内容无效时返回空结构。
+
+    读取失败只告警而不抛错，使主流程可以重新生成；返回值始终包含 industries
+    列表并按行业 ID 去重。
+    """
+
     if not out_file.exists():
         return {
             "industries": [],
@@ -762,6 +865,11 @@ def _merge_stock_lists(
     old_stocks: List[Dict[str, str]],
     new_stocks: List[Dict[str, str]],
 ) -> Tuple[List[Dict[str, str]], int]:
+    """合并旧、新成份股列表并返回合并结果及真正新增数量。
+
+    旧列表顺序保留；相同代码使用本次抓取到的最新名称，新代码追加到末尾。
+    """
+
     stock_map: Dict[str, Dict[str, str]] = {}
     merged: List[Dict[str, str]] = []
     added_count = 0
@@ -806,6 +914,12 @@ def merge_existing_and_fetched(
     existing: Dict[str, Any],
     fetched: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    """按行业和股票 ID 合并旧文件与本次结果，并统计新增项。
+
+    本次仍存在的行业更新名称和成份股；旧文件中本次列表暂缺的行业继续保留，
+    避免短暂接口缺失造成历史数据误删。
+    """
+
     existing_industries = existing.get("industries", []) or []
     fetched_industries = fetched.get("industries", []) or []
 
@@ -875,6 +989,8 @@ def merge_existing_and_fetched(
 
 
 def _atomic_write_json(out_file: Path, data: Dict[str, Any]) -> None:
+    """先写同目录临时文件再原子替换目标 JSON，避免中断留下半截文件。"""
+
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
     tmp_file = out_file.with_suffix(out_file.suffix + ".tmp")
@@ -902,6 +1018,12 @@ def fetch_ths_industry_boards(
     hexin_v: Optional[str] = None,
     max_industry_boards: Optional[int] = None,
 ) -> Dict[str, Any]:
+    """抓取同花顺行业列表，并按配置补充每个行业的有限页成份股。
+
+    支持代理、Cookie、hexin-v、分层重试和测试用行业上限；返回结构只包含
+    标准化 industries 列表，是否与旧文件合并由 CLI 主流程决定。
+    """
+
     industries = _fetch_ths_industry_boards(
         provider=provider,
         retry=retry,
@@ -937,6 +1059,12 @@ def fetch_ths_industry_boards(
 
 
 def main() -> None:
+    """解析行业抓取命令行参数，合并或覆盖旧 JSON，并原子保存结果。
+
+    默认启用代理并抓取成份股；执行结束打印行业、引用和新增统计，可选把最终
+    JSON 同时输出到终端。异常由模块入口统一打印并转换为非零退出码。
+    """
+
     parser = argparse.ArgumentParser(
         description="获取同花顺行业板块及其前几页成份股，合并写入单个 JSON 文件"
     )

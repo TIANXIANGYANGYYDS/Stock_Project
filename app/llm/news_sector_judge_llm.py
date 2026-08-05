@@ -450,7 +450,7 @@ class NewsSectorJudgeLLMAnalyzer(BaseLLM):
         随后必须是 JSON 数组并满足 ``NewsSectorLLMAnalysis`` 结构，最后还会经过
         白名单、去重、数量上限和“不涉及版块”兜底规则处理。
 
-        Args:
+        参数：
             title: 新闻标题，可以为空，但不能与正文同时为空。
             content: 新闻正文，可以为空，但不能与标题同时为空。
             publish_time: 原始发布时间文本，仅作为模型判断上下文。
@@ -458,10 +458,10 @@ class NewsSectorJudgeLLMAnalyzer(BaseLLM):
             max_tokens: 本次 LLM 请求允许生成的最大 token 数。
             max_retries: 底层 LLM 请求失败时的最大尝试次数。
 
-        Returns:
+        返回值：
             经过结构和行业白名单校验的行业分析列表，最多包含三个行业。
 
-        Raises:
+        异常：
             ValueError: 标题和正文同时为空时抛出。
             LLMResponseError: 模型返回内容不是合法 JSON 数组时抛出。
         """

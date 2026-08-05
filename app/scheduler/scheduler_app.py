@@ -14,8 +14,8 @@ from app.scheduler.crawler_jobs import (
     ensure_news_indexes,
     register_crawler_jobs,
 )
+from app.scheduler.creator_monitoring_jobs import register_creator_monitoring_jobs
 from app.scheduler.morning_analysis_jobs import register_morning_analysis_job
-from app.scheduler.douyin_creator_jobs import register_douyin_creator_job
 from app.scheduler.news_ranking_jobs import (
     register_news_ranking_job,
     run_news_ranking_snapshot,
@@ -47,10 +47,10 @@ def configure_logging() -> None:
 
 
 def build_scheduler() -> AsyncIOScheduler:
-    """创建调度器并注册新闻、榜单、抖音和盘前分析的全部周期任务。
+    """创建调度器并注册新闻、博主采集和盘前分析的全部周期任务。
 
-    新闻抓取任务启动后立即执行，且禁止同一任务并发重入；新闻榜单、抖音发现
-    和盘前分析均由各领域注册函数固定启用。返回尚未启动的调度器供主循环管理。
+    博主采集、内容提取、观点分析和评分统一由 creator monitoring 链路负责；
+    返回尚未启动的调度器，供主循环安装信号处理后统一管理生命周期。
     """
     scheduler = AsyncIOScheduler()
     job = scheduler.add_job(
@@ -66,7 +66,7 @@ def build_scheduler() -> AsyncIOScheduler:
     logger.info("registered job id=%s", job.id)
     register_crawler_jobs(scheduler)
     register_news_ranking_job(scheduler)
-    register_douyin_creator_job(scheduler)
+    register_creator_monitoring_jobs(scheduler)
     register_morning_analysis_job(scheduler)
     return scheduler
 

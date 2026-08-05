@@ -5,7 +5,6 @@ import inspect
 from collections import Counter
 from datetime import datetime
 from types import SimpleNamespace
-from typing import Optional
 from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
@@ -13,6 +12,7 @@ import pytest
 
 from app.crawlers import stock_daily_detail_crawler as crawler_module
 from app.crawlers import proxy_provider as proxy_module
+from app.crawlers.eastmoney_reverse_fetcher import EastMoneyReverseFetcher
 from app.crawlers.proxy_provider import (
     AsyncDailiProxyPool,
     AsyncDailiProxyProvider,
@@ -21,37 +21,44 @@ from app.crawlers.proxy_provider import (
 )
 from app.crawlers.stock_daily_detail_crawler import (
     EastMoneyDataFetcher,
-    EastMoneyQuotePageFetcher,
-    NonRetryablePageError,
     StockDailyDetailCrawler,
 )
 
 
 def build_daily_df(periods: int = 2) -> pd.DataFrame:
     dates = pd.date_range("2026-01-01", periods=periods, freq="D")
-    lines = []
+    rows = []
     for index, date in enumerate(dates):
         open_price = 10 + index * 0.01
         close_price = open_price + 0.05
         high_price = close_price + 0.1
         low_price = open_price - 0.1
-        lines.append(
-            (
-                f"{date:%Y-%m-%d},"
-                f"{open_price:.2f},{close_price:.2f},{high_price:.2f},"
-                f"{low_price:.2f},1000,1050000,2.00,0.50,0.05,1.50"
-            )
+        rows.append(
+            {
+                "日期": f"{date:%Y-%m-%d}",
+                "开盘": open_price,
+                "收盘": close_price,
+                "最高": high_price,
+                "最低": low_price,
+                "成交量": 1000,
+                "成交额": 1_050_000,
+                "振幅": 2.0,
+                "涨跌幅": 0.5,
+                "涨跌额": 0.05,
+                "换手率": 1.5,
+                "股票代码": "000049",
+            }
         )
 
-    dataframe = EastMoneyDataFetcher._kline_lines_to_daily_df(lines, code="000049")
+    dataframe = pd.DataFrame(rows)
     latest_date = f"{dates[-1]:%Y-%m-%d}"
     dataframe.attrs.update(
         {
-            "source": EastMoneyQuotePageFetcher.SOURCE,
-            "page_url": EastMoneyQuotePageFetcher.get_daily_page_url("000049"),
+            "source": EastMoneyReverseFetcher.SOURCE,
+            "page_url": EastMoneyReverseFetcher.get_daily_page_url("000049"),
             "network": "proxy",
-            "indicator_source": EastMoneyQuotePageFetcher.RUNTIME_SOURCE,
-            "chip_source": EastMoneyQuotePageFetcher.RUNTIME_SOURCE,
+            "indicator_source": EastMoneyReverseFetcher.INDICATOR_SOURCE,
+            "chip_source": EastMoneyReverseFetcher.CHIP_SOURCE,
             "indicator_rows": {
                 latest_date: {
                     "ma5": 10.03,
@@ -97,88 +104,16 @@ def build_daily_df(periods: int = 2) -> pd.DataFrame:
     return dataframe
 
 
-def test_quote_page_urls_match_eastmoney_routes() -> None:
-    assert EastMoneyQuotePageFetcher.get_concept_url("002185") == (
+def test_reverse_reference_urls_match_eastmoney_routes() -> None:
+    assert EastMoneyReverseFetcher.get_daily_page_url("002185") == (
         "https://quote.eastmoney.com/concept/sz002185.html#chart-k-cyq"
     )
-    assert EastMoneyQuotePageFetcher.get_daily_page_url("002185") == (
-        "https://quote.eastmoney.com/concept/sz002185.html#chart-k-cyq"
-    )
-    assert EastMoneyQuotePageFetcher.get_daily_page_url("600000") == (
+    assert EastMoneyReverseFetcher.get_daily_page_url("600000") == (
         "https://quote.eastmoney.com/concept/sh600000.html#chart-k-cyq"
     )
-    assert EastMoneyQuotePageFetcher.get_daily_page_url("920992") == (
+    assert EastMoneyReverseFetcher.get_daily_page_url("920992") == (
         "https://quote.eastmoney.com/concept/bj920992.html#chart-k-cyq"
     )
-
-
-def test_quote_page_route_only_blocks_heavy_assets() -> None:
-    class FakeRoute:
-        def __init__(self, resource_type: str) -> None:
-            self.request = SimpleNamespace(resource_type=resource_type)
-            self.action = None
-
-        async def abort(self) -> None:
-            self.action = "abort"
-
-        async def continue_(self) -> None:
-            self.action = "continue"
-
-    async def run_test() -> None:
-        for resource_type in ("image", "media", "font"):
-            route = FakeRoute(resource_type)
-            await EastMoneyQuotePageFetcher._abort_heavy_assets(route)
-            assert route.action == "abort"
-
-        for resource_type in ("document", "script", "xhr", "fetch"):
-            route = FakeRoute(resource_type)
-            await EastMoneyQuotePageFetcher._abort_heavy_assets(route)
-            assert route.action == "continue"
-
-    asyncio.run(run_test())
-
-
-def test_kline_lines_to_daily_df_matches_quote_page_schema() -> None:
-    dataframe = EastMoneyDataFetcher._kline_lines_to_daily_df(
-        [
-            "2026-07-10,26.10,25.31,26.10,25.10,4948817,"
-            "12764273171.63,4.21,6.66,1.58,14.89"
-        ],
-        code="2185",
-    )
-
-    assert dataframe.loc[0, "股票代码"] == "002185"
-    assert dataframe.loc[0, "收盘"] == 25.31
-    assert dataframe.loc[0, "成交量"] == 4_948_817
-
-
-def test_bse_concept_daily_rows_match_quote_page_schema() -> None:
-    dataframe = EastMoneyQuotePageFetcher._concept_daily_rows_to_df(
-        [
-            {
-                "date": "2026-07-13",
-                "open": 11.92,
-                "close": 11.45,
-                "high": 12.05,
-                "low": 11.38,
-                "volume": 10_818,
-                "amount": 12_514_985.53,
-                "amplitude": 5.57,
-                "pctChange": -4.82,
-                "changeAmount": -0.58,
-                "turnover": 2.21,
-            }
-        ],
-        code="920992",
-    )
-
-    assert list(dataframe.columns) == [
-        *EastMoneyDataFetcher.DAILY_COLUMNS,
-        "股票代码",
-    ]
-    assert dataframe.loc[0, "股票代码"] == "920992"
-    assert dataframe.loc[0, "收盘"] == 11.45
-    assert dataframe.loc[0, "成交额"] == 12_514_985.53
 
 
 def test_daily_crawler_contains_no_local_indicator_or_chip_fallback() -> None:
@@ -192,164 +127,6 @@ def test_daily_crawler_contains_no_local_indicator_or_chip_fallback() -> None:
         "_calculate_rsi",
     )
     assert all(token not in source for token in forbidden)
-
-
-def test_runtime_diagnostics_can_be_dumped(tmp_path) -> None:
-    fetcher = EastMoneyQuotePageFetcher()
-    assert fetcher.strict_page_indicators is True
-    assert fetcher.strict_page_chip is True
-    fetcher.last_runtime_diagnostics = {"runtime": {"chipDateCount": 1}}
-    target = fetcher.dump_last_runtime_diagnostics(tmp_path / "diagnostics.json")
-
-    assert target.read_text(encoding="utf-8").find('"chipDateCount": 1') > 0
-
-
-class FakeProxyProvider:
-    def __init__(self) -> None:
-        self.proxy_index = 0
-        self.success_count = 0
-        self.failures: list[Exception] = []
-
-    async def get_requests_proxies(self) -> dict[str, str]:
-        self.proxy_index += 1
-        url = f"http://127.0.0.1:{8000 + self.proxy_index}"
-        return {"http": url, "https": url}
-
-    def on_success(self) -> None:
-        self.success_count += 1
-
-    def on_failure(self, exc: Exception) -> None:
-        self.failures.append(exc)
-
-    async def close(self) -> None:
-        pass
-
-
-class FakeQuotePageFetcher:
-    def __init__(self, fail_proxy_count: int = 0) -> None:
-        self.fail_proxy_count = fail_proxy_count
-        self.calls: list[Optional[dict[str, str]]] = []
-
-    async def fetch_kline(self, **kwargs) -> pd.DataFrame:
-        proxies = kwargs.get("proxies")
-        self.calls.append(proxies)
-        if proxies is None:
-            raise ConnectionError("local IP blocked")
-        if self.fail_proxy_count:
-            self.fail_proxy_count -= 1
-            raise ConnectionError("proxy blocked")
-        return build_daily_df()
-
-    async def close(self) -> None:
-        pass
-
-
-class NonRetryableFakeQuotePageFetcher:
-    def __init__(self) -> None:
-        self.calls: list[Optional[dict[str, str]]] = []
-
-    async def fetch_kline(self, **kwargs) -> pd.DataFrame:
-        self.calls.append(kwargs.get("proxies"))
-        raise NonRetryablePageError("行情页响应异常: status=404")
-
-    async def close(self) -> None:
-        pass
-
-
-def test_daily_history_rotates_proxy_without_local_request(monkeypatch) -> None:
-    provider = FakeProxyProvider()
-    page_fetcher = FakeQuotePageFetcher(fail_proxy_count=1)
-    crawler = StockDailyDetailCrawler(
-        max_retry=2,
-        proxy_provider=provider,
-        quote_page_fetcher=page_fetcher,
-    )
-
-    async def run_test() -> pd.DataFrame:
-        async def no_sleep(_: float) -> None:
-            pass
-
-        monkeypatch.setattr(crawler_module.asyncio, "sleep", no_sleep)
-        try:
-            return await crawler.fetch_stock_daily_hist(
-                "002185", "20260101", "20260102"
-            )
-        finally:
-            await crawler.close()
-
-    dataframe = asyncio.run(run_test())
-
-    assert page_fetcher.calls == [
-        {"http": "http://127.0.0.1:8001", "https": "http://127.0.0.1:8001"},
-        {"http": "http://127.0.0.1:8002", "https": "http://127.0.0.1:8002"},
-    ]
-    assert len(provider.failures) == 1
-    assert provider.success_count == 1
-    assert dataframe.attrs["source"] == EastMoneyQuotePageFetcher.SOURCE
-
-
-def test_non_retryable_page_error_keeps_proxy() -> None:
-    provider = FakeProxyProvider()
-    page_fetcher = NonRetryableFakeQuotePageFetcher()
-    crawler = StockDailyDetailCrawler(
-        max_retry=3,
-        proxy_provider=provider,
-        quote_page_fetcher=page_fetcher,
-    )
-
-    async def run_test() -> None:
-        try:
-            with pytest.raises(NonRetryablePageError):
-                await crawler.fetch_stock_daily_hist(
-                    "920992", "20260713", "20260713"
-                )
-        finally:
-            await crawler.close()
-
-    asyncio.run(run_test())
-
-    assert len(page_fetcher.calls) == 1
-    assert page_fetcher.calls[0] is not None
-    assert provider.proxy_index == 1
-    assert provider.success_count == 1
-    assert provider.failures == []
-
-
-def test_concurrent_crawlers_always_use_proxy() -> None:
-    provider = FakeProxyProvider()
-    page_fetcher = FakeQuotePageFetcher()
-    semaphore = asyncio.Semaphore(5)
-    crawlers = [
-        StockDailyDetailCrawler(
-            max_retry=1,
-            proxy_provider=provider,
-            quote_page_fetcher=page_fetcher,
-            page_semaphore=semaphore,
-        )
-        for _ in range(5)
-    ]
-
-    async def run_test() -> None:
-        try:
-            await asyncio.gather(
-                *(
-                    crawler.fetch_stock_daily_hist(
-                        f"{2185 + index:06d}",
-                        "20260101",
-                        "20260102",
-                    )
-                    for index, crawler in enumerate(crawlers)
-                )
-            )
-        finally:
-            for crawler in crawlers:
-                await crawler.close()
-            await provider.close()
-
-    asyncio.run(run_test())
-
-    assert page_fetcher.calls.count(None) == 0
-    assert len([proxies for proxies in page_fetcher.calls if proxies]) == 5
 
 
 def test_async_proxy_is_reused_until_failure_or_expiry(monkeypatch) -> None:
@@ -539,7 +316,7 @@ def test_51daili_proxy_pool_rejects_non_fixed_duration(monkeypatch) -> None:
         AsyncDailiProxyPool(minutes=4)
 
 
-def test_page_values_are_saved_without_local_fill(monkeypatch) -> None:
+def test_reverse_values_are_saved_without_local_fill(monkeypatch) -> None:
     crawler = StockDailyDetailCrawler(max_retry=1)
     daily_df = build_daily_df()
 
@@ -573,8 +350,8 @@ def test_page_values_are_saved_without_local_fill(monkeypatch) -> None:
     assert item.chip is not None
     assert item.chip.chart is not None
     assert len(item.chip.chart.x) == 150
-    assert item.source.indicator == "eastmoney.quote_page.runtime"
-    assert item.source.chip == "eastmoney.quote_page.runtime"
+    assert item.source.indicator == EastMoneyReverseFetcher.INDICATOR_SOURCE
+    assert item.source.chip == EastMoneyReverseFetcher.CHIP_SOURCE
 
 
 def test_stock_universe_keeps_only_target_date_traded_stocks() -> None:

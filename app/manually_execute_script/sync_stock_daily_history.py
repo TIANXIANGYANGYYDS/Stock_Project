@@ -37,10 +37,17 @@ CN_TZ = timezone(timedelta(hours=8))
 
 
 def today_yyyymmdd() -> str:
+    """返回中国时区当天日期的 ``YYYYMMDD`` 文本，作为补历史默认截止日。"""
+
     return datetime.now(CN_TZ).strftime("%Y%m%d")
 
 
 def optional_positive_int(value: Optional[str]) -> Optional[int]:
+    """把可空命令行文本解析为正整数，供 ``limit`` 和并发参数复用。
+
+    ``None`` 或空字符串表示不限制；非正整数转换为 argparse 可展示的参数错误。
+    """
+
     if value is None or value == "":
         return None
 
@@ -52,6 +59,8 @@ def optional_positive_int(value: Optional[str]) -> Optional[int]:
 
 
 def non_negative_int(value: str) -> int:
+    """解析允许为零的整数参数，并拒绝负数偏移量。"""
+
     number = int(value)
     if number < 0:
         raise argparse.ArgumentTypeError("offset 不能小于 0")
@@ -60,6 +69,8 @@ def non_negative_int(value: str) -> int:
 
 
 def parse_args() -> argparse.Namespace:
+    """解析历史日线补齐范围、股票切片、目标交易日和并发参数。"""
+
     parser = argparse.ArgumentParser(
         description="手动补齐 A 股详细日线历史数据。",
     )
@@ -104,13 +115,19 @@ def parse_args() -> argparse.Namespace:
         "--concurrency",
         type=optional_positive_int,
         default=STOCK_DAILY_DEFAULT_CONCURRENCY,
-        help="协程 worker 数；实际网页并发仍受服务端信号量限制。",
+        help="逆向协议协程 worker 数，生产默认及上限均为 20。",
     )
 
     return parser.parse_args()
 
 
 async def async_main() -> None:
+    """执行一次历史日线补齐任务并打印运行统计和前十条失败项。
+
+    未显式给出目标交易日时，根据结束日期解析不晚于该日的最近 A 股交易日，
+    再以 ``history_backfill`` 模式调用统一同步服务。
+    """
+
     args = parse_args()
     target_trade_date = args.target_trade_date
     if target_trade_date is None:
@@ -147,6 +164,8 @@ async def async_main() -> None:
 
 
 def main() -> None:
+    """创建事件循环并运行历史日线手动补齐入口。"""
+
     asyncio.run(async_main())
 
 

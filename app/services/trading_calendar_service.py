@@ -43,14 +43,14 @@ def resolve_morning_trade_dates(
     ``exchange_calendars`` 接口的日历对象以便测试。若日期超出日历覆盖范围，抛出
     带升级提示的 ``RuntimeError``。
 
-    Args:
+    参数：
         reference_date: 调度器参考的自然日。
         calendar: 可选交易所日历；为空时使用缓存的 XSHG 日历。
 
-    Returns:
+    返回值：
         包含三个 ISO 日期字符串和交易日标志的不可变决策对象。
 
-    Raises:
+    异常：
         RuntimeError: 交易所日历不覆盖参考日期时抛出。
     """
 
@@ -77,3 +77,26 @@ def resolve_morning_trade_dates(
         prev_trade_date=previous_session.strftime("%Y-%m-%d"),
         is_current_trade_day=is_current_trade_day,
     )
+
+
+def next_a_share_trade_date(
+    reference_date: date,
+    *,
+    calendar: Any | None = None,
+) -> date:
+    """把自然日规范为当日或之后最近的 A 股交易日。"""
+
+    active_calendar = calendar or get_a_share_calendar()
+    reference_session = pd.Timestamp(reference_date)
+    try:
+        session = (
+            reference_session
+            if active_calendar.is_session(reference_session)
+            else active_calendar.date_to_session(reference_session, direction="next")
+        )
+    except DateOutOfBounds as exc:
+        raise RuntimeError(
+            "A 股交易日历不覆盖验证日期 "
+            f"{reference_date.isoformat()}，请升级 exchange_calendars 后重启调度器"
+        ) from exc
+    return session.date()

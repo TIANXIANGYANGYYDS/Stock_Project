@@ -73,8 +73,8 @@ def test_manual_ranking_helper_passes_fixed_values_and_reference_time(monkeypatc
             "reference_datetime": reference_datetime,
             "window_hours": 72,
             "ranking_limit": 12,
-            "morning_cutoff_hour": 9,
-            "morning_cutoff_minute": 0,
+                "morning_cutoff_hour": 8,
+                "morning_cutoff_minute": 20,
         }
     ]
 

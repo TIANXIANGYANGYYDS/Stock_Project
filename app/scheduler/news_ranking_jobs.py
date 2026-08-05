@@ -11,7 +11,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 logger = logging.getLogger(__name__)
 # APScheduler 中用于幂等替换新闻榜单刷新任务的稳定 ID。
 NEWS_RANKING_JOB_ID = "news_ranking_snapshot"
-# 新闻榜单固定每 5 分钟刷新一次，以保证 09:00 盘前读取到足够新的快照。
+# 新闻榜单固定每 5 分钟刷新一次，以保证 08:20 盘前读取到足够新的快照。
 NEWS_RANKING_INTERVAL_MINUTES = 5
 
 

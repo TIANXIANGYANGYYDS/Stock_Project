@@ -268,7 +268,11 @@ class NewsRepository(BaseMongoRepository):
         start_ts: int,
         end_ts: int,
     ) -> list[dict[str, Any]]:
-        """Read one internally consistent window for ranking input and stats."""
+        """读取指定发布时间窗口内用于榜单计算和统计的新闻快照。
+
+        查询包含起止时间戳边界，并仅投影榜单消费所需的来源、状态和板块分析字段；
+        返回结果按发布时间倒序排列，使排名输入与窗口统计共享同一批数据库结果。
+        """
         return await self.find_many(
             {
                 "publish_ts": {"$gte": start_ts, "$lte": end_ts},

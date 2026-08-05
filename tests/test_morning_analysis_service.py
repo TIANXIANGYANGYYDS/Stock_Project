@@ -15,17 +15,16 @@ from app.models.daily_market_analysis import (
     SectorNewsEvidence,
     SectorRankingItem,
 )
+from app.models.creator_monitoring import (
+    CreatorOpinion,
+    CreatorWork,
+    CreatorWorkAnalysis,
+    CreatorWorkStatus,
+)
 from app.models.news_ranking_snapshot import (
     NewsRankingFormulaVersions,
     NewsRankingSnapshot,
     NewsRankingSourceStats,
-)
-from app.models.douyin_creator_work import (
-    DouyinCreatorWork,
-    DouyinSectorOpinion,
-    DouyinTranscript,
-    DouyinWorkAnalysis,
-    DouyinWorkStatus,
 )
 from app.services.morning_analysis_service import MorningAnalysisService
 from app.services.trading_calendar_service import (
@@ -72,17 +71,34 @@ class FakeCreatorWorkRepository:
         self.list_calls = []
         self.latest_calls = []
 
-    async def list_finished_for_morning(self, **kwargs):
+    async def list_finished_works_by_published_window(self, **kwargs):
         self.list_calls.append(kwargs)
         if self.error is not None:
             raise self.error
-        return self.works
+        return [
+            work
+            for work in self.works
+            if work.creator_id == kwargs["creator_id"]
+        ]
 
     async def find_latest_finished_before(self, **kwargs):
         self.latest_calls.append(kwargs)
         if self.error is not None:
             raise self.error
         return self.latest
+
+
+class FakeCreatorVerificationRepository:
+    def __init__(self, verifications=None, *, error=None):
+        self.verifications = list(verifications or [])
+        self.error = error
+        self.calls = []
+
+    async def list_by_market_date(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return self.verifications
 
 
 class FakeMorningCrawler:
@@ -120,6 +136,8 @@ class FakeReviewCrawler:
 class FakeAnalyzer:
     def __init__(self):
         self.inputs = None
+        self.last_source_memos = {"previous_review": "独立复盘备忘录"}
+        self.last_scenario_memos = {"reversal": "独立反转论证"}
 
     async def analyze(self, **kwargs):
         self.inputs = kwargs
@@ -146,43 +164,71 @@ def build_creator_work(
     first_seen_at: datetime | None = None,
     analyzed_at: datetime | None = None,
     work_id: str = "douyin-work-1",
-) -> DouyinCreatorWork:
+    creator_id: str = "creator-1",
+    creator_name: str = "测试博主",
+) -> CreatorWork:
     published_at = now - timedelta(hours=age_hours)
     first_seen_at = first_seen_at or published_at
-    return DouyinCreatorWork(
-        work_id=work_id,
-        creator_sec_uid="creator-1",
-        creator_name="测试博主",
-        creator_short_id="creator-short-id",
-        description="盘前关注半导体。",
+    work_key = f"douyin:{work_id}"
+    return CreatorWork(
+        creator_id=creator_id,
+        creator_name=creator_name,
+        account_id="douyin:creator-account",
+        platform="douyin",
+        platform_work_id=work_id,
+        content_type="video",
+        title="盘前关注半导体。",
         published_at=published_at,
-        publish_ts=int(published_at.timestamp()),
         canonical_url=f"https://www.douyin.com/video/{work_id}",
         duration_ms=60_000,
         first_seen_at=first_seen_at,
         fetched_at=first_seen_at,
-        status=DouyinWorkStatus(status="finished"),
-        transcript=DouyinTranscript(
-            text="原始转写文本。",
-            provider="test-asr",
-            model="test-model",
-            transcribed_at=first_seen_at,
-        ),
-        analysis=DouyinWorkAnalysis(
+        source_text="盘前关注半导体。",
+        extracted_text="原始转写文本。",
+        status=CreatorWorkStatus(status="finished"),
+        analysis=CreatorWorkAnalysis(
             summary="博主认为半导体有增量催化。",
-            sector_opinions=[
-                DouyinSectorOpinion(
-                    opinion_id=f"{work_id}:半导体",
-                    sector_name="半导体",
+            opinions=[
+                CreatorOpinion(
+                    opinion_id=f"{work_key}:sector:0",
+                    work_key=work_key,
+                    target_type="sector",
+                    target_name="半导体",
+                    direction="bullish",
                     stance_score=70,
-                    reason="产业政策可能形成增量预期。",
+                    claim="产业政策可能形成增量预期。",
+                    horizon="次日",
+                    valid_from=published_at,
+                    valid_until=published_at + timedelta(days=1),
+                    metric="半导体行业相对表现",
+                    source_quote="盘前关注半导体。",
                 )
             ],
-            analysis_version="douyin_creator_analysis_v1",
+            analysis_version="creator_opinion_v1",
             analysis_model="test-model",
             analyzed_at=analyzed_at or first_seen_at,
         ),
     )
+
+
+def build_creator_verification(
+    creator_id: str = "creator-1",
+    *,
+    creator_name: str = "测试博主",
+    rolling_score: float | None = 80.0,
+    daily_score: float | None = 80.0,
+    sample_count: int = 5,
+):
+    class Verification:
+        pass
+
+    verification = Verification()
+    verification.creator_id = creator_id
+    verification.creator_name = creator_name
+    verification.rolling_score = rolling_score
+    verification.daily_score = daily_score
+    verification.sample_count = sample_count
+    return verification
 
 
 def build_snapshot(
@@ -201,7 +247,7 @@ def build_snapshot(
         event_id="news-1",
         source="cls",
         title="芯片产业政策",
-        publish_time="2026-07-23 08:59:00",
+        publish_time="2026-07-23 08:19:00",
         publish_ts=event_ts,
         score=70,
         reason="政策直接支持产业。",
@@ -236,13 +282,16 @@ def build_snapshot(
 
 
 def test_morning_analysis_service_builds_and_upserts_report() -> None:
-    now = datetime(2026, 7, 23, 9, 0, tzinfo=CN_TZ)
+    now = datetime(2026, 7, 23, 8, 20, tzinfo=CN_TZ)
     snapshot_repository = FakeRankingSnapshotRepository(build_snapshot(now))
     report_repository = FakeReportRepository()
     morning_crawler = FakeMorningCrawler()
     review_crawler = FakeReviewCrawler()
     analyzer = FakeAnalyzer()
     creator_repository = FakeCreatorWorkRepository(works=[build_creator_work(now)])
+    verification_repository = FakeCreatorVerificationRepository(
+        [build_creator_verification()]
+    )
     decision = MorningTradeDateDecision(
         reference_date="2026-07-23",
         analysis_date="2026-07-23",
@@ -253,7 +302,7 @@ def test_morning_analysis_service_builds_and_upserts_report() -> None:
         report_repository=report_repository,
         ranking_snapshot_repository=snapshot_repository,
         creator_work_repository=creator_repository,
-        creator_sec_uid="creator-1",
+        creator_verification_repository=verification_repository,
         morning_crawler=morning_crawler,
         review_crawler=review_crawler,
         analyzer=analyzer,
@@ -274,12 +323,19 @@ def test_morning_analysis_service_builds_and_upserts_report() -> None:
     assert result.report.ranking_snapshot_meta is not None
     assert result.report.ranking_snapshot_meta.snapshot_id.startswith("snapshot-")
     assert result.report.ranking_snapshot_meta.is_stale is False
-    assert result.report.prompt_version == "morning_analysis_v3"
+    assert result.report.prompt_version == "morning_analysis_v9"
     assert result.report.analysis_model == ""
     assert result.report.thinking_enabled is False
+    assert result.report.source_analysis_memos == {
+        "previous_review": "独立复盘备忘录"
+    }
+    assert result.report.scenario_analysis_memos == {"reversal": "独立反转论证"}
     assert result.report.creator_context.status == "available"
     assert result.report.creator_context.priority == "critical"
     assert result.report.creator_context.source_date == "2026-07-22"
+    assert result.report.creator_context.ranking_market_date == "2026-07-22"
+    assert result.report.creator_context.ranked_creators[0].creator_id == "creator-1"
+    assert result.report.creator_context.ranked_creators[0].rolling_score == 80.0
     assert morning_crawler.dates == ["2026-07-23"]
     assert review_crawler.dates == ["2026-07-22"]
     assert report_repository.index_calls == 1
@@ -293,14 +349,49 @@ def test_morning_analysis_service_builds_and_upserts_report() -> None:
     ]
     assert creator_repository.list_calls == [
         {
-            "creator_sec_uid": "creator-1",
-            "start_ts": int(datetime(2026, 7, 22, 0, 0, tzinfo=CN_TZ).timestamp()),
-            "end_ts": int(datetime(2026, 7, 22, 23, 59, 59, tzinfo=CN_TZ).timestamp()),
-            "available_at_ts": int(now.timestamp()),
+            "creator_id": "creator-1",
+            "start_at": datetime(2026, 7, 22, 0, 0, tzinfo=CN_TZ),
+            "end_at": datetime(2026, 7, 23, 0, 0, tzinfo=CN_TZ),
+            "available_at": now,
             "limit": 3,
         }
     ]
     assert creator_repository.latest_calls == []
+    assert verification_repository.calls == [
+        {"market_date": "2026-07-22", "status": "completed"}
+    ]
+
+
+def test_morning_analysis_service_dry_run_returns_report_without_database_write() -> None:
+    now = datetime(2026, 7, 23, 8, 20, tzinfo=CN_TZ)
+    report_repository = FakeReportRepository()
+    decision = MorningTradeDateDecision(
+        reference_date="2026-07-23",
+        analysis_date="2026-07-23",
+        prev_trade_date="2026-07-22",
+        is_current_trade_day=True,
+    )
+    service = MorningAnalysisService(
+        report_repository=report_repository,
+        ranking_snapshot_repository=FakeRankingSnapshotRepository(build_snapshot(now)),
+        creator_work_repository=FakeCreatorWorkRepository(
+            works=[build_creator_work(now)]
+        ),
+        creator_verification_repository=FakeCreatorVerificationRepository(
+            [build_creator_verification()]
+        ),
+        morning_crawler=FakeMorningCrawler(),
+        review_crawler=FakeReviewCrawler(),
+        analyzer=FakeAnalyzer(),
+        trade_date_resolver=lambda value: decision,
+    )
+
+    result = asyncio.run(service.run(reference_datetime=now, persist=False))
+
+    assert result.report is not None
+    assert result.report.analysis_date == "2026-07-23"
+    assert report_repository.index_calls == 0
+    assert report_repository.reports == []
 
 
 def test_morning_analysis_service_skips_non_trading_day_before_io() -> None:
@@ -316,7 +407,6 @@ def test_morning_analysis_service_skips_non_trading_day_before_io() -> None:
         report_repository=report_repository,
         ranking_snapshot_repository=snapshot_repository,
         creator_work_repository=FakeCreatorWorkRepository(),
-        creator_sec_uid="creator-1",
         morning_crawler=FakeMorningCrawler(),
         review_crawler=FakeReviewCrawler(),
         analyzer=FakeAnalyzer(),
@@ -334,7 +424,7 @@ def test_morning_analysis_service_skips_non_trading_day_before_io() -> None:
 
 
 def test_morning_analysis_service_requires_published_snapshot() -> None:
-    now = datetime(2026, 7, 23, 9, 0, tzinfo=CN_TZ)
+    now = datetime(2026, 7, 23, 8, 20, tzinfo=CN_TZ)
     report_repository = FakeReportRepository()
     decision = MorningTradeDateDecision(
         reference_date="2026-07-23",
@@ -348,7 +438,9 @@ def test_morning_analysis_service_requires_published_snapshot() -> None:
         creator_work_repository=FakeCreatorWorkRepository(
             works=[build_creator_work(now)]
         ),
-        creator_sec_uid="creator-1",
+        creator_verification_repository=FakeCreatorVerificationRepository(
+            [build_creator_verification()]
+        ),
         morning_crawler=FakeMorningCrawler(),
         review_crawler=FakeReviewCrawler(),
         analyzer=FakeAnalyzer(),
@@ -362,7 +454,7 @@ def test_morning_analysis_service_requires_published_snapshot() -> None:
 
 
 def test_morning_analysis_service_marks_stale_snapshot_degraded() -> None:
-    now = datetime(2026, 7, 23, 9, 0, tzinfo=CN_TZ)
+    now = datetime(2026, 7, 23, 8, 20, tzinfo=CN_TZ)
     snapshot = build_snapshot(
         now,
         age_seconds=16 * 60,
@@ -381,7 +473,9 @@ def test_morning_analysis_service_marks_stale_snapshot_degraded() -> None:
         creator_work_repository=FakeCreatorWorkRepository(
             works=[build_creator_work(now)]
         ),
-        creator_sec_uid="creator-1",
+        creator_verification_repository=FakeCreatorVerificationRepository(
+            [build_creator_verification()]
+        ),
         morning_crawler=FakeMorningCrawler(),
         review_crawler=FakeReviewCrawler(),
         analyzer=analyzer,
@@ -401,7 +495,7 @@ def test_morning_analysis_service_marks_stale_snapshot_degraded() -> None:
 
 
 def test_morning_analysis_service_marks_complete_with_fresh_creator_context() -> None:
-    now = datetime(2026, 7, 23, 9, 0, tzinfo=CN_TZ)
+    now = datetime(2026, 7, 23, 8, 20, tzinfo=CN_TZ)
     snapshot = build_snapshot(now, status_counts={"finished": 10})
     analyzer = FakeAnalyzer()
     decision = MorningTradeDateDecision(
@@ -416,7 +510,9 @@ def test_morning_analysis_service_marks_complete_with_fresh_creator_context() ->
         creator_work_repository=FakeCreatorWorkRepository(
             works=[build_creator_work(now)]
         ),
-        creator_sec_uid="creator-1",
+        creator_verification_repository=FakeCreatorVerificationRepository(
+            [build_creator_verification()]
+        ),
         morning_crawler=FakeMorningCrawler(),
         review_crawler=FakeReviewCrawler(),
         analyzer=analyzer,
@@ -449,8 +545,10 @@ def test_delayed_run_keeps_the_configured_morning_cutoff() -> None:
             build_snapshot(cutoff)
         ),
         creator_work_repository=creator_repository,
+        creator_verification_repository=FakeCreatorVerificationRepository(
+            [build_creator_verification()]
+        ),
         creator_enabled=True,
-        creator_sec_uid="creator-1",
         analysis_hour=9,
         analysis_minute=0,
         morning_crawler=FakeMorningCrawler(),
@@ -465,19 +563,17 @@ def test_delayed_run_keeps_the_configured_morning_cutoff() -> None:
     assert result.report.created_at == execution_time
     assert result.report.ranking_snapshot_meta is not None
     assert result.report.ranking_snapshot_meta.age_seconds == 60
-    assert creator_repository.list_calls[0]["end_ts"] == int(
-        datetime(2026, 7, 22, 23, 59, 59, tzinfo=CN_TZ).timestamp()
+    assert creator_repository.list_calls[0]["end_at"] == datetime(
+        2026, 7, 23, 0, 0, tzinfo=CN_TZ
     )
-    assert creator_repository.list_calls[0]["available_at_ts"] == int(
-        cutoff.timestamp()
-    )
+    assert creator_repository.list_calls[0]["available_at"] == cutoff
     assert service.ranking_snapshot_repository.dates == [
         ("2026-07-23", int(cutoff.timestamp()))
     ]
 
 
 def test_creator_source_uses_previous_day_but_next_morning_availability() -> None:
-    cutoff = datetime(2026, 7, 24, 9, 0, tzinfo=CN_TZ)
+    cutoff = datetime(2026, 7, 24, 8, 20, tzinfo=CN_TZ)
     first_seen_at = cutoff - timedelta(minutes=30)
     work = build_creator_work(
         cutoff,
@@ -486,10 +582,13 @@ def test_creator_source_uses_previous_day_but_next_morning_availability() -> Non
         analyzed_at=first_seen_at,
     )
     creator_repository = FakeCreatorWorkRepository(works=[work])
+    verification_repository = FakeCreatorVerificationRepository(
+        [build_creator_verification()]
+    )
     service = MorningAnalysisService(
         creator_work_repository=creator_repository,
+        creator_verification_repository=verification_repository,
         creator_enabled=True,
-        creator_sec_uid="creator-1",
     )
     publish_start = datetime(2026, 7, 23, 0, 0, tzinfo=CN_TZ)
     publish_end = datetime(2026, 7, 23, 23, 59, 59, tzinfo=CN_TZ)
@@ -497,30 +596,197 @@ def test_creator_source_uses_previous_day_but_next_morning_availability() -> Non
     context = asyncio.run(
         service._load_creator_context(
             source_date="2026-07-23",
+            ranking_market_date="2026-07-23",
             publish_start_ts=int(publish_start.timestamp()),
             publish_end_ts=int(publish_end.timestamp()),
             available_at_ts=int(cutoff.timestamp()),
-            max_age_hours=96,
-            limit=3,
+            creator_limit=5,
+            work_limit=3,
         )
     )
 
     assert context.status == "available"
     assert context.source_date == "2026-07-23"
+    assert context.ranking_market_date == "2026-07-23"
     assert context.works[0].published_at.date().isoformat() == "2026-07-23"
     assert creator_repository.list_calls == [
         {
-            "creator_sec_uid": "creator-1",
-            "start_ts": int(publish_start.timestamp()),
-            "end_ts": int(publish_end.timestamp()),
-            "available_at_ts": int(cutoff.timestamp()),
+            "creator_id": "creator-1",
+            "start_at": publish_start,
+            "end_at": publish_end + timedelta(seconds=1),
+            "available_at": cutoff,
             "limit": 3,
         }
     ]
 
 
+def test_creator_context_uses_only_previous_trade_day_top_five_by_rolling_score() -> None:
+    cutoff = datetime(2026, 7, 28, 8, 20, tzinfo=CN_TZ)
+    publish_start = datetime(2026, 7, 27, 0, 0, tzinfo=CN_TZ)
+    publish_end = datetime(2026, 7, 27, 23, 59, 59, tzinfo=CN_TZ)
+    scores = [
+        ("creator-6", 65.0),
+        ("creator-2", 92.0),
+        ("creator-4", 75.0),
+        ("creator-1", 98.0),
+        ("creator-no-score", None),
+        ("creator-5", 70.0),
+        ("creator-3", 86.0),
+    ]
+    verification_repository = FakeCreatorVerificationRepository(
+        [
+            build_creator_verification(
+                creator_id,
+                creator_name=f"博主{creator_id}",
+                rolling_score=score,
+                sample_count=5 if score is not None else 0,
+            )
+            for creator_id, score in scores
+        ]
+    )
+    works = [
+        build_creator_work(
+            cutoff,
+            age_hours=12,
+            work_id=f"work-{creator_id}",
+            creator_id=creator_id,
+            creator_name=f"博主{creator_id}",
+        )
+        for creator_id, _ in scores
+    ]
+    creator_repository = FakeCreatorWorkRepository(works=works)
+    service = MorningAnalysisService(
+        creator_work_repository=creator_repository,
+        creator_verification_repository=verification_repository,
+    )
+
+    context = asyncio.run(
+        service._load_creator_context(
+            source_date="2026-07-27",
+            ranking_market_date="2026-07-27",
+            publish_start_ts=int(publish_start.timestamp()),
+            publish_end_ts=int(publish_end.timestamp()),
+            available_at_ts=int(cutoff.timestamp()),
+            creator_limit=5,
+            work_limit=1,
+        )
+    )
+
+    expected_ids = [
+        "creator-1",
+        "creator-2",
+        "creator-3",
+        "creator-4",
+        "creator-5",
+    ]
+    assert context.status == "available"
+    assert context.selection_rule == "cumulative_accuracy_top5"
+    assert [item.creator_id for item in context.ranked_creators] == expected_ids
+    assert [item.rank for item in context.ranked_creators] == [1, 2, 3, 4, 5]
+    assert [item.creator_id for item in context.works] == expected_ids
+    assert all(item.creator_id != "creator-no-score" for item in context.works)
+    assert all(item.creator_id != "creator-6" for item in context.works)
+    assert verification_repository.calls == [
+        {"market_date": "2026-07-27", "status": "completed"}
+    ]
+
+
+def test_creator_context_does_not_query_works_without_verified_scores() -> None:
+    cutoff = datetime(2026, 7, 28, 8, 20, tzinfo=CN_TZ)
+    verification_repository = FakeCreatorVerificationRepository(
+        [
+            build_creator_verification(
+                "creator-no-score",
+                rolling_score=None,
+                sample_count=0,
+            )
+        ]
+    )
+    creator_repository = FakeCreatorWorkRepository(
+        error=AssertionError("没有有效评分时不应查询博主作品")
+    )
+    service = MorningAnalysisService(
+        creator_work_repository=creator_repository,
+        creator_verification_repository=verification_repository,
+    )
+
+    context = asyncio.run(
+        service._load_creator_context(
+            source_date="2026-07-27",
+            ranking_market_date="2026-07-27",
+            publish_start_ts=int(
+                datetime(2026, 7, 27, 0, 0, tzinfo=CN_TZ).timestamp()
+            ),
+            publish_end_ts=int(
+                datetime(2026, 7, 27, 23, 59, 59, tzinfo=CN_TZ).timestamp()
+            ),
+            available_at_ts=int(cutoff.timestamp()),
+            creator_limit=5,
+            work_limit=3,
+        )
+    )
+
+    assert context.status == "missing"
+    assert "没有可用的博主滚动评分" in context.reason
+    assert creator_repository.list_calls == []
+    assert creator_repository.latest_calls == []
+
+
+def test_creator_context_excludes_non_sector_opinions() -> None:
+    now = datetime(2026, 7, 23, 8, 20, tzinfo=CN_TZ)
+    work = build_creator_work(now)
+    assert work.analysis is not None
+    base_opinion = work.analysis.opinions[0]
+    stock_opinion = base_opinion.model_copy(
+        update={
+            "opinion_id": f"{work.work_key}:stock:1",
+            "target_type": "stock",
+            "target_name": "贵州茅台",
+        }
+    )
+    work = work.model_copy(
+        update={
+            "analysis": work.analysis.model_copy(
+                update={"opinions": [stock_opinion]}
+            )
+        }
+    )
+    service = MorningAnalysisService()
+    service.valid_sector_names = frozenset({"半导体"})
+
+    context = service._to_creator_work_context(work)
+
+    assert context.analysis.sector_opinions == []
+
+
+def test_creator_context_excludes_sector_outside_ths_industry_whitelist() -> None:
+    now = datetime(2026, 7, 23, 8, 20, tzinfo=CN_TZ)
+    work = build_creator_work(now)
+    assert work.analysis is not None
+    base_opinion = work.analysis.opinions[0]
+    unlisted_opinion = base_opinion.model_copy(
+        update={
+            "opinion_id": f"{work.work_key}:sector:1",
+            "target_name": "自定义概念板块",
+        }
+    )
+    work = work.model_copy(
+        update={
+            "analysis": work.analysis.model_copy(
+                update={"opinions": [unlisted_opinion]}
+            )
+        }
+    )
+    service = MorningAnalysisService()
+    service.valid_sector_names = frozenset({"半导体"})
+
+    context = service._to_creator_work_context(work)
+
+    assert context.analysis.sector_opinions == []
+
+
 def test_morning_analysis_service_does_not_consume_creator_data_when_disabled() -> None:
-    now = datetime(2026, 7, 23, 9, 0, tzinfo=CN_TZ)
+    now = datetime(2026, 7, 23, 8, 20, tzinfo=CN_TZ)
     analyzer = FakeAnalyzer()
     decision = MorningTradeDateDecision(
         reference_date="2026-07-23",
@@ -537,7 +803,6 @@ def test_morning_analysis_service_does_not_consume_creator_data_when_disabled() 
             error=AssertionError("关闭后不应查询抖音作品")
         ),
         creator_enabled=False,
-        creator_sec_uid="creator-1",
         morning_crawler=FakeMorningCrawler(),
         review_crawler=FakeReviewCrawler(),
         analyzer=analyzer,
@@ -549,14 +814,13 @@ def test_morning_analysis_service_does_not_consume_creator_data_when_disabled() 
     assert result.report is not None
     assert result.report.data_quality == "degraded"
     assert result.report.creator_context.status == "missing"
-    assert result.report.creator_context.reason == "抖音博主观点功能未启用"
+    assert result.report.creator_context.reason == "博主观点功能未启用"
 
 
 @pytest.mark.parametrize(
     ("scenario", "expected_status"),
     [
         ("missing", "missing"),
-        ("stale", "stale"),
         ("invalid", "invalid"),
         ("future_analysis", "invalid"),
         ("fetch_failed", "fetch_failed"),
@@ -566,12 +830,8 @@ def test_morning_analysis_service_degrades_unavailable_creator_context(
     scenario: str,
     expected_status: str,
 ) -> None:
-    now = datetime(2026, 7, 23, 9, 0, tzinfo=CN_TZ)
-    if scenario == "stale":
-        creator_repository = FakeCreatorWorkRepository(
-            latest=build_creator_work(now, age_hours=120)
-        )
-    elif scenario == "invalid":
+    now = datetime(2026, 7, 23, 8, 20, tzinfo=CN_TZ)
+    if scenario == "invalid":
         creator_repository = FakeCreatorWorkRepository(
             works=[
                 build_creator_work(
@@ -607,7 +867,9 @@ def test_morning_analysis_service_degrades_unavailable_creator_context(
             build_snapshot(now, status_counts={"finished": 10})
         ),
         creator_work_repository=creator_repository,
-        creator_sec_uid="creator-1",
+        creator_verification_repository=FakeCreatorVerificationRepository(
+            [build_creator_verification()]
+        ),
         morning_crawler=FakeMorningCrawler(),
         review_crawler=FakeReviewCrawler(),
         analyzer=analyzer,
@@ -621,10 +883,44 @@ def test_morning_analysis_service_degrades_unavailable_creator_context(
     assert result.report.creator_context.reason
     assert result.report.data_quality == "degraded"
     assert analyzer.inputs["creator_context"].status == expected_status
-    if expected_status == "stale":
-        assert result.report.creator_context.works
     if expected_status == "fetch_failed":
         assert result.report.creator_context.reason == "RuntimeError"
+
+
+def test_creator_context_does_not_fallback_to_older_work() -> None:
+    """来源日没有作品时只保留 Top 5 排名，不读取更早日期作品。"""
+
+    cutoff = datetime(2026, 7, 29, 8, 20, tzinfo=CN_TZ)
+    creator_repository = FakeCreatorWorkRepository(
+        latest=build_creator_work(cutoff, age_hours=120)
+    )
+    service = MorningAnalysisService(
+        creator_work_repository=creator_repository,
+        creator_verification_repository=FakeCreatorVerificationRepository(
+            [build_creator_verification()]
+        ),
+    )
+
+    context = asyncio.run(
+        service._load_creator_context(
+            source_date="2026-07-28",
+            ranking_market_date="2026-07-28",
+            publish_start_ts=int(
+                datetime(2026, 7, 28, 0, 0, tzinfo=CN_TZ).timestamp()
+            ),
+            publish_end_ts=int(
+                datetime(2026, 7, 28, 23, 59, 59, tzinfo=CN_TZ).timestamp()
+            ),
+            available_at_ts=int(cutoff.timestamp()),
+            creator_limit=5,
+            work_limit=3,
+        )
+    )
+
+    assert context.status == "missing"
+    assert context.works == []
+    assert context.ranked_creators
+    assert creator_repository.latest_calls == []
 
 
 def test_resolve_morning_trade_dates_uses_current_and_previous_session() -> None:

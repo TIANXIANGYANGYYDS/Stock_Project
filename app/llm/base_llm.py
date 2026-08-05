@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import time
+from functools import partial
 from typing import Any, TypeVar, cast
 
 import requests
@@ -23,8 +24,10 @@ DEFAULT_LLM_MODEL = "qwen-plus"
 DEFAULT_LLM_TEMPERATURE = 0.2
 # 深度思考是生产默认能力，不再依赖环境变量中的 JSON 字符串。
 DEFAULT_LLM_EXTRA_BODY: dict[str, Any] = {"enable_thinking": True}
-# 盘前和抖音分析共享的强推理模型名称。
+# 盘前和统一博主观点分析共享的强推理模型名称。
 QWEN_ANALYSIS_MODEL = "qwen3.7-max"
+# 供应商错误详情的最大字符数，避免异常与日志被超长响应占满。
+PROVIDER_ERROR_MAX_LENGTH = 500
 
 
 class LLMError(RuntimeError):
@@ -66,23 +69,34 @@ class BaseLLM:
 		default_temperature: float | None = None,
 		extra_body: dict[str, Any] | None = None,
 	) -> None:
-		"""加载集中默认配置、建立 HTTP 会话，并验证请求前置条件。"""
+		"""加载集中默认配置、建立 HTTP 会话，并验证请求前置条件。
+
+		显式参数优先于应用配置和模块默认值；供应商扩展参数会与默认深度思考开关
+		合并。构造完成后实例持有规范化请求地址和复用认证头的同步会话。
+		"""
 		settings = get_settings()
 
+		# 调用兼容 OpenAI 接口时使用的 Bearer 认证令牌。
 		self.api_key = (api_key or settings.llm_api_key or "").strip()
+		# 每次请求写入 payload 的模型名称。
 		self.model = (model or DEFAULT_LLM_MODEL).strip()
+		# 部署环境提供的兼容 OpenAI 服务根地址。
 		self.api_base_url = (api_base_url or settings.llm_api_base_url or "").strip()
+		# 单次 HTTP 请求的最大等待秒数，稍后统一转换为 float。
 		self.timeout = timeout if timeout is not None else settings.llm_timeout
+		# 调用方未覆盖时写入请求的默认采样温度。
 		self.default_temperature = (
 			default_temperature
 			if default_temperature is not None
 			else DEFAULT_LLM_TEMPERATURE
 		)
+		# 深度思考开关等供应商扩展请求字段，显式值覆盖代码默认值。
 		self.extra_body = self._merge_extra_body(
 			init_extra_body=extra_body,
 		)
 
 		self._validate_config()
+		# 由服务根地址规范化得到的最终 Chat Completions 请求 URL。
 		self.chat_completions_url = self._build_chat_completions_url(self.api_base_url)
 
 		# 复用 TCP 连接并统一携带认证头，供所有同步和异步包装请求使用。
@@ -110,6 +124,7 @@ class BaseLLM:
 		temperature: float | None = None,
 		max_tokens: int | None = None,
 		response_format: dict[str, Any] | None = None,
+		allow_plain_reasoning: bool = False,
 		max_retries: int = 2,
 	) -> str:
 		"""发送一次同步 Chat Completions 请求，并返回 assistant 正文。"""
@@ -120,25 +135,12 @@ class BaseLLM:
 		if max_retries <= 0:
 			raise ValueError("max_retries 必须大于 0")
 
-		messages: list[dict[str, str]] = []
-		if system_prompt and system_prompt.strip():
-			messages.append(
-				{
-					"role": "system",
-					"content": system_prompt.strip(),
-				}
-			)
-
-		messages.append(
-			{
-				"role": "user",
-				"content": user_prompt,
-			}
-		)
-
 		payload: dict[str, Any] = {
 			"model": self.model,
-			"messages": messages,
+			"messages": self._build_messages(
+				user_prompt=user_prompt,
+				system_prompt=system_prompt,
+			),
 			"temperature": self.default_temperature if temperature is None else temperature,
 		}
 
@@ -152,7 +154,10 @@ class BaseLLM:
 			payload.update(self.extra_body)
 
 		response_data = self._post_chat_completion(payload, max_retries=max_retries)
-		return self._extract_message_content(response_data)
+		return self._extract_message_content(
+			response_data,
+			allow_plain_reasoning=allow_plain_reasoning,
+		)
 
 	def analyze_json(
 		self,
@@ -201,7 +206,82 @@ class BaseLLM:
 		try:
 			return cast(SchemaT, TypeAdapter(response_schema).validate_python(data))
 		except Exception as exc:
-			raise LLMResponseError(f"LLM 结果结构校验失败: {data}") from exc
+			# 保留字段级校验原因，便于上层把明确的修正要求反馈给结构纠错重试。
+			raise LLMResponseError(f"LLM 结果结构校验失败: {exc}") from exc
+
+	def call_function(
+		self,
+		*,
+		user_prompt: str,
+		function_name: str,
+		response_schema: Any,
+		system_prompt: str | None = None,
+		function_description: str = "提交经过分析的结构化结果",
+		temperature: float | None = None,
+		max_tokens: int | None = None,
+		max_retries: int = 2,
+		strict: bool = True,
+	) -> SchemaT:
+		"""强制调用一个 function，并按 Pydantic schema 校验其 arguments。
+
+		Qwen thinking 模式不支持强制 ``tool_choice``，因此结构化提交固定关闭
+		thinking。研究阶段仍可使用 :meth:`chat` 保留深度思考能力。
+		"""
+		user_prompt = user_prompt.strip()
+		if not user_prompt:
+			raise ValueError("user_prompt 不能为空")
+		if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", function_name):
+			raise ValueError(f"function_name 非法: {function_name}")
+		if max_retries <= 0:
+			raise ValueError("max_retries 必须大于 0")
+
+		parameters = TypeAdapter(response_schema).json_schema()
+		if parameters.get("type") != "object":
+			raise ValueError("function response_schema 顶层必须是 object")
+
+		payload: dict[str, Any] = {
+			"model": self.model,
+			"messages": self._build_messages(
+				user_prompt=user_prompt,
+				system_prompt=system_prompt,
+			),
+			"temperature": self.default_temperature if temperature is None else temperature,
+			"tools": [
+				{
+					"type": "function",
+					"function": {
+						"name": function_name,
+						"description": function_description,
+						"parameters": parameters,
+						"strict": strict,
+					},
+				}
+			],
+			"tool_choice": {
+				"type": "function",
+				"function": {"name": function_name},
+			},
+		}
+		if max_tokens is not None:
+			payload["max_tokens"] = max_tokens
+		if self.extra_body:
+			payload.update(self.extra_body)
+		# DashScope 会拒绝 thinking 模式下的 required/object tool_choice。
+		payload.pop("thinking", None)
+		payload["enable_thinking"] = False
+
+		response_data = self._post_chat_completion(payload, max_retries=max_retries)
+		arguments = self._extract_tool_arguments(
+			response_data,
+			function_name=function_name,
+		)
+		try:
+			data = json.loads(arguments)
+		except json.JSONDecodeError as exc:
+			raise LLMResponseError(
+				f"function {function_name} arguments 不是合法 JSON"
+			) from exc
+		return self.validate_llm_schema(data, response_schema)
 
 	async def async_chat(
 		self,
@@ -211,6 +291,7 @@ class BaseLLM:
 		temperature: float | None = None,
 		max_tokens: int | None = None,
 		response_format: dict[str, Any] | None = None,
+		allow_plain_reasoning: bool = False,
 		max_retries: int = 2,
 	) -> str:
 		"""
@@ -222,14 +303,50 @@ class BaseLLM:
 		因此不会阻塞当前 asyncio 事件循环。
 		"""
 
-		return await asyncio.to_thread(
-			self.chat,
+		loop = asyncio.get_running_loop()
+		return await loop.run_in_executor(
+			None,
+			partial(
+				self.chat,
 			user_prompt=user_prompt,
 			system_prompt=system_prompt,
 			temperature=temperature,
 			max_tokens=max_tokens,
 			response_format=response_format,
+			allow_plain_reasoning=allow_plain_reasoning,
 			max_retries=max_retries,
+			),
+		)
+
+	async def async_call_function(
+		self,
+		*,
+		user_prompt: str,
+		function_name: str,
+		response_schema: Any,
+		system_prompt: str | None = None,
+		function_description: str = "提交经过分析的结构化结果",
+		temperature: float | None = None,
+		max_tokens: int | None = None,
+		max_retries: int = 2,
+		strict: bool = True,
+	) -> SchemaT:
+		"""在线程池中执行 :meth:`call_function`，兼容 Python 3.8。"""
+		loop = asyncio.get_running_loop()
+		return await loop.run_in_executor(
+			None,
+			partial(
+				self.call_function,
+				user_prompt=user_prompt,
+				function_name=function_name,
+				response_schema=response_schema,
+				system_prompt=system_prompt,
+				function_description=function_description,
+				temperature=temperature,
+				max_tokens=max_tokens,
+				max_retries=max_retries,
+				strict=strict,
+			),
 		)
 
 	@classmethod
@@ -264,7 +381,8 @@ class BaseLLM:
 		try:
 			return cast(SchemaT, TypeAdapter(response_schema).validate_python(data))
 		except Exception as exc:
-			raise LLMResponseError(f"LLM 结果结构校验失败: {data}") from exc
+			# 向结构纠错重试暴露字段路径和失败规则，不回传整份可能很长的结果。
+			raise LLMResponseError(f"LLM 结果结构校验失败: {exc}") from exc
 
 
 	@staticmethod
@@ -307,7 +425,7 @@ class BaseLLM:
 				continue
 			if isinstance(value, (dict, list)):
 				last_container = cleaned[start : start + end]
-				# Skip nested containers; only compare standalone top-level candidates.
+				# 跳过嵌套容器，只比较彼此独立的顶层 JSON 候选片段。
 				start += end
 				continue
 			start += 1
@@ -335,6 +453,64 @@ class BaseLLM:
 
 		return json.dumps(parsed, ensure_ascii=False)
 
+	@staticmethod
+	def _build_messages(
+		*,
+		user_prompt: str,
+		system_prompt: str | None,
+	) -> list[dict[str, str]]:
+		"""构造兼容 Chat Completions 的 system/user 消息。"""
+		messages: list[dict[str, str]] = []
+		if system_prompt and system_prompt.strip():
+			messages.append(
+				{"role": "system", "content": system_prompt.strip()}
+			)
+		messages.append({"role": "user", "content": user_prompt})
+		return messages
+
+	@staticmethod
+	def _extract_tool_arguments(
+		data: dict[str, Any],
+		*,
+		function_name: str,
+	) -> str:
+		"""从强制 function-call 响应中取出指定函数的 JSON arguments。"""
+		choices = data.get("choices") or []
+		if not choices or not isinstance(choices[0], dict):
+			raise LLMResponseError("LLM function 响应缺少有效 choices")
+		choice = choices[0]
+		message = choice.get("message") or {}
+		if not isinstance(message, dict):
+			raise LLMResponseError("LLM function 响应 message 不是 object")
+		if choice.get("finish_reason") == "length":
+			raise LLMResponseError(
+				"LLM function arguments 被截断，finish_reason=length"
+			)
+
+		tool_calls = message.get("tool_calls") or []
+		if not isinstance(tool_calls, list):
+			raise LLMResponseError("LLM function 响应 tool_calls 不是数组")
+		matching_calls: list[dict[str, Any]] = []
+		for tool_call in tool_calls:
+			if not isinstance(tool_call, dict):
+				continue
+			function = tool_call.get("function") or {}
+			if isinstance(function, dict) and function.get("name") == function_name:
+				matching_calls.append(function)
+		if len(matching_calls) != 1:
+			raise LLMResponseError(
+				f"LLM function 响应未唯一调用 {function_name}"
+			)
+
+		arguments = matching_calls[0].get("arguments")
+		if isinstance(arguments, dict):
+			return json.dumps(arguments, ensure_ascii=False)
+		if isinstance(arguments, str) and arguments.strip():
+			return arguments.strip()
+		raise LLMResponseError(
+			f"LLM function {function_name} 缺少 arguments"
+		)
+
 	def _post_chat_completion(self, payload: dict[str, Any], max_retries: int) -> dict[str, Any]:
 		"""按指数退避重试 HTTP 调用，并返回供应商的顶层 JSON object。"""
 		last_error: Exception | None = None
@@ -346,6 +522,12 @@ class BaseLLM:
 					json=payload,
 					timeout=self.timeout,
 				)
+				if not 200 <= response.status_code < 300:
+					provider_error = self._extract_provider_error(response)
+					error_suffix = f": {provider_error}" if provider_error else ""
+					raise LLMRequestError(
+						f"LLM 接口返回 HTTP {response.status_code}{error_suffix}"
+					)
 				response.raise_for_status()
 				data = response.json()
 
@@ -353,27 +535,82 @@ class BaseLLM:
 					raise LLMResponseError(f"LLM 返回不是 JSON object: {data}")
 
 				if data.get("error"):
-					raise LLMRequestError(f"LLM 接口返回 error: {data['error']}")
+					provider_error = self._format_provider_error(data)
+					error_suffix = f": {provider_error}" if provider_error else ""
+					raise LLMRequestError(f"LLM 接口返回 error{error_suffix}")
 
 				return data
 			except (requests.RequestException, ValueError, LLMRequestError, LLMResponseError) as exc:
 				last_error = exc
 				logger.warning(
 					"llm request failed model=%s url=%s attempt=%s/%s error=%s",
-					self.model,
-					self.chat_completions_url,
+					self._sanitize_error_text(self.model),
+					self._sanitize_error_text(self.chat_completions_url),
 					attempt,
 					max_retries,
-					exc,
+					self._sanitize_error_text(str(exc)),
 				)
 
 				if attempt < max_retries:
 					time.sleep(min(2 ** (attempt - 1), 8))
 
-		raise LLMRequestError(f"LLM 请求失败 model={self.model}") from last_error
+		error_suffix = ""
+		if isinstance(last_error, LLMRequestError):
+			error_suffix = f"；{self._sanitize_error_text(str(last_error))}"
+		raise LLMRequestError(
+			f"LLM 请求失败 model={self._sanitize_error_text(self.model)}{error_suffix}"
+		) from last_error
+
+	def _extract_provider_error(self, response: requests.Response) -> str | None:
+		"""从非成功 HTTP 响应的 JSON 中提取经过脱敏和限长的供应商错误。"""
+		try:
+			data = response.json()
+		except ValueError:
+			return None
+
+		return self._format_provider_error(data)
+
+	def _format_provider_error(self, data: Any) -> str | None:
+		"""仅保留 error.code、error.type 和 error.message，忽略其他响应字段。"""
+		if not isinstance(data, dict):
+			return None
+
+		error = data.get("error")
+		if not isinstance(error, dict):
+			return None
+
+		parts: list[str] = []
+		for field_name in ("code", "type", "message"):
+			value = error.get(field_name)
+			if isinstance(value, (str, int, float, bool)):
+				parts.append(f"{field_name}={value}")
+
+		if not parts:
+			return None
+
+		return self._sanitize_error_text(", ".join(parts))
+
+	def _sanitize_error_text(self, value: str) -> str:
+		"""移除认证令牌、压平空白并限制错误文本长度，供异常和日志安全复用。"""
+		text = re.sub(r"\s+", " ", value).strip()
+		if self.api_key:
+			text = text.replace(self.api_key, "[已脱敏]")
+		text = re.sub(
+			r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+",
+			"Bearer [已脱敏]",
+			text,
+		)
+		text = re.sub(r"\bsk-[A-Za-z0-9_-]{6,}\b", "[已脱敏]", text)
+		if len(text) > PROVIDER_ERROR_MAX_LENGTH:
+			return text[: PROVIDER_ERROR_MAX_LENGTH - 1] + "…"
+		return text
 
 	@staticmethod
-	def _extract_message_content(data: dict[str, Any]) -> str:
+	def _extract_message_content(
+		data: dict[str, Any],
+		*,
+		allow_plain_reasoning: bool = False,
+	) -> str:
 		"""从响应 choices 中提取正文，必要时从 reasoning_content 兜底取 JSON。"""
 		choices = data.get("choices") or []
 		if not choices:
@@ -420,6 +657,8 @@ class BaseLLM:
 			fallback_json = BaseLLM._extract_json_from_reasoning_content(reasoning_content)
 			if fallback_json:
 				return fallback_json
+			if allow_plain_reasoning:
+				return reasoning_content.strip()
 
 			raise LLMResponseError(
 				"LLM 只返回 reasoning_content，message.content 为空，"
@@ -490,13 +729,14 @@ class BaseLLM:
 
 
 class QwenAnalysisLLM(BaseLLM):
-	"""盘前与抖音分析共同使用的 qwen3.7-max 请求配置。"""
+    """盘前与统一博主观点分析共同使用的 qwen3.7-max 请求配置。"""
 
-	# 固定模型不从环境读取，防止两个关键分析任务在部署时发生配置漂移。
-	MODEL = QWEN_ANALYSIS_MODEL
+    # 固定模型不从环境读取，防止两个关键分析任务在部署时发生配置漂移。
+    MODEL = QWEN_ANALYSIS_MODEL
 
-	def __init__(self, **llm_kwargs: Any) -> None:
-		"""默认注入 qwen3.7-max；显式参数仅用于测试或受控诊断。"""
-		if not llm_kwargs.get("model"):
-			llm_kwargs["model"] = self.MODEL
-		super().__init__(**llm_kwargs)
+    def __init__(self, **llm_kwargs: Any) -> None:
+        """默认注入 qwen3.7-max；显式参数仅用于测试或受控诊断。"""
+
+        if not llm_kwargs.get("model"):
+            llm_kwargs["model"] = self.MODEL
+        super().__init__(**llm_kwargs)

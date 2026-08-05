@@ -20,7 +20,7 @@
 | 3  | 每日 K 线分析       | 日终批处理     | 每天 15:30   | 分析趋势、涨跌结构、技术指标 |
 | 4  | 每日 / 实时筹码分析    | 可日终 / 可实时 | 取决于数据源能力   | 判断筹码集中度、主力变化   |
 | 5  | 日内实时行情分析       | 高频交易时段流   | 交易时段每 30 秒 | 实时监控异动、量价、板块联动 |
-| 6  | 同花顺早报 / 晚间复盘分析 | 每日资讯批处理   | 交易日 9:00  | 判断当日板块主线、市场情绪  |
+| 6  | 同花顺早报 / 晚间复盘分析 | 每日资讯批处理   | 交易日 8:20  | 判断当日板块主线、市场情绪  |
 
 ---
 
@@ -724,7 +724,7 @@ MA5 / MA10 / MA20 / MA60
 
 ```text
 新闻榜单：默认每 5 分钟独立刷新一次
-盘前分析：每个交易日 9:00
+盘前分析：每个交易日 8:20
 ```
 
 ### 流程
@@ -738,11 +738,11 @@ MA5 / MA10 / MA20 / MA60
   ↓
 生成同一截止时点的 news_ranking_snapshots 快照
 
-9:00 盘前任务
+8:20 盘前任务
   ↓
 获取同花顺早报和前一交易日复盘
   ↓
-读取当天 `window_end_ts <= 9:00` 的最新 completed 榜单快照并检查新鲜度
+读取当天 `window_end_ts <= 8:20` 的最新 completed 榜单快照并检查新鲜度
   ↓
 LLM 结合早报、复盘和新闻榜单生成 5 条结构化主线
   ↓
@@ -760,20 +760,22 @@ python -m app.scheduler.morning_analysis_jobs
 需要重跑历史交易日时，必须先按盘前截止时间重建该日榜单快照，避免使用收盘后的新闻：
 
 ```bash
-python -m app.scheduler.news_ranking_jobs --datetime "2026-07-23 08:58"
+python -m app.scheduler.news_ranking_jobs --datetime "2026-07-23 08:18"
 python -m app.scheduler.morning_analysis_jobs --date 2026-07-23
 ```
 
 这些规则不会随部署环境变化，因此不再放入 `.env`：新闻榜单每 5 分钟刷新、
-回看 72 小时并保留前 12 名；盘前分析固定在北京时间 09:00 执行，榜单超过
-15 分钟标记陈旧；抖音作品固定读取目标博主，并在盘前报告中只采用前一自然日
-发布且 09:00 前已完成分析的最多 3 个作品。常量放在对应的 crawler、service、
+回看 72 小时并保留前 12 名；盘前分析固定在北京时间 08:20 执行，榜单超过
+15 分钟标记陈旧；博主作品从 `creator_works` 读取目标逻辑博主，并在盘前报告中只采用
+前一自然日发布且 08:20 前已完成分析的最多 3 个作品。常量放在对应的 crawler、service、
 scheduler 或 worker 模块中，并带有单位和用途注释。
 
-盘前分析和抖音观点分析固定使用代码中的 `QwenAnalysisLLM` 配置：模型为
-`qwen3.7-max`，并默认携带 `enable_thinking=true`。环境文件只提供
-`LLM_API_KEY`、`LLM_API_BASE_URL` 和 `LLM_TIMEOUT`，不再允许两个任务通过环境变量
-分别覆盖模型或关闭深度思考。
+盘前分析、博主单作品内容分析和收盘观点验证均使用代码中的 `QwenAnalysisLLM` 基础
+配置：模型为 `qwen3.7-max`，并默认携带 `enable_thinking=true`。博主流程中的
+`CreatorContentAnalysisLLMAnalyzer` 与 `CreatorOpinionVerificationLLMAnalyzer` 是
+两个相互独立的 LLM 分析器，分别负责“提取观点”和“验证观点”，各自使用独立提示词、
+输入契约和结果状态。环境文件只提供 `LLM_API_KEY`、`LLM_API_BASE_URL` 和
+`LLM_TIMEOUT`，不再允许上述任务通过环境变量分别覆盖模型或关闭深度思考。
 
 `MorningAnalysisService` 不会在缺少快照时临时重算榜单。当天快照不存在会明确失败；
 快照超过允许年龄时仍可生成报告，但 `data_quality` 会标记为 `degraded`。
@@ -802,7 +804,7 @@ scheduler 或 worker 模块中，并带有单位和用途注释。
 
 该集合以 `snapshot_id` 作为唯一键。每个交易日只保留两类必要快照：全天最新快照，以及
 配置的盘前截止时点之前最后一份快照；两者相同时只保留一份。这样下午继续刷新排行榜时，
-仍可用固定的 9:00 截止快照补跑盘前任务。盘前实际使用的榜单和版本元数据会复制进
+仍可用固定的 8:20 截止快照补跑盘前任务。盘前实际使用的榜单和版本元数据会复制进
 `daily_market_analysis`，作为不可随后续刷新改变的审计副本。该保留策略面向固定盘前时点，
 不提供任意历史时刻的完整快照回放。
 
@@ -933,7 +935,7 @@ Asia/Shanghai
 | 筹码日终       | 15:40 / 16:00              | 每个交易日一次      |
 | 实时行情       | 9:30 - 11:30，13:00 - 15:00 | 每 30 秒       |
 | 实时筹码       | 如果支持实时                     | 每 30 秒或只对异动池 |
-| 同花顺早报 / 复盘 | 9:00                       | 每个交易日一次      |
+| 同花顺早报 / 复盘 | 8:20                       | 每个交易日一次      |
 | 清理任务       | 23:30                      | 每日一次         |
 | 日 K 失败补偿   | 主批次失败后立即执行 / 次日 15:30 | 限次自动补偿      |
 
@@ -1346,38 +1348,88 @@ LLM 分析
 
 ---
 
-# 十二、抖音博主盘前观点输入
+# 十二、跨平台博主观点监控与评分
 
-`全能的野人` 使用独立链路，不写入 `news_data`，也不参与投资倾向榜和新闻热度榜：
+20 个账号统一注册在 `app/crawlers/creator_platforms/accounts.py`，抖音、B站、微博、
+微信公众号和新浪博客的适配器全部位于 `app/crawlers/creator_platforms/`。作品内容分析与
+收盘观点验证使用两个解耦的 LLM 模块，盘前报告从唯一博主汇总表读取累计准确率排名。
+
+平台抓取统一使用无浏览器的协议会话和连接池；默认手工探针为单并发、单条列表检查，
+不会读取详情、分页或媒体。需要深入核验时显式加 `--detail`、`--check-pagination` 或
+`--check-media-download`。微博首次遇到 432 时会从公开访客页读取当次动态参数，在同一
+内存会话中初始化匿名 Cookie 后只重试一次；Cookie 不落盘、不写日志。时间线会排除置顶
+历史卡片并按真实发布时间倒序。抖音当前匿名主页会截断近期作品，按月列表即使返回
+`HTTP 200` 也可能只有 `status_code` 而没有作品数组，因此近期作品发现必须从私有环境
+文件注入有效的 `DOUYIN_SESSION_COOKIE`。列表请求仍使用纯 Python `a_bogus`，缺失登录
+字段、出现“登录后查看更多”、空体或缺少作品列表都会被标记为阻断，不会误写成“没有新
+作品”。授权会话不写代码、不进日志，定时业务链路也不启动浏览器；已知作品详情仍通过
+公开分享页协议读取并校验作者 `sec_uid`。调度器启动时及每天 09:05 会从 `sid_guard`
+脱敏计算会话到期时间；剩余 7 天内记录 `WARNING`，已经过期记录 `ERROR`，日志只包含
+到期时间和剩余时长，不包含 Cookie 值。
 
 ```text
-Scheduler 每 15 分钟发现公开视频
-  → douyin_creator_works
-  → douyin_analysis worker 下载视频
-  → RapidOCR 字幕 + faster-whisper ASR
-  → 专用 LLM 提取结构化行业观点
-  → 09:00 盘前分析以 critical priority 读取前一自然日发布、且 09:00 前完成的结果
+Scheduler 每小时整点按账号顺序串行采集抖音/B站/微博/公众号/新浪博客
+  → creator_works（平台:作品ID 幂等去重、正文/OCR/ASR、处理状态）
+  → creator_content_extraction worker
+      视频：视频容器执行 RapidOCR + faster-whisper；音频流只执行 ASR
+           媒体不可用但平台正文存在时直接使用正文，不耗尽为提取失败
+      图文：逐图 OCR，并与作品正文合并
+      文字：直接进入内容分析
+  → creator_opinion_analysis worker
+  → `CreatorContentAnalysisLLMAnalyzer`
+      输入：标题、平台正文、提取正文、ASR 和 OCR 文本
+      输出：仅包含 A 股观点的 `CreatorWorkAnalysis`，附带有效期、指标和逐字 `source_quote`
+  → LLM 1 成功后将 A 股观点和 verification_date 写回 creator_works，
+    并幂等加入 creator_opinion_analyses.pending_opinions
+  → 交易日 15:40 主验证，16:30 幂等补偿重跑
+      → 在内存中构建当天复盘、新闻榜单、目标板块和条件行情事实
+      → 按交易日历计算上一交易来源窗口
+          普通交易日：前一自然日
+          周一/节后首个交易日：上一交易日至评价日前的全部休市日
+      → 只读取评价日 08:20 前已完成 LLM 1、且在收盘时仍有效的观点
+      → `CreatorOpinionVerificationService` 验证这批已冻结观点
+          输入：结构化观点 + 当天直接行情事实
+          → `CreatorOpinionVerificationLLMAnalyzer`
+          → 默认启用联网搜索，返回结论、理由、URL、标题、时间和原文摘录
+      → 程序计算累计准确性评分
+      → 原子地把到期观点从 pending_opinions 移入 verified_opinions
+  → 下一交易日 08:20 按 creator_opinion_analyses.accuracy_score 选择 Top 5 博主
+      → 只读取这些博主在前一自然日发布且 08:20 前完成 LLM 1 的作品
+      → 盘前 LLM 对观点重新结合复盘、早报和新闻核验
+      → 当前证据印证的观点作为高权重输入；直接反证仍优先于历史高分
 ```
 
-启动方式：
+内容提取、单作品观点分析和收盘验证可以分别重试、补跑和审计。验证 LLM 不会根据
+原始视频、图片或文章自行补造观点；它只接收 LLM 1 已提取观点，结合直接行情事实和
+联网资料完成核验，最终分数由程序计算。
+
+启动与只读检查：
 
 ```bash
-./.local/bin/start_scheduler.sh
-./.local/bin/workers.sh start douyin_analysis
-./.local/bin/workers.sh status all
+./.local/bin/restart_scheduler.sh
+./.local/bin/workers.sh start creator_extraction
+./.local/bin/workers.sh start creator_analysis
+/home/txy/miniconda3/envs/MyAgent/bin/python \
+  -m app.manually_execute_script.probe_creator_platforms
 ```
 
-抓取失败、转写失败、分析失败分别保留状态；盘前任务在来源暂不可用时标记
-`degraded`，但不会因此阻断同花顺早报、复盘和新闻榜单分析。处理中任务使用
-30 分钟租约和 attempt fencing，worker 异常退出后可安全重领，旧进程的迟到结果
-不会覆盖新结果。盘前日报只复制结构化摘要和行业观点，OCR/ASR 原文仅保留在
-`douyin_creator_works`。
+该探针默认串行检查每个平台排名最高的一个账号，单账号仅取 1 条列表数据；传入
+`--detail` 时，列表受阻的抖音账号会额外校验配置中的种子作品详情，但不会把该校验
+当作新作品发现成功。探针会记录列表、详情和总耗时；需要人工抽查正文时可传
+`--content-preview-chars 240`，预览上限为 1000 字。完整 20 个账号检查必须显式传入
+`--all-accounts --concurrency 1`。
 
-MongoDB 的 BSON Date 保留 UTC 绝对时刻，供排序、租约、重试和 09:00 截止判断
-使用；同一文档同时保存 `published_at_cn`、`first_seen_at_cn`、`fetched_at_cn`、
-`transcript.transcribed_at_cn`、`analysis.analyzed_at_cn` 等 `+08:00` 字符串，供人工
-直接查看北京时间。`*_cn` 字段只用于展示，不参与查询或索引。
+也可以使用 `./.local/bin/workers.sh start all` 同时启动全部 worker。旧的
+`douyin_analysis` worker 和独立抖音写入链路已经移除。历史作品和内容处理状态均按
+`work_key` 存在于 `creator_works`；不存在独立的内部处理表。
 
-抖音观点按盘前日期的前一自然日筛选：例如 7 月 24 日盘前只读取 7 月 23 日发布的
-作品。`publish_ts` 决定来源日，`first_seen_at` 和 `analysis.analyzed_at` 则必须不晚于
-7 月 24 日 09:00；两类时间分开判断，既允许凌晨完成处理，也避免历史补录数据穿越。
+评分范围为 `0..100`。完全符合、部分符合、轻微偏差、明确相反先映射为
+`1 / 0.5 / -0.5 / -1`，再把均值线性转换为 0 到 100；`unverified` 和
+`not_triggered` 不进入分母。排行榜使用最近 7 个自然日内已经明确结算的有效观点；
+未结算观点单独展示，不补零。评分同时展示有效样本数，没有样本时分数为 `null`。
+
+MongoDB 只保留两张博主业务集合：`creator_works` 和
+`creator_opinion_analyses`。前者保存博主名称、平台、北京时间发布时间、北京时间入库
+时间、原文/OCR/ASR、A 股观点和处理状态；后者每位博主一条，保存
+`verified_opinions`、`accuracy_score` 和 `pending_opinions`。提取与分析使用 30 分钟租约
+和 attempt fencing；收盘任务通过 Mongo 原子更新完成 pending 到 verified 的迁移。

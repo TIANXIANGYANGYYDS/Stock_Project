@@ -25,6 +25,9 @@ def test_register_morning_analysis_job_uses_shanghai_time() -> None:
     assert options["max_instances"] == 1
     assert options["coalesce"] is True
     assert str(options["trigger"].timezone) == "Asia/Shanghai"
+    assert str(options["trigger"]) == (
+        "cron[day_of_week='mon-fri', hour='8', minute='20']"
+    )
 
 
 def test_run_morning_analysis_passes_snapshot_age_limit(monkeypatch) -> None:
@@ -39,14 +42,14 @@ def test_run_morning_analysis_passes_snapshot_age_limit(monkeypatch) -> None:
     fake_module.MorningAnalysisService = FakeMorningAnalysisService
     fake_module.MORNING_ANALYSIS_RANKING_LIMIT = 12
     fake_module.MORNING_ANALYSIS_MAX_RANKING_AGE_MINUTES = 15
-    fake_module.MORNING_ANALYSIS_MAX_CREATOR_AGE_HOURS = 96
-    fake_module.MORNING_ANALYSIS_CREATOR_LIMIT = 3
+    fake_module.MORNING_ANALYSIS_CREATOR_LIMIT = 5
+    fake_module.MORNING_ANALYSIS_CREATOR_WORK_LIMIT = 3
     monkeypatch.setitem(
         sys.modules,
         "app.services.morning_analysis_service",
         fake_module,
     )
-    reference_datetime = datetime(2026, 7, 23, 9, 0)
+    reference_datetime = datetime(2026, 7, 23, 8, 20)
 
     result = asyncio.run(
         morning_analysis_jobs._run_morning_analysis(
@@ -56,11 +59,12 @@ def test_run_morning_analysis_passes_snapshot_age_limit(monkeypatch) -> None:
 
     assert result == "report"
     assert calls == [
-        {
-            "reference_datetime": reference_datetime,
-            "ranking_limit": 12,
+            {
+                "reference_datetime": reference_datetime,
+                "persist": True,
+                "ranking_limit": 12,
             "max_snapshot_age_minutes": 15,
-            "max_creator_age_hours": 96,
-            "creator_limit": 3,
+            "creator_limit": 5,
+            "creator_work_limit": 3,
         }
     ]

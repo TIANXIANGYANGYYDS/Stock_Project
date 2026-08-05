@@ -1,7 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -38,6 +38,12 @@ class Settings(BaseSettings):
 
     # 代理池服务地址；留空时不使用外部代理池。
     proxy_51_api_url: str = Field(default="", alias="PROXY_51_API_URL")
+
+    # 抖音近期作品列表所需的合规授权会话；详情页仍可使用公开协议读取。
+    douyin_session_cookie: SecretStr = Field(
+        default=SecretStr(""),
+        alias="DOUYIN_SESSION_COOKIE",
+    )
 
     # 应用日志级别，例如 INFO、WARNING 或 DEBUG。
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")

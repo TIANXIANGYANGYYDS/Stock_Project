@@ -125,8 +125,8 @@ class NewsRankingSnapshotRepository(BaseMongoRepository):
         """
         查询业务日内符合可选截止上限的最新完成快照。
 
-        `window_end_ts_lte` 为空时返回全天最新快照；盘前调用传入 09:00 时间戳时，
-        只返回新闻窗口截止不晚于 09:00 的最新记录。MongoDB 返回无时区
+        `window_end_ts_lte` 为空时返回全天最新快照；盘前调用传入 08:20 时间戳时，
+        只返回新闻窗口截止不晚于 08:20 的最新记录。MongoDB 返回无时区
         `generated_at` 时先按 UTC 恢复，再由模型统一转换为中国时区。
         """
         filters: dict[str, object] = {

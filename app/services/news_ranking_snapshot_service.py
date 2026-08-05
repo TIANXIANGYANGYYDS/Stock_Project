@@ -70,17 +70,17 @@ class NewsRankingSnapshotService:
         调用方同时提供盘前小时和分钟，会尝试清理同一业务日的冗余快照；清理失败
         仅记录日志，不影响已生成快照返回。
 
-        Args:
+        参数：
             reference_datetime: 快照观察时点；为空时使用当前北京时间。
             window_hours: 向前滚动统计的小时数。
             ranking_limit: 每套行业榜单最多保留的记录数。
             morning_cutoff_hour: 当日盘前分析截止小时，必须与分钟同时提供。
             morning_cutoff_minute: 当日盘前分析截止分钟，必须与小时同时提供。
 
-        Returns:
+        返回值：
             已写入快照仓储的完整 ``NewsRankingSnapshot``。
 
-        Raises:
+        异常：
             ValueError: 窗口、榜单数量或盘前时间参数不合法时抛出。
         """
 

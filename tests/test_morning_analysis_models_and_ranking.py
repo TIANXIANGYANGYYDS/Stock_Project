@@ -10,6 +10,10 @@ from pydantic import ValidationError
 from app.models.daily_market_analysis import (
     CreatorContext,
     CreatorOpinionAssessment,
+    CreatorRankingContext,
+    CreatorSectorOpinionContext,
+    CreatorWorkAnalysisContext,
+    CreatorWorkContext,
     DailyMarketAnalysis,
     MarketReview,
     MorningAnalysisResult,
@@ -17,13 +21,6 @@ from app.models.daily_market_analysis import (
     MorningReport,
     MorningReportSections,
     NewsWindowStats,
-)
-from app.models.douyin_creator_work import (
-    DouyinCreatorWork,
-    DouyinSectorOpinion,
-    DouyinTranscript,
-    DouyinWorkAnalysis,
-    DouyinWorkStatus,
 )
 from app.repositories.daily_market_analysis_repository import (
     DailyMarketAnalysisRepository,
@@ -38,38 +35,25 @@ def build_finished_creator_work(
     *,
     work_id: str = "douyin-work-1",
     opinion_id: str = "douyin-work-1:半导体",
-) -> DouyinCreatorWork:
+) -> CreatorWorkContext:
     published_at = datetime(2026, 7, 23, 7, 30, tzinfo=CN_TZ)
-    return DouyinCreatorWork(
+    return CreatorWorkContext(
         work_id=work_id,
-        creator_sec_uid="creator-1",
+        creator_id="creator-1",
         creator_name="测试博主",
-        creator_short_id="creator-short-id",
-        description="盘前关注半导体。",
         published_at=published_at,
         publish_ts=int(published_at.timestamp()),
-        canonical_url=f"https://www.douyin.com/video/{work_id}",
-        duration_ms=60_000,
-        first_seen_at=published_at,
-        fetched_at=published_at,
-        status=DouyinWorkStatus(status="finished"),
-        transcript=DouyinTranscript(
-            text="原始转写文本。",
-            provider="test-asr",
-            model="test-model",
-            transcribed_at=published_at,
-        ),
-        analysis=DouyinWorkAnalysis(
+        analysis=CreatorWorkAnalysisContext(
             summary="博主认为半导体存在催化。",
             sector_opinions=[
-                DouyinSectorOpinion(
+                CreatorSectorOpinionContext(
                     opinion_id=opinion_id,
                     sector_name="半导体",
                     stance_score=70,
                     reason="产业政策可能带来增量预期。",
                 )
             ],
-            analysis_version="douyin_creator_analysis_v1",
+            analysis_version="creator_opinion_v1",
             analysis_model="test-model",
             analyzed_at=published_at,
         ),
@@ -190,7 +174,7 @@ def test_morning_analysis_result_requires_ordered_unique_mainlines() -> None:
         )
 
 
-def test_creator_context_requires_finished_work_when_available() -> None:
+def test_creator_context_requires_stable_work_snapshot_when_available() -> None:
     work = build_finished_creator_work()
     context = CreatorContext(status="available", works=[work])
 
@@ -204,6 +188,27 @@ def test_creator_context_requires_finished_work_when_available() -> None:
 
     with pytest.raises(ValidationError, match="必须说明原因"):
         CreatorContext(status="missing")
+
+
+def test_creator_context_rejects_work_outside_ranked_top_five() -> None:
+    work = build_finished_creator_work()
+    ranking = CreatorRankingContext(
+        creator_id="creator-2",
+        creator_name="其他博主",
+        rank=1,
+        rolling_score=90,
+        daily_score=100,
+        sample_count=10,
+    )
+
+    with pytest.raises(ValidationError, match="评分 Top 5"):
+        CreatorContext(
+            status="available",
+            ranking_market_date="2026-07-22",
+            selection_rule="previous_trade_day_rolling_score_top5",
+            ranked_creators=[ranking],
+            works=[work],
+        )
 
 
 @pytest.mark.parametrize(

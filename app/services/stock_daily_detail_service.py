@@ -16,12 +16,12 @@ from pymongo.database import Database
 from app.core.config import get_settings
 from app.crawlers.proxy_provider import (
     AsyncRequestRateLimiter,
-    AsyncDailiProxyPool,
 )
-from app.crawlers.stock_daily_detail_crawler import (
-    EastMoneyQuotePageFetcher,
-    StockDailyDetailCrawler,
+from app.crawlers.eastmoney_reverse_fetcher import (
+    EastMoneyReverseFetcher,
+    TargetAwareProxyManager,
 )
+from app.crawlers.stock_daily_detail_crawler import StockDailyDetailCrawler
 from app.models.stock_daily_detail import CN_TZ, StockDailyDetail, now_cn
 
 
@@ -32,17 +32,17 @@ STOCK_DAILY_DEFAULT_END_DATE = ""
 STOCK_DAILY_DEFAULT_ADJUST = "qfq"
 STOCK_DAILY_DEFAULT_LIMIT: Optional[int] = None
 STOCK_DAILY_DEFAULT_ONLY_CODE: Optional[str] = None
-STOCK_DAILY_REQUEST_SLEEP_SECONDS = 0.5
 STOCK_DAILY_MAX_RETRY = 2
-STOCK_DAILY_DEFAULT_CONCURRENCY = 80
-STOCK_DAILY_PAGE_CONCURRENCY = 80
+STOCK_DAILY_DEFAULT_CONCURRENCY = 20
+# 服务重启补数继续限制为八个协程，避免与其他启动任务争用资源。
+STOCK_DAILY_STARTUP_CONCURRENCY = 8
 STOCK_DAILY_PROXY_MINUTES = 3
-STOCK_DAILY_PROXY_POOL_SIZE = 80
-STOCK_DAILY_PROXY_CONCURRENCY_PER_IP = 1
-STOCK_DAILY_RETRY_CONCURRENCY = 80
-STOCK_DAILY_RETRY_PAGE_CONCURRENCY = 80
+STOCK_DAILY_REVERSE_PROXY_POOL_SIZE = 20
+STOCK_DAILY_REVERSE_REQUEST_INTERVAL_SECONDS = 1.2
+STOCK_DAILY_REVERSE_MAX_REQUESTS_PER_PROXY = 40
+# 失败补偿同样采用低并发；它只处理剩余失败项，不要求与日常全量任务同速。
+STOCK_DAILY_RETRY_CONCURRENCY = 8
 STOCK_DAILY_TOTAL_MAX_COMPENSATIONS = 5
-STOCK_DAILY_BROWSER_ERROR_EXTRA_COMPENSATIONS = 2
 STOCK_DAILY_TRADE_CALENDAR_LOOKBACK_DAYS = 90
 STOCK_DAILY_STARTUP_MIN_TIME = "16:00"
 
@@ -50,19 +50,6 @@ SYNC_STATUS_RUNNING = "running"
 SYNC_STATUS_SUCCESS = "success"
 SYNC_STATUS_PARTIAL_FAILED = "partial_failed"
 SYNC_STATUS_FAILED = "failed"
-
-BROWSER_RUNTIME_ERROR_TOKENS = (
-    "page.evaluate",
-    "execution context was destroyed",
-    "target page, context or browser has been closed",
-    "page crashed",
-)
-
-
-def _is_browser_runtime_error(error: str) -> bool:
-    normalized_error = error.lower()
-    return any(token in normalized_error for token in BROWSER_RUNTIME_ERROR_TOKENS)
-
 
 @dataclass(frozen=True)
 class StockTradeDateDecision:
@@ -74,10 +61,15 @@ class StockTradeDateDecision:
     A 股交易日。
     """
 
+    # 调用方传入的紧凑日期文本，格式 YYYYMMDD。
     reference_yyyymmdd: str
+    # 参考日期的 ISO 表示，格式 YYYY-MM-DD。
     reference_trade_date: str
+    # 最终目标交易日的紧凑表示，供东方财富接口参数使用。
     target_yyyymmdd: str
+    # 最终应同步或审计的 A 股交易日，格式 YYYY-MM-DD。
     target_trade_date: str
+    # 参考自然日本身是否为 A 股交易日。
     is_reference_trade_day: bool
 
 
@@ -90,16 +82,27 @@ class StockDailyDetailSyncResult:
     作为后续跳过判断、失败补偿和同步完整性判断的依据。
     """
 
+    # 本次同步批次的唯一标识，同时作为 sync_runs 集合的查询主键。
     run_id: str
+    # 本批次要求每只股票覆盖到的 ISO 交易日。
     target_trade_date: str
+    # 本批次采用的复权口径，例如 qfq、hfq 或空字符串。
     adjust: str
+    # 调度、历史补齐或失败补偿等运行模式标识。
     run_mode: str
+    # 股票处理范围的稳定标识，用于完整批次跳过和补偿判断。
     scope_key: str
+    # 本批次计划处理的股票数量。
     expected_count: int = 0
+    # 未抛出单股错误并完成持久化流程的股票数量。
     success_count: int = 0
+    # 单股同步最终失败的数量。
     failed_count: int = 0
+    # 所有成功股票新增或替换文档数量之和。
     affected_total: int = 0
+    # 批次当前或最终状态，例如 running、success、partial_failed、failed。
     status: str = SYNC_STATUS_RUNNING
+    # 可供后续补偿的失败股票代码、名称及错误摘要。
     failed_items: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -109,11 +112,17 @@ class StockDailyDetailItemResult:
     单只股票同步结果，用于协程 worker 和批次汇总。
     """
 
+    # 当前股票在本批处理列表中的一基序号。
     index: int
+    # 本批次股票总数，用于进度日志。
     total: int
+    # 规范化后的六位股票代码。
     code: str
+    # 股票展示名称；来源缺失时允许为 None。
     name: Optional[str]
+    # 本股票批量写入中新增或替换的文档数。
     affected: int = 0
+    # 最终失败的错误摘要；成功时为 None。
     error: Optional[str] = None
 
 
@@ -121,10 +130,10 @@ async def _load_a_stock_trade_dates(reference_yyyymmdd: str) -> tuple[str, ...]:
     """
     从东方财富上证指数日 K 推导参考日期附近的 A 股交易日，并缓存到当前进程内。
 
-    Returns:
+    返回值：
         升序排列的交易日元组，日期格式为 YYYY-MM-DD。
 
-    Raises:
+    异常：
         RuntimeError:
             当东方财富返回空数据时抛出。scheduler 会记录异常，避免静默错误。
     """
@@ -188,11 +197,11 @@ async def resolve_a_stock_target_trade_date(
     - 如果 reference_yyyymmdd 是 A 股交易日，目标日期就是它自己；
     - 如果不是交易日，目标日期回退到小于 reference 的最近一个交易日。
 
-    Args:
+    参数：
         reference_yyyymmdd:
             参考日期，格式 YYYYMMDD，通常是今天或 STOCK_DAILY_DEFAULT_END_DATE。
 
-    Returns:
+    返回值：
         StockTradeDateDecision，包含参考日期、目标交易日和是否交易日。
     """
 
@@ -252,15 +261,12 @@ class StockDailyDetailService:
         request_sleep_seconds: Optional[float] = None,
         max_retry: Optional[int] = None,
         concurrency: Optional[int] = None,
-        page_concurrency: Optional[int] = None,
         proxy_minutes: Optional[int] = None,
-        proxy_pool_size: Optional[int] = None,
-        proxy_concurrency_per_ip: Optional[int] = None,
     ) -> None:
         """
         初始化日线同步服务。
 
-        Args:
+        参数：
             mongo_uri:
                 MongoDB 连接地址；不传时读取 Settings.mongo_uri。
             db_name:
@@ -270,75 +276,68 @@ class StockDailyDetailService:
             sync_run_collection_name:
                 同步批次状态集合名，默认 stock_daily_detail_sync_runs。
             request_sleep_seconds:
-                每只股票处理完成后的基础休眠秒数；不传时使用模块常量
-                STOCK_DAILY_REQUEST_SLEEP_SECONDS。
+                每只股票处理完成后的额外休眠秒数；逆向请求自身已限速，默认 0。
             max_retry:
-                crawler 请求东方财富页面或接口的最大重试次数；不传时使用模块常量
+                crawler 请求东方财富股票列表或交易日接口的最大重试次数；不传时使用模块常量
                 STOCK_DAILY_MAX_RETRY。
             concurrency:
                 全市场同步时的协程 worker 数；不传时使用
                 STOCK_DAILY_DEFAULT_CONCURRENCY。
-            page_concurrency:
-                同时打开东方财富网页的上限。其余 worker 在异步队列中等待。
             proxy_minutes:
-                代理 IP 的购买时长，单位为分钟。
-            proxy_pool_size:
-                单次最多维护的代理 IP 数。小批次会按页面并发自动缩小。
-            proxy_concurrency_per_ip:
-                每个代理 IP 同时承载的页面数。
-        Side effects:
+                股票列表和交易日接口回退代理的购买时长，单位为分钟。
+        副作用：
             会创建一个同步 MongoClient，并初始化 StockDailyDetailCrawler。
         """
 
         settings = get_settings()
 
+        # MongoDB 服务连接地址，来自显式参数或应用设置。
         self.mongo_uri = mongo_uri or settings.mongo_uri
+        # 日线数据和同步批次所在的 MongoDB 数据库名。
         self.db_name = db_name or settings.mongo_db_name
+        # 股票日线详情集合名。
         self.collection_name = collection_name
+        # 同步批次状态与失败清单集合名。
         self.sync_run_collection_name = sync_run_collection_name
-
+        # 当前服务独占的同步 PyMongo 客户端，由 close 负责释放。
         self.client: MongoClient = MongoClient(self.mongo_uri)
+        # 从客户端选择出的业务数据库句柄。
         self.db: Database = self.client[self.db_name]
+        # 保存 StockDailyDetail 文档的集合句柄。
         self.collection: Collection = self.db[self.collection_name]
+        # 保存运行状态、计数和失败项的同步批次集合句柄。
         self.sync_run_collection: Collection = self.db[self.sync_run_collection_name]
 
+        # 每只股票处理完成后的基础请求间隔秒数。
         self.request_sleep_seconds = (
             request_sleep_seconds
             if request_sleep_seconds is not None
-            else STOCK_DAILY_REQUEST_SLEEP_SECONDS
+            else 0.0
         )
+        # 单次股票抓取内部允许的最大请求重试次数。
         self.max_retry = max_retry if max_retry is not None else STOCK_DAILY_MAX_RETRY
+        # 消费股票队列的异步 worker 数，最小为 1。
         self.concurrency = (
             max(1, concurrency)
             if concurrency is not None
             else STOCK_DAILY_DEFAULT_CONCURRENCY
         )
-        self.page_concurrency = (
-            max(1, page_concurrency)
-            if page_concurrency is not None
-            else STOCK_DAILY_PAGE_CONCURRENCY
-        )
+        # 从代理服务购买单个代理的有效时长，单位为分钟。
         self.proxy_minutes = (
             max(1, proxy_minutes)
             if proxy_minutes is not None
             else STOCK_DAILY_PROXY_MINUTES
         )
-        self.proxy_pool_size = (
-            max(1, proxy_pool_size)
-            if proxy_pool_size is not None
-            else STOCK_DAILY_PROXY_POOL_SIZE
-        )
-        self.proxy_concurrency_per_ip = (
-            max(1, proxy_concurrency_per_ip)
-            if proxy_concurrency_per_ip is not None
-            else STOCK_DAILY_PROXY_CONCURRENCY_PER_IP
-        )
+        # 限制代理供应商 API 调用频率的进程内异步限流器。
         self.proxy_rate_limiter = AsyncRequestRateLimiter(max_calls_per_second=10.0)
-        self.proxy_pool_stats_history: list[dict[str, int]] = []
+        # 每轮代理池运行统计的历史快照，供日志和调优观察。
+        self.proxy_pool_stats_history: list[dict[str, Any]] = []
 
+        # 复用服务级请求策略和代理限流器的东方财富日线爬虫。
         self.crawler = StockDailyDetailCrawler(
             request_sleep_seconds=self.request_sleep_seconds,
             max_retry=self.max_retry,
+            proxy_minutes=self.proxy_minutes,
             proxy_rate_limiter=self.proxy_rate_limiter,
         )
 
@@ -431,10 +430,16 @@ class StockDailyDetailService:
         code: str,
         name: Optional[str],
     ) -> pd.DataFrame:
+        """把单只股票代码和可选名称包装成与全市场列表相同列结构的 DataFrame。"""
+
         return pd.DataFrame([{"代码": code, "名称": name}])
 
     def _load_existing_stock_list(self) -> pd.DataFrame:
-        """Use the latest stored name for each code when the stock-list API fails."""
+        """在股票列表接口失败时，从存量行情恢复各代码的最新名称。
+
+        聚合流程先按交易日倒序排列，再为每个代码保留最近一条名称，最终返回与
+        在线股票列表相同的“代码”“名称”列结构，并按代码升序排列。
+        """
 
         pipeline = [
             {"$sort": {"trade_date_int": -1}},
@@ -612,7 +617,7 @@ class StockDailyDetailService:
         start_date/end_date 格式为 YYYYMMDD。增量同步会从写入起点向前读取预热
         窗口，用于计算长周期指标，但只写入目标日期范围。
 
-        Args:
+        参数：
             start_date:
                 首次同步时的默认起始日期；为空时使用模块常量
                 STOCK_DAILY_DEFAULT_START_DATE。
@@ -634,10 +639,10 @@ class StockDailyDetailService:
             parent_run_id:
                 失败补偿时记录原始失败 run_id。
 
-        Returns:
+        返回值：
             StockDailyDetailSyncResult，包含 expected/success/failed/affected 等统计。
 
-        Side effects:
+        副作用：
             会访问东方财富上游接口，并对 MongoDB 执行批量 upsert。
             同时会写入 stock_daily_detail_sync_runs 批次状态集合。
         """
@@ -720,8 +725,7 @@ class StockDailyDetailService:
         logger.info(
             (
                 "stock_daily_detail_sync_start run_id=%s total=%s start_date=%s "
-                "end_date=%s target_trade_date=%s adjust=%s workers=%s "
-                "page_concurrency=%s"
+                "end_date=%s target_trade_date=%s adjust=%s workers=%s"
             ),
             run_id,
             total,
@@ -730,7 +734,6 @@ class StockDailyDetailService:
             target_trade_date,
             adjust,
             self.concurrency,
-            self.page_concurrency,
         )
 
         success_count = 0
@@ -810,7 +813,11 @@ class StockDailyDetailService:
         target_trade_date: str,
         retry_failed_once: bool = True,
     ) -> list[StockDailyDetailItemResult]:
-        """Process the stock queue with coroutines sharing one browser."""
+        """使用共享逆向抓取资源的多个协程处理股票同步队列。
+
+        最多使用二十个单并发代理槽位。每只股票生成一条结果，并可对本轮失败项
+        执行一次内部重试；结束前始终释放对应抓取资源。
+        """
 
         if not stock_rows:
             return []
@@ -819,27 +826,28 @@ class StockDailyDetailService:
         for stock_row in stock_rows:
             queue.put_nowait(stock_row)
 
-        shared_fetcher = EastMoneyQuotePageFetcher()
-        active_page_capacity = min(self.page_concurrency, len(stock_rows))
-        required_proxy_count = (
-            active_page_capacity + self.proxy_concurrency_per_ip - 1
-        ) // self.proxy_concurrency_per_ip
-        proxy_pool_size = min(self.proxy_pool_size, max(1, required_proxy_count))
-        shared_proxy_provider = AsyncDailiProxyPool(
-            minutes=self.proxy_minutes,
-            pool_size=proxy_pool_size,
-            max_concurrency_per_proxy=self.proxy_concurrency_per_ip,
-            rate_limiter=self.proxy_rate_limiter,
+        proxy_pool_size = min(
+            STOCK_DAILY_REVERSE_PROXY_POOL_SIZE,
+            self.concurrency,
+            len(stock_rows),
         )
-        page_semaphore = asyncio.Semaphore(self.page_concurrency)
-        crawler_count = min(self.page_concurrency * 2, len(stock_rows))
+        required_proxy_rotations = (
+            len(stock_rows) + STOCK_DAILY_REVERSE_MAX_REQUESTS_PER_PROXY - 1
+        ) // STOCK_DAILY_REVERSE_MAX_REQUESTS_PER_PROXY
+        candidate_budget = max(40, required_proxy_rotations * 3)
+        reverse_manager = TargetAwareProxyManager(
+            pool_size=proxy_pool_size,
+            request_interval_seconds=STOCK_DAILY_REVERSE_REQUEST_INTERVAL_SECONDS,
+            max_target_requests_per_proxy=STOCK_DAILY_REVERSE_MAX_REQUESTS_PER_PROXY,
+            max_candidate_count=candidate_budget,
+        )
+        shared_reverse_fetcher = EastMoneyReverseFetcher(manager=reverse_manager)
+        crawler_count = min(self.concurrency, proxy_pool_size, len(stock_rows))
         crawlers = [
             StockDailyDetailCrawler(
                 request_sleep_seconds=self.request_sleep_seconds,
                 max_retry=self.max_retry,
-                proxy_provider=shared_proxy_provider,
-                quote_page_fetcher=shared_fetcher,
-                page_semaphore=page_semaphore,
+                reverse_fetcher=shared_reverse_fetcher,
                 proxy_rate_limiter=self.proxy_rate_limiter,
             )
             for _ in range(crawler_count)
@@ -850,6 +858,12 @@ class StockDailyDetailService:
         results: list[StockDailyDetailItemResult] = []
 
         async def worker() -> None:
+            """持续领取股票并复用爬虫，直至共享队列为空。
+
+            每只股票无论成功失败都会生成结果、执行请求间隔、归还爬虫并标记
+            队列任务完成，从而避免单股异常耗尽爬虫池或阻塞其他 worker。
+            """
+
             while True:
                 try:
                     index, code, name = queue.get_nowait()
@@ -907,7 +921,7 @@ class StockDailyDetailService:
                     crawler_pool.put_nowait(worker_crawler)
                     queue.task_done()
 
-        worker_count = min(self.concurrency, len(stock_rows))
+        worker_count = min(self.concurrency, len(stock_rows), len(crawlers))
         try:
             await asyncio.gather(*(worker() for _ in range(worker_count)))
         finally:
@@ -916,18 +930,14 @@ class StockDailyDetailService:
                     await crawler.close()
                 except Exception:
                     logger.exception("stock_daily_detail_worker_crawler_close_failed")
-            proxy_pool_stats = dict(vars(shared_proxy_provider.stats))
-            self.proxy_pool_stats_history.append(proxy_pool_stats)
+            reverse_stats = reverse_manager.report_stats()
+            self.proxy_pool_stats_history.append(reverse_stats)
             logger.info(
-                "stock_daily_proxy_pool_stats minutes=%s pool_size=%s "
-                "concurrency_per_ip=%s stats=%s",
-                self.proxy_minutes,
+                "stock_daily_reverse_proxy_stats pool_size=%s stats=%s",
                 proxy_pool_size,
-                self.proxy_concurrency_per_ip,
-                proxy_pool_stats,
+                reverse_stats,
             )
-            await shared_proxy_provider.close()
-            await shared_fetcher.close()
+            await reverse_manager.close()
 
         sorted_results = sorted(results, key=lambda item: item.index)
         if not retry_failed_once:
@@ -968,6 +978,12 @@ class StockDailyDetailService:
 
     @staticmethod
     def _is_retryable_item_error(error: str) -> bool:
+        """判断单股失败是否值得在当前批次结束后立即再尝试一次。
+
+        明确的资源不存在状态和指定区间无日 K 数据属于确定性失败，其余网络、
+        协议请求和解析错误保留一次快速恢复机会。
+        """
+
         normalized_error = error.lower()
         return not any(
             token in normalized_error
@@ -992,7 +1008,7 @@ class StockDailyDetailService:
 
         增量同步只读取并写入最新已入库日期之后的目标区间。
 
-        Args:
+        参数：
             code:
                 股票代码，会标准化为 6 位。
             name:
@@ -1004,7 +1020,7 @@ class StockDailyDetailService:
             adjust:
                 复权口径。
 
-        Returns:
+        返回值：
             本次 bulk_upsert 影响的文档数量，包含新增和修改。
         """
 
@@ -1029,6 +1045,13 @@ class StockDailyDetailService:
         adjust: str,
         target_trade_date: Optional[str],
     ) -> int:
+        """使用指定爬虫增量抓取一只股票，校验目标日后批量写入。
+
+        已入库股票从最新交易日开始读取以刷新边界日并补足指标预热数据；首次
+        入库使用默认起点。若要求目标交易日，则在写入前验证该日行情、指标、
+        筹码和来源字段完整，返回新增及修改文档数量。
+        """
+
         code = self._normalize_code(code)
         latest_trade_date = self.get_latest_trade_date(code=code, adjust=adjust)
 
@@ -1068,6 +1091,12 @@ class StockDailyDetailService:
         target_trade_date: str,
         code: str,
     ) -> None:
+        """确认抓取结果包含目标交易日且该日所有生产必需字段完整。
+
+        缺少目标日或任一行情、逆向指标、筹码与来源字段时抛出带股票代码和字段
+        清单的错误，使批次将该股票记录为失败而非写入不完整成功状态。
+        """
+
         target_item = next(
             (item for item in items if item.trade_date == target_trade_date),
             None,
@@ -1090,6 +1119,12 @@ class StockDailyDetailService:
         self,
         item: StockDailyDetail,
     ) -> list[str]:
+        """列出一条目标日详情中缺失的行情、指标、筹码及来源字段。
+
+        逆向指标采用“至少一个有效值”的完整性门槛；筹码存在时进一步检查两组
+        成本区间、集中度、图表坐标及算法来源，返回值仅含缺失字段路径。
+        """
+
         required_values: list[tuple[str, Any]] = [
             ("open", item.open),
             ("close", item.close),
@@ -1120,14 +1155,14 @@ class StockDailyDetailService:
             item.wr.wr10,
         )
         if not any(value is not None for value in indicator_values):
-            required_values.append(("page_indicators", None))
-        if item.source.daily != "eastmoney.quote_page":
+            required_values.append(("indicators", None))
+        if item.source.daily != EastMoneyReverseFetcher.SOURCE:
             required_values.append(("source.daily", None))
-        if item.source.indicator != "eastmoney.quote_page.runtime":
+        if item.source.indicator != EastMoneyReverseFetcher.INDICATOR_SOURCE:
             required_values.append(("source.indicator", None))
 
         if item.chip is not None:
-            if item.source.chip != "eastmoney.quote_page.runtime":
+            if item.source.chip != EastMoneyReverseFetcher.CHIP_SOURCE:
                 required_values.append(("source.chip", None))
             required_values.extend(
                 [
@@ -1160,16 +1195,16 @@ class StockDailyDetailService:
         """
         批量 upsert 股票日线详情模型。
 
-        Args:
+        参数：
             items:
                 待写入的 StockDailyDetail 模型序列。
             batch_size:
                 每批 MongoDB bulk_write 的操作数量，默认 1000。
 
-        Returns:
+        返回值：
             MongoDB 报告的 upserted_count + modified_count。
 
-        Side effects:
+        副作用：
             会写入 stock_daily_detail 集合。
         """
 
@@ -1196,13 +1231,13 @@ class StockDailyDetailService:
         """
         查询某只股票在指定复权口径下已入库的最新交易日。
 
-        Args:
+        参数：
             code:
                 股票代码，会标准化为 6 位。
             adjust:
                 复权口径。
 
-        Returns:
+        返回值：
             最新 trade_date，格式 YYYY-MM-DD；没有数据时返回 None。
         """
 
@@ -1229,15 +1264,15 @@ class StockDailyDetailService:
         """
         只重试某个同步批次中失败的股票。
 
-        Args:
+        参数：
             run_id:
                 原始同步批次 ID。
 
-        Returns:
+        返回值：
             新的 retry 批次结果。retry 会创建一条新的 sync run，并用 parent_run_id
             关联原始失败批次。
 
-        Raises:
+        异常：
             ValueError:
                 找不到 run，或者该 run 没有 failed_items 时抛出。
         """
@@ -1353,7 +1388,11 @@ class StockDailyDetailService:
         retry_result: StockDailyDetailSyncResult,
         remaining_failed_items: list[dict[str, Any]],
     ) -> None:
-        """Update the original full-market run with the remaining failures."""
+        """根据补偿结果回写原始全市场批次及其剩余失败项。
+
+        成功数累加但不超过原批次预期数，失败数以当前剩余项重新计算，并同步更新
+        状态、累计影响行数、最近补偿批次和时间；全部成功时额外清除自动重试耗尽标记。
+        """
 
         expected_count = int(source_run.get("expected_count") or 0)
         success_count = min(
@@ -1395,6 +1434,12 @@ class StockDailyDetailService:
         target_trade_date: str,
         adjust: str = "qfq",
     ) -> Optional[dict[str, Any]]:
+        """查找指定交易日和复权口径最近的可补偿全市场失败批次。
+
+        仅返回 startup/scheduled 模式、范围为 all、状态失败且确实保存了失败项的
+        最新记录；投影排除 MongoDB ``_id``，无匹配时返回 ``None``。
+        """
+
         return self.sync_run_collection.find_one(
             {
                 "target_trade_date": target_trade_date,
@@ -1504,11 +1549,11 @@ class StockDailyDetailService:
         - replacement 按 StockDailyDetail 模型字段顺序写入完整文档；
         - 已有记录保留 created_at，新记录使用本次模型的 created_at。
 
-        Args:
+        参数：
             item:
                 待写入的日线详情模型。
 
-        Returns:
+        返回值：
             可交给 bulk_write 的 ReplaceOne 操作。
         """
 
@@ -1535,11 +1580,11 @@ class StockDailyDetailService:
         """
         按模型字段顺序执行一批 MongoDB 整文档替换。
 
-        Args:
+        参数：
             items:
                 待写入的 StockDailyDetail 模型列表。
 
-        Returns:
+        返回值：
             upserted_count + modified_count；空列表返回 0。
         """
 
@@ -1576,8 +1621,10 @@ class StockDailyDetailService:
 
     @staticmethod
     def _normalize_code(value: object) -> str:
-        """
-        把股票代码标准化为 6 位字符串。
+        """把任意股票代码值去除首尾空白并在左侧补零为六位字符串。
+
+        该方法只负责格式统一，不校验字符是否全为数字，调用方应传入数据源提供的
+        合法 A 股代码。
         """
 
         return str(value).strip().zfill(6)
@@ -1628,11 +1675,10 @@ async def run_stock_daily_detail_sync(
     offset: int = 0,
     concurrency: Optional[int] = None,
 ) -> StockDailyDetailSyncResult:
-    """
-    给脚本和 scheduler 调用的统一同步入口。
+    """给脚本和调度器调用的统一股票日线同步入口。
 
-    这个函数负责创建 service、执行同步，并在 finally 中关闭 MongoDB 连接。
-    外部调用者不需要关心 service 生命周期。
+    ``concurrency`` 限制逆向队列 Worker 数。函数负责创建服务、执行同步，并在
+    ``finally`` 中关闭 MongoDB 和爬虫资源；未显式传入时使用服务层默认配置。
     """
 
     service = StockDailyDetailService(concurrency=concurrency)
@@ -1701,12 +1747,14 @@ async def retry_latest_incomplete_stock_daily_detail_run(
     adjust: str = "qfq",
     max_automatic_compensations: int = STOCK_DAILY_TOTAL_MAX_COMPENSATIONS,
 ) -> Optional[StockDailyDetailSyncResult]:
-    """Automatically retry only the remaining network failures for one day."""
+    """自动补偿指定交易日最近未完成批次中仍属网络故障的股票。
 
-    service = StockDailyDetailService(
-        concurrency=STOCK_DAILY_RETRY_CONCURRENCY,
-        page_concurrency=STOCK_DAILY_RETRY_PAGE_CONCURRENCY,
-    )
+    函数使用较低并发创建服务，查找目标日期和复权口径对应的最近未完成全市场
+    批次；不存在可补偿批次或达到次数上限时返回 ``None``，否则仅重试剩余的
+    可恢复失败项并返回本次同步结果。
+    """
+
+    service = StockDailyDetailService(concurrency=STOCK_DAILY_RETRY_CONCURRENCY)
     try:
         service.ensure_indexes()
         source_run = service.find_latest_incomplete_full_run(
@@ -1720,24 +1768,6 @@ async def retry_latest_incomplete_stock_daily_detail_run(
         compensation_count = int(
             source_run.get("automatic_compensation_count") or 0
         )
-        browser_retry_enabled = bool(
-            source_run.get("browser_runtime_retry_enabled")
-        ) or any(
-            _is_browser_runtime_error(str(item.get("error") or ""))
-            for item in source_run.get("failed_items") or []
-        )
-        if browser_retry_enabled:
-            service.sync_run_collection.update_one(
-                {"run_id": run_id},
-                {
-                    "$set": {
-                        "browser_runtime_retry_enabled": True,
-                        "automatic_retry_exhausted": False,
-                        "updated_at": now_cn(),
-                    }
-                },
-            )
-
         try:
             result = await service.retry_failed_run(run_id)
         except ValueError as exc:
@@ -1778,6 +1808,12 @@ async def stock_daily_detail_has_incomplete_sync_run(
     target_trade_date: str,
     adjust: str = "qfq",
 ) -> bool:
+    """检查指定交易日是否仍有可补偿的全市场日线同步批次。
+
+    入口负责创建索引和释放爬虫、MongoDB 资源；只判断失败批次是否存在，不执行
+    补偿，也不修改原批次状态。
+    """
+
     service = StockDailyDetailService()
     try:
         service.ensure_indexes()

@@ -5,9 +5,6 @@ from typing import ClassVar, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.models.douyin_creator_work import DouyinCreatorWork, DouyinWorkAnalysis
-
-
 CN_TZ = timezone(timedelta(hours=8))
 
 
@@ -187,44 +184,77 @@ class RankingSnapshotMeta(BaseModel):
     is_stale: bool
 
 
+class CreatorSectorOpinionContext(BaseModel):
+    """表示嵌入历史盘前报告的稳定行业观点数据传输对象。
+
+    统一博主链路会存储覆盖更多目标类型的丰富观点。盘前报告刻意保留这一精简的
+    纯行业结构，使旧版持久化报告仍可读取，并防止 OCR/ASR 原文或无关的个股、
+    题材观点进入盘前提示词。
+    """
+
+    # 供观点核验和行业主线引用的稳定来源观点标识。
+    opinion_id: str = Field(min_length=1)
+    # 盘前行业分析选取且通过校验的同花顺行业名称。
+    sector_name: str = Field(min_length=1)
+    # 博主立场强度，范围为 -100（强烈看空）到 100（强烈看多）。
+    stance_score: int = Field(ge=-100, le=100)
+    # 提供给盘前分析器的可证伪主张及精简来源证据。
+    reason: str = Field(min_length=1)
+
+
+class CreatorWorkAnalysisContext(BaseModel):
+    """表示不含原始提取内容的单条博主作品分析盘前报告副本。"""
+
+    # 作品层面对市场节奏、流动性、仓位和风险的摘要。
+    summary: str = Field(min_length=1)
+    # 通过同花顺行业白名单校验的纯行业观点。
+    sector_opinions: List[CreatorSectorOpinionContext] = Field(default_factory=list)
+    # 为审计保留的博主作品分析提示词及校验版本。
+    analysis_version: str = ""
+    # 生成来源作品分析结果的具体 LLM 模型。
+    analysis_model: str = ""
+    # 来源作品分析完成时间，用于历史时点审计。
+    analyzed_at: Optional[datetime] = None
+
+
+class CreatorRankingContext(BaseModel):
+    """记录进入盘前分析的博主在前一交易日评分榜中的位置。"""
+
+    # 禁止未声明字段进入盘前提示词，保证排名依据可以稳定审计。
+    model_config = ConfigDict(extra="forbid")
+
+    # 跨平台聚合同一博主使用的稳定逻辑标识。
+    creator_id: str = Field(min_length=1)
+    # 排行榜和盘前报告展示使用的博主名称。
+    creator_name: str = Field(min_length=1)
+    # 按滚动分降序排列后的前五名名次。
+    rank: int = Field(ge=1, le=5)
+    # 截至前一交易日最近七个自然日有效观点计算出的近期分。
+    rolling_score: float = Field(ge=0, le=100)
+    # 前一交易日新到期观点得分；当日没有有效新样本时允许为空。
+    daily_score: Optional[float] = Field(default=None, ge=0, le=100)
+    # 实际参与滚动分计算的历史有效观点数量。
+    sample_count: int = Field(ge=1, le=20)
+
+
 class CreatorWorkContext(BaseModel):
     """保存盘前日报可使用的单条博主作品结构化观点，不复制 OCR/ASR 原文。"""
 
     # 禁止输入模型未声明的字段，避免原始转写等大字段意外进入盘前上下文。
     model_config = ConfigDict(extra="forbid")
 
-    # 抖音作品唯一标识。
+    # 跨平台作品唯一标识，使用 ``platform:platform_work_id`` 避免平台间冲突。
     work_id: str = Field(min_length=1)
+    # 作品所属博主的稳定逻辑标识；旧盘前文档缺少该字段时保持为空。
+    creator_id: str = ""
     # 作品所属博主名称。
     creator_name: str = Field(min_length=1)
-    # 作品在抖音平台上的实际发布时间。
+    # 作品在来源平台上的实际发布时间。
     published_at: datetime
     # 作品发布时间的秒级 Unix 时间戳，便于执行时间窗口筛选。
     publish_ts: int = Field(ge=0)
     # 已完成的结构化博主观点分析结果。
-    analysis: DouyinWorkAnalysis
-
-    @model_validator(mode="before")
-    @classmethod
-    def from_finished_work(cls, value):
-        """将已完成处理的抖音作品转换成精简的盘前上下文输入。
-
-        非 ``DouyinCreatorWork`` 输入保持不变并交给 Pydantic 正常解析；作品对象
-        只有在状态为 ``finished`` 且存在分析结果时才允许转换，防止盘前报告使用
-        尚未完成或不完整的数据。
-        """
-
-        if not isinstance(value, DouyinCreatorWork):
-            return value
-        if value.status.status != "finished" or value.analysis is None:
-            raise ValueError("creator work context 只能由 finished 作品生成")
-        return {
-            "work_id": value.work_id,
-            "creator_name": value.creator_name,
-            "published_at": value.published_at,
-            "publish_ts": value.publish_ts,
-            "analysis": value.analysis,
-        }
+    analysis: CreatorWorkAnalysisContext
 
 
 class CreatorContext(BaseModel):
@@ -243,6 +273,16 @@ class CreatorContext(BaseModel):
     ]
     # 博主观点在盘前分析中的固定优先级标识。
     priority: Literal["critical"] = "critical"
+    # 选择博主时使用的已完成收盘评分交易日。
+    ranking_market_date: Optional[str] = None
+    # 当前上下文采用的博主筛选规则；空值用于兼容旧盘前报告。
+    selection_rule: Literal[
+        "",
+        "previous_trade_day_rolling_score_top5",
+        "cumulative_accuracy_top5",
+    ] = ""
+    # 前一交易日按滚动分选出的最多五位高置信度博主。
+    ranked_creators: List[CreatorRankingContext] = Field(default_factory=list)
     # 盘前分析要求作品所属的来源日期，通常是分析日前一自然日。
     source_date: Optional[str] = None
     # 数据不可用时的原因，或对当前上下文状态的补充说明。
@@ -251,6 +291,18 @@ class CreatorContext(BaseModel):
     age_seconds: Optional[int] = Field(default=None, ge=0)
     # 满足发布时间、发现时间和分析完成时间约束的作品列表。
     works: List[CreatorWorkContext] = Field(default_factory=list)
+    # 配置账号和作品处理在盘前截止时点的完整性状态；旧报告默认为未知。
+    coverage_status: Literal["complete", "incomplete", "unknown"] = "unknown"
+    # 当前配置中需要采集的启用账号总数。
+    enabled_account_count: int = Field(default=0, ge=0)
+    # 已有成功扫描完整覆盖来源日期的账号数。
+    covered_account_count: int = Field(default=0, ge=0)
+    # 截止时点前发现但没有按时完成 LLM 1 的作品数。
+    unfinished_work_count: int = Field(default=0, ge=0)
+    # 未完成作品中已经耗尽自动重试次数的终止失败数。
+    terminal_failure_count: int = Field(default=0, ge=0)
+    # 未能提供来源日完整覆盖证明的账号键，按配置顺序保存。
+    uncovered_account_keys: List[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_status_payload(self) -> "CreatorContext":
@@ -264,6 +316,10 @@ class CreatorContext(BaseModel):
             raise ValueError("available creator_context 必须包含作品")
         if self.status != "available" and not self.reason.strip():
             raise ValueError("非 available creator_context 必须说明原因")
+        if self.covered_account_count > self.enabled_account_count:
+            raise ValueError("covered_account_count 不能超过 enabled_account_count")
+        if self.terminal_failure_count > self.unfinished_work_count:
+            raise ValueError("terminal_failure_count 不能超过 unfinished_work_count")
 
         work_ids = [work.work_id for work in self.works]
         if len(set(work_ids)) != len(work_ids):
@@ -277,13 +333,31 @@ class CreatorContext(BaseModel):
         if len(set(opinion_ids)) != len(opinion_ids):
             raise ValueError("creator_context 不允许重复观点 ID")
 
+        creator_ids = [item.creator_id for item in self.ranked_creators]
+        ranks = [item.rank for item in self.ranked_creators]
+        if len(set(creator_ids)) != len(creator_ids):
+            raise ValueError("creator_context 不允许重复入选博主")
+        if len(set(ranks)) != len(ranks):
+            raise ValueError("creator_context 不允许重复排行榜名次")
+        if self.selection_rule:
+            if not self.ranking_market_date:
+                raise ValueError("Top 5 博主上下文必须记录评分交易日")
+            if not self.ranked_creators:
+                raise ValueError("Top 5 博主上下文必须记录入选博主")
+            ranked_ids = set(creator_ids)
+            if any(
+                not work.creator_id or work.creator_id not in ranked_ids
+                for work in self.works
+            ):
+                raise ValueError("盘前作品只能来自前一交易日评分 Top 5 博主")
+
         return self
 
 
 def missing_creator_context() -> CreatorContext:
     """构造默认的博主观点缺失状态，供盘前报告字段作为安全默认值。"""
 
-    return CreatorContext(status="missing", reason="未找到可用的抖音博主观点")
+    return CreatorContext(status="missing", reason="未找到可用的博主观点")
 
 
 class CreatorOpinionAssessment(BaseModel):
@@ -401,7 +475,7 @@ class DailyMarketAnalysis(BaseModel):
     # 输入数据是否完整；过期或缺失数据会标记为 degraded。
     data_quality: Literal["complete", "degraded"] = "complete"
     # 生成该报告所使用的业务提示词版本。
-    prompt_version: str = "morning_analysis_v3"
+    prompt_version: str = "morning_analysis_v9"
     # 生成最终盘前结论的 LLM 模型名称。
     analysis_model: str = ""
     # 生成最终盘前结论时是否启用了模型深度思考。
@@ -420,6 +494,10 @@ class DailyMarketAnalysis(BaseModel):
     investment_ranking: List[SectorRankingItem] = Field(default_factory=list)
     # 传给 LLM 的新闻热度行业排名输入。
     heat_ranking: List[SectorRankingItem] = Field(default_factory=list)
+    # 四个独立来源研究模块生成的详细备忘录，便于审计总分析依据。
+    source_analysis_memos: Dict[str, str] = Field(default_factory=dict)
+    # 延续与反转两个独立情景模块的详细论证，便于审计最终裁决。
+    scenario_analysis_memos: Dict[str, str] = Field(default_factory=dict)
     # LLM 生成并通过业务规则校验的最终分析结果。
     analysis: MorningAnalysisResult
     # 报告首次创建时间，使用北京时间。
