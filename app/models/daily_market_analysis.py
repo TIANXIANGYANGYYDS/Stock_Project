@@ -233,8 +233,8 @@ class CreatorRankingContext(BaseModel):
     rolling_score: float = Field(ge=0, le=100)
     # 前一交易日新到期观点得分；当日没有有效新样本时允许为空。
     daily_score: Optional[float] = Field(default=None, ge=0, le=100)
-    # 实际参与滚动分计算的历史有效观点数量。
-    sample_count: int = Field(ge=1, le=20)
+    # 实际参与滚动分计算的历史有效观点数量；累计样本不设人为上限。
+    sample_count: int = Field(ge=1)
 
 
 class CreatorWorkContext(BaseModel):

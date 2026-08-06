@@ -211,6 +211,19 @@ def test_creator_context_rejects_work_outside_ranked_top_five() -> None:
         )
 
 
+def test_creator_ranking_context_accepts_unbounded_sample_count() -> None:
+    ranking = CreatorRankingContext(
+        creator_id="creator-1",
+        creator_name="测试博主",
+        rank=1,
+        rolling_score=80,
+        daily_score=80,
+        sample_count=34,
+    )
+
+    assert ranking.sample_count == 34
+
+
 @pytest.mark.parametrize(
     "verdict",
     [
