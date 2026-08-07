@@ -5,6 +5,7 @@ import logging
 import signal
 from datetime import datetime
 
+from apscheduler.jobstores.mongodb import MongoDBJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from app.core.config import get_settings
@@ -25,6 +26,8 @@ from app.scheduler.news_ranking_jobs import (
 logger = logging.getLogger(__name__)
 
 JOB_ID = "crawl_news_job"
+# APScheduler 任务定义与 next_run_time 的持久化集合；业务数据仍写入各自集合。
+SCHEDULER_JOBSTORE_COLLECTION = "apscheduler_jobs"
 
 
 def configure_logging() -> None:
@@ -50,14 +53,25 @@ def build_scheduler() -> AsyncIOScheduler:
     """创建调度器并注册新闻、博主采集和盘前分析的全部周期任务。
 
     博主采集、内容提取、观点分析和评分统一由 creator monitoring 链路负责；
-    返回尚未启动的调度器，供主循环安装信号处理后统一管理生命周期。
+    任务定义和下一次触发时间写入 MongoDB job store，返回尚未启动的调度器，
+    供主循环安装信号处理后统一管理生命周期。
     """
-    scheduler = AsyncIOScheduler()
+    settings = get_settings()
+    scheduler = AsyncIOScheduler(
+        jobstores={
+            "default": MongoDBJobStore(
+                host=settings.mongo_uri,
+                database=settings.mongo_db_name,
+                collection=SCHEDULER_JOBSTORE_COLLECTION,
+            )
+        }
+    )
     job = scheduler.add_job(
         crawl_news_job,
         trigger="interval",
         minutes=3,
         id=JOB_ID,
+        replace_existing=True,
         max_instances=1,
         coalesce=True,
         misfire_grace_time=60,

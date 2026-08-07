@@ -725,6 +725,7 @@ MA5 / MA10 / MA20 / MA60
 ```text
 新闻榜单：默认每 5 分钟独立刷新一次
 盘前分析：每个交易日 8:20
+盘前补偿：调度器启动后检查当日缺失报告，并在 8:40、8:55 对缺失报告重试
 ```
 
 ### 流程
@@ -769,6 +770,10 @@ python -m app.scheduler.morning_analysis_jobs --date 2026-07-23
 15 分钟标记陈旧；博主作品从 `creator_works` 读取目标逻辑博主，并在盘前报告中只采用
 前一自然日发布且 08:20 前已完成分析的最多 3 个作品。常量放在对应的 crawler、service、
 scheduler 或 worker 模块中，并带有单位和用途注释。
+
+调度器重启不会直接恢复已经中断的 LLM 协程，因此启动时会对当前交易日执行一次
+幂等缺失检查：只有已经过 08:20 且 `daily_market_analysis` 尚无当日报告时才按
+08:20 的数据截止点补跑；报告已存在时跳过，避免重启造成重复分析。
 
 盘前分析、博主单作品内容分析和收盘观点验证均使用代码中的 `QwenAnalysisLLM` 基础
 配置：模型为 `qwen3.7-max`，并默认携带 `enable_thinking=true`。博主流程中的
@@ -1412,6 +1417,11 @@ Scheduler 每小时整点按账号顺序串行采集抖音/B站/微博/公众号
 /home/txy/miniconda3/envs/MyAgent/bin/python \
   -m app.manually_execute_script.probe_creator_platforms
 ```
+
+APScheduler 的默认 job store 使用 MongoDB 集合 `apscheduler_jobs`，保存任务定义和
+下一次触发时间；正在执行的协程本身不作为可恢复 checkpoint 保存。调度器重启后会从
+该集合恢复定时任务，盘前分析另有当日缺失报告补偿逻辑。启动脚本以追加方式写入
+`.local/logs/scheduler.log`，并只用本次启动产生的日志判断启动是否成功。
 
 该探针默认串行检查每个平台排名最高的一个账号，单账号仅取 1 条列表数据；传入
 `--detail` 时，列表受阻的抖音账号会额外校验配置中的种子作品详情，但不会把该校验

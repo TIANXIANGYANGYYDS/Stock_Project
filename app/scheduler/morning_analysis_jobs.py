@@ -4,15 +4,42 @@ import argparse
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 
 logger = logging.getLogger(__name__)
 # APScheduler 中用于幂等替换盘前分析任务的稳定 ID。
 MORNING_ANALYSIS_JOB_ID = "morning_market_analysis"
+MORNING_ANALYSIS_RETRY_JOB_ID = "morning_market_analysis_retry"
+MORNING_ANALYSIS_STARTUP_JOB_ID = "morning_market_analysis_startup_catchup"
+# 08:20 首次执行失败时，在早盘仍可用的两个时间点补偿一次。
+MORNING_ANALYSIS_RETRY_MINUTES = "40,55"
+CN_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
+_morning_analysis_lock: asyncio.Lock | None = None
+
+
+def _get_morning_analysis_lock() -> asyncio.Lock:
+    """Return the process-local lock shared by scheduled and catch-up runs."""
+
+    global _morning_analysis_lock
+
+    if _morning_analysis_lock is None:
+        _morning_analysis_lock = asyncio.Lock()
+    return _morning_analysis_lock
+
+
+def _normalize_datetime(value: datetime | None) -> datetime:
+    """Normalize an optional reference time to the project's China timezone."""
+
+    if value is None:
+        return datetime.now(CN_TZ)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=CN_TZ)
+    return value.astimezone(CN_TZ)
 
 
 async def _run_morning_analysis(
@@ -44,6 +71,72 @@ async def _run_morning_analysis(
     )
 
 
+async def _run_morning_analysis_if_missing(
+    *,
+    reference_datetime: datetime | None = None,
+    job_name: str,
+) -> Any:
+    """Run a current-day catch-up only when its report is not already persisted."""
+
+    from app.repositories.daily_market_analysis_repository import (
+        DailyMarketAnalysisRepository,
+    )
+    from app.services.morning_analysis_policy import (
+        MORNING_ANALYSIS_HOUR,
+        MORNING_ANALYSIS_MINUTE,
+    )
+    from app.services.trading_calendar_service import resolve_morning_trade_dates
+
+    reference = _normalize_datetime(reference_datetime)
+    cutoff = reference.replace(
+        hour=MORNING_ANALYSIS_HOUR,
+        minute=MORNING_ANALYSIS_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    if reference < cutoff:
+        logger.info("%s skipped reason=before_cutoff", job_name)
+        return None
+
+    decision = resolve_morning_trade_dates(reference.date())
+    if not decision.is_current_trade_day:
+        logger.info(
+            "%s skipped reason=non_trading_day reference_date=%s",
+            job_name,
+            decision.reference_date,
+        )
+        return None
+
+    repository = DailyMarketAnalysisRepository()
+    if await repository.exists({"analysis_date": decision.analysis_date}):
+        logger.info(
+            "%s skipped reason=report_exists analysis_date=%s",
+            job_name,
+            decision.analysis_date,
+        )
+        return None
+
+    return await _run_morning_analysis(reference_datetime=reference)
+
+
+async def _run_morning_analysis_job(
+    *,
+    job_name: str,
+    only_if_missing: bool,
+) -> Any:
+    """Serialize all production entry points and preserve their failure signal."""
+
+    lock = _get_morning_analysis_lock()
+    if lock.locked():
+        logger.warning("%s skipped reason=job_already_running", job_name)
+        return None
+
+    async with lock:
+        if only_if_missing:
+            return await _run_morning_analysis_if_missing(job_name=job_name)
+        return await _run_morning_analysis()
+
+
 async def morning_analysis_job() -> None:
     """
     APScheduler 的盘前分析任务入口，记录跳过、成功或失败状态。
@@ -53,7 +146,12 @@ async def morning_analysis_job() -> None:
     """
     logger.info("morning_analysis_job start")
     try:
-        result = await _run_morning_analysis()
+        result = await _run_morning_analysis_job(
+            job_name="morning_analysis_job",
+            only_if_missing=False,
+        )
+        if result is None:
+            return
         if result.skipped:
             logger.info("morning_analysis_job skipped: %s", result.reason)
         else:
@@ -66,6 +164,48 @@ async def morning_analysis_job() -> None:
         raise
     finally:
         logger.info("morning_analysis_job finished")
+
+
+async def morning_analysis_retry_job() -> None:
+    """Retry a missing current-day report after a transient 08:20 failure."""
+
+    logger.info("morning_analysis_retry_job start")
+    try:
+        result = await _run_morning_analysis_job(
+            job_name="morning_analysis_retry_job",
+            only_if_missing=True,
+        )
+        if result is not None and not result.skipped:
+            logger.info(
+                "morning_analysis_retry_job completed analysis_date=%s",
+                result.report.analysis_date,
+            )
+    except Exception:
+        logger.exception("morning_analysis_retry_job failed")
+        raise
+    finally:
+        logger.info("morning_analysis_retry_job finished")
+
+
+async def morning_analysis_startup_catchup_job() -> None:
+    """Recover a missed current-day report after a scheduler restart."""
+
+    logger.info("morning_analysis_startup_catchup_job start")
+    try:
+        result = await _run_morning_analysis_job(
+            job_name="morning_analysis_startup_catchup_job",
+            only_if_missing=True,
+        )
+        if result is not None and not result.skipped:
+            logger.info(
+                "morning_analysis_startup_catchup_job completed analysis_date=%s",
+                result.report.analysis_date,
+            )
+    except Exception:
+        logger.exception("morning_analysis_startup_catchup_job failed")
+        raise
+    finally:
+        logger.info("morning_analysis_startup_catchup_job finished")
 
 
 def register_morning_analysis_job(scheduler: AsyncIOScheduler) -> None:
@@ -96,6 +236,38 @@ def register_morning_analysis_job(scheduler: AsyncIOScheduler) -> None:
         misfire_grace_time=30 * 60,
     )
     logger.info("registered job id=%s", job.id)
+
+    retry_job = scheduler.add_job(
+        morning_analysis_retry_job,
+        trigger=CronTrigger(
+            hour=MORNING_ANALYSIS_HOUR,
+            minute=MORNING_ANALYSIS_RETRY_MINUTES,
+            day_of_week="mon-fri",
+            timezone="Asia/Shanghai",
+        ),
+        id=MORNING_ANALYSIS_RETRY_JOB_ID,
+        name="补偿重试盘前市场分析",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=30 * 60,
+    )
+    logger.info("registered job id=%s", retry_job.id)
+
+    startup_job = scheduler.add_job(
+        morning_analysis_startup_catchup_job,
+        trigger=DateTrigger(
+            run_date=datetime.now(CN_TZ),
+            timezone="Asia/Shanghai",
+        ),
+        id=MORNING_ANALYSIS_STARTUP_JOB_ID,
+        name="启动补偿盘前市场分析",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
+    logger.info("registered job id=%s", startup_job.id)
 
 
 if __name__ == "__main__":

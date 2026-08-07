@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -18,6 +18,7 @@ CN_TZ = timezone(timedelta(hours=8))
 _indexes_ready = False
 _indexes_lock: Optional[asyncio.Lock] = None
 _stock_daily_job_lock: Optional[asyncio.Lock] = None
+_realtime_minute_job_lock: Optional[asyncio.Lock] = None
 
 
 def _get_indexes_lock() -> asyncio.Lock:
@@ -51,6 +52,67 @@ def _get_stock_daily_job_lock() -> asyncio.Lock:
     if _stock_daily_job_lock is None:
         _stock_daily_job_lock = asyncio.Lock()
     return _stock_daily_job_lock
+
+
+def _get_realtime_minute_job_lock() -> asyncio.Lock:
+    """Return the process-local lock shared by the two market sessions."""
+
+    global _realtime_minute_job_lock
+
+    if _realtime_minute_job_lock is None:
+        _realtime_minute_job_lock = asyncio.Lock()
+    return _realtime_minute_job_lock
+
+
+async def realtime_minute_session_job(*, session: str) -> None:
+    """Run one real-time market session without overlapping another session."""
+
+    lock = _get_realtime_minute_job_lock()
+    if lock.locked():
+        logger.warning(
+            "realtime_minute_session_skipped session=%s reason=job_already_running",
+            session,
+        )
+        return
+
+    from app.services.realtime_minute_service import RealtimeMinuteService
+
+    async with lock:
+        service = RealtimeMinuteService()
+        try:
+            await service.run_session(session)
+        except Exception:
+            logger.exception("realtime_minute_session_failed session=%s", session)
+        finally:
+            await service.close()
+
+
+async def resume_realtime_minute_job() -> None:
+    """Resume the active market session after a scheduler restart."""
+
+    from app.services.realtime_minute_service import (
+        SESSION_CLOCK_SKEW_GRACE_SECONDS,
+        SESSION_HARD_STOP_GRACE_SECONDS,
+    )
+
+    now = datetime.now(CN_TZ)
+    morning_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    morning_deadline = now.replace(hour=11, minute=30, second=0, microsecond=0) + timedelta(
+        seconds=SESSION_HARD_STOP_GRACE_SECONDS
+    )
+    afternoon_start = now.replace(hour=13, minute=0, second=0, microsecond=0)
+    afternoon_deadline = now.replace(hour=15, minute=0, second=0, microsecond=0) + timedelta(
+        seconds=SESSION_HARD_STOP_GRACE_SECONDS
+    )
+    early_grace = timedelta(seconds=SESSION_CLOCK_SKEW_GRACE_SECONDS)
+    if morning_start - early_grace <= now < morning_deadline:
+        session = "morning"
+    elif afternoon_start - early_grace <= now < afternoon_deadline:
+        session = "afternoon"
+    else:
+        logger.info("realtime_minute_resume_skipped reason=outside_trading_window")
+        return
+    await realtime_minute_session_job(session=session)
 
 
 async def ensure_news_indexes() -> None:
@@ -543,6 +605,48 @@ def register_stock_daily_detail_job(
         logger.info("registered job id=%s", compensation_job.id)
 
 
+def register_realtime_minute_jobs(scheduler: AsyncIOScheduler) -> None:
+    """Register the two A-share continuous snapshot sessions.
+
+    APScheduler starts at 09:30 and 13:00 Beijing time.  The service uses the
+    source-clock estimate and keeps a bounded post-close stabilization window.
+    """
+
+    for session, hour, minute in (("morning", 9, 30), ("afternoon", 13, 0)):
+        job = scheduler.add_job(
+            realtime_minute_session_job,
+            trigger=CronTrigger(
+                day_of_week="mon-fri",
+                hour=hour,
+                minute=minute,
+                timezone="Asia/Shanghai",
+            ),
+            kwargs={"session": session},
+            id=f"realtime_minute_{session}",
+            name=f"全市场实时分钟行情-{session}",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=60,
+        )
+        logger.info("registered job id=%s", job.id)
+
+    startup_job = scheduler.add_job(
+        resume_realtime_minute_job,
+        trigger=DateTrigger(
+            run_date=datetime.now(CN_TZ),
+            timezone="Asia/Shanghai",
+        ),
+        id="realtime_minute_startup_resume",
+        name="启动恢复全市场实时分钟行情",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60,
+    )
+    logger.info("registered job id=%s", startup_job.id)
+
+
 def register_crawler_jobs(
     scheduler: AsyncIOScheduler,
 ) -> None:
@@ -560,3 +664,4 @@ def register_crawler_jobs(
     """
 
     register_stock_daily_detail_job(scheduler)
+    register_realtime_minute_jobs(scheduler)
