@@ -42,6 +42,8 @@ def matches(document: dict[str, Any], filters: dict[str, Any]) -> bool:
                 values = actual if isinstance(actual, list) else [actual]
                 if not any(pattern.search(str(item or "")) for item in values):
                     return False
+            if "$in" in expected and actual not in expected["$in"]:
+                return False
             if "$gte" in expected and (actual is None or actual < expected["$gte"]):
                 return False
             if "$lte" in expected and (actual is None or actual > expected["$lte"]):
@@ -249,6 +251,40 @@ def sample_database() -> FakeDatabase:
                     {"code": "000001", "name": "平安银行", "trade_date": "2026-08-05", "trade_date_int": 20260805, "adjust": "qfq", "close": 10, "pct_chg": 1.2},
                     {"code": "000001", "name": "平安银行", "trade_date": "2026-08-04", "trade_date_int": 20260804, "adjust": "qfq", "close": 9, "pct_chg": -1.0},
                     {"code": "000002", "name": "万科A", "trade_date": "2026-08-05", "trade_date_int": 20260805, "adjust": "qfq", "close": 8, "pct_chg": -2.0},
+                ]
+            ),
+            "stock_realtime_minute_bars": FakeCollection(
+                [
+                    {
+                        "code": "600519",
+                        "name": "贵州茅台",
+                        "market": "SH",
+                        "trade_date": "2026-08-05",
+                        "interval": "1m",
+                        "timestamp": "2026-08-05T14:59:00+08:00",
+                        "open": 1308.0,
+                        "high": 1310.0,
+                        "low": 1307.0,
+                        "close": 1309.22,
+                        "volume": 1000.0,
+                        "amount": 1309220.0,
+                        "provider": "TENCENT",
+                    },
+                    {
+                        "code": "000001",
+                        "name": "平安银行",
+                        "market": "SZ",
+                        "trade_date": "2026-08-05",
+                        "interval": "1m",
+                        "timestamp": "2026-08-05T14:59:00+08:00",
+                        "open": 11.2,
+                        "high": 11.2,
+                        "low": 11.18,
+                        "close": 11.19,
+                        "volume": 2000.0,
+                        "amount": 22380.0,
+                        "provider": "TENCENT",
+                    },
                 ]
             ),
             "creator_works": FakeCollection(

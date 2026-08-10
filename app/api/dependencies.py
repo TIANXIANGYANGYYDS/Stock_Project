@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from fastapi import HTTPException, Query, Request
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
+from app.services.realtime_index_service import RealtimeIndexService
+
 
 @dataclass(frozen=True)
 class Pagination:
@@ -30,3 +32,10 @@ def get_db(request: Request) -> AsyncIOMotorDatabase:
     if database is None:
         raise HTTPException(status_code=503, detail="MongoDB 不可用")
     return database
+
+
+def get_realtime_index_service(request: Request) -> RealtimeIndexService:
+    service = getattr(request.app.state, "realtime_index_service", None)
+    if service is None:
+        raise HTTPException(status_code=503, detail="实时指数服务不可用")
+    return service

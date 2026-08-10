@@ -35,6 +35,10 @@ API 使用 `.local/env/.env` 中的 `MONGO_URI` 和 `MONGO_DB_NAME`。服务生�
 | `GET /api/v1/morning-analyses` | `daily_market_analysis` | 报告列表；支持 `start_date`、`end_date`、`data_quality` |
 | `GET /api/v1/morning-analyses/latest` | `daily_market_analysis` | 最新完整报告 |
 | `GET /api/v1/morning-analyses/{analysis_date}` | `daily_market_analysis` | 指定日期完整报告 |
+| `GET /api/v1/market/latest-trade-date` | `stock_daily_detail` | 返回 `qfq` 行情的最新交易日；空库时返回 `null` |
+| `GET /api/v1/market/indices/realtime` | 腾讯/Sina 公共行情 + 进程内缓存 | 顶部五个大盘指数；交易时段每次请求实时获取，闭市展示最后缓存 |
+| `GET /api/v1/stocks/realtime?codes=600519,000001` | `stock_realtime_minute_bars` | 批量读取现有个股实时行情；支持 `interval=1m/5m/15m/30m/60m/120m` |
+| `GET /api/v1/stocks/{code}/realtime` | `stock_realtime_minute_bars` | 读取单只个股最新一条现有实时行情，不触发新的行情抓取 |
 | `GET /api/v1/stocks` | `stock_daily_detail` | 聚合每只股票最新一条日线；支持 `keyword`、`adjust` |
 | `GET /api/v1/stocks/{code}/daily` | `stock_daily_detail` | 单只股票日线分页；支持日期范围和 `adjust` |
 | `GET /api/v1/stocks/{code}/daily/{trade_date}` | `stock_daily_detail` | 单只股票单日完整详情 |
@@ -53,6 +57,10 @@ API 使用 `.local/env/.env` 中的 `MONGO_URI` 和 `MONGO_DB_NAME`。服务生�
 
 ```bash
 curl 'http://127.0.0.1:8100/api/v1/health'
+curl 'http://127.0.0.1:8100/api/v1/market/latest-trade-date'
+curl 'http://127.0.0.1:8100/api/v1/market/indices/realtime'
+curl 'http://127.0.0.1:8100/api/v1/stocks/realtime?codes=600519,000001'
+curl 'http://127.0.0.1:8100/api/v1/stocks/600519/realtime'
 curl 'http://127.0.0.1:8100/api/v1/news?page=1&page_size=20&source=cls'
 curl 'http://127.0.0.1:8100/api/v1/morning-analyses/2026-08-05'
 curl 'http://127.0.0.1:8100/api/v1/stocks/002185/daily?start_date=2026-01-01'

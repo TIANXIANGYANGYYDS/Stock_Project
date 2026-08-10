@@ -15,6 +15,18 @@ from app.api.serializers import serialize_document
 router = APIRouter(tags=["stocks"])
 
 
+@router.get("/api/v1/market/latest-trade-date")
+async def get_latest_trade_date(
+    db: AsyncIOMotorDatabase = Depends(get_db),
+) -> dict[str, Any]:
+    row = await db["stock_daily_detail"].find_one(
+        {"adjust": "qfq"},
+        projection={"_id": 0, "trade_date": 1},
+        sort=[("trade_date", -1)],
+    )
+    return {"data": {"latest_trade_date": (row or {}).get("trade_date")}}
+
+
 @router.get("/api/v1/stocks")
 async def list_stocks(
     pagination: Pagination = Depends(get_pagination),

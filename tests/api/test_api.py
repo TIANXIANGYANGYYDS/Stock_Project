@@ -3,7 +3,10 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from app.api.app import create_app
-from app.api.dependencies import get_db
+from app.api.dependencies import (
+    get_db,
+    get_realtime_index_service,
+)
 from app.api.serializers import serialize_mongo_value
 from tests.api.conftest import sample_database
 
@@ -60,6 +63,55 @@ def test_stocks_and_sort_whitelist():
         market = client.get("/api/v1/stock-daily/2026-08-05?sort_by=pct_chg&sort_order=desc").json()
         assert market["items"][0]["code"] == "000001"
         assert client.get("/api/v1/stock-daily/2026-08-05?sort_by=bad").status_code == 422
+
+
+def test_latest_trade_date_and_empty_database():
+    database = sample_database()
+    with make_client(database) as client:
+        response = client.get("/api/v1/market/latest-trade-date")
+        assert response.status_code == 200
+        assert response.json() == {
+            "data": {"latest_trade_date": "2026-08-05"}
+        }
+
+    database["stock_daily_detail"].rows = []
+    with make_client(database) as client:
+        response = client.get("/api/v1/market/latest-trade-date")
+        assert response.status_code == 200
+        assert response.json() == {"data": {"latest_trade_date": None}}
+
+
+def test_realtime_indices_endpoint_uses_index_service() -> None:
+    class FakeIndexService:
+        async def fetch_latest(self):
+            return {"market_status": "open", "items": [{"symbol": "000001.SH"}]}
+
+    app = create_app()
+    app.dependency_overrides[get_db] = lambda: sample_database()
+    app.dependency_overrides[get_realtime_index_service] = lambda: FakeIndexService()
+    with TestClient(app) as client:
+        response = client.get("/api/v1/market/indices/realtime")
+    assert response.status_code == 200
+    assert response.json() == {
+        "data": {"market_status": "open", "items": [{"symbol": "000001.SH"}]}
+    }
+
+
+def test_realtime_stock_endpoints_read_existing_minute_bars() -> None:
+    with make_client() as client:
+        batch = client.get("/api/v1/stocks/realtime?codes=600519,000001")
+        single = client.get("/api/v1/stocks/600519/realtime")
+        missing = client.get("/api/v1/stocks/000002/realtime")
+        invalid = client.get("/api/v1/stocks/realtime?codes=not-a-code")
+    assert batch.status_code == 200
+    assert single.status_code == 200
+    assert missing.status_code == 404
+    assert invalid.status_code == 422
+    assert [item["code"] for item in batch.json()["data"]["items"]] == [
+        "600519",
+        "000001",
+    ]
+    assert single.json()["data"]["items"][0]["close"] == 1309.22
 
 
 def test_creator_accounts_works_and_opinions():

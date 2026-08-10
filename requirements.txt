@@ -23,5 +23,6 @@ pytest
 
 # Optional dependencies for manual A-share sector scripts
 akshare
+baostock
 html5lib
 lxml

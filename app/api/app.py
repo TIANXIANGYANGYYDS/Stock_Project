@@ -9,8 +9,9 @@ from fastapi.responses import JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError
 
-from app.api.routers import creators, health, morning_analysis, news, rankings, stats, stocks
+from app.api.routers import creators, health, market, morning_analysis, news, rankings, stats, stocks
 from app.core.config import get_settings
+from app.services.realtime_index_service import RealtimeIndexService
 
 
 logger = logging.getLogger(__name__)
@@ -24,9 +25,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     client = AsyncIOMotorClient(settings.mongo_uri)
     app.state.mongo_client = client
     app.state.db = client[settings.mongo_db_name]
+    index_service = RealtimeIndexService()
+    app.state.realtime_index_service = index_service
     try:
         yield
     finally:
+        await index_service.close()
         client.close()
 
 
@@ -44,7 +48,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Stock Project Query API",
         version="1.0.0",
-        description="只读查询 MongoDB 中已持久化的新闻、行情和分析数据。",
+        description="查询 MongoDB 业务数据和实时大盘指数行情。",
         lifespan=lifespan,
     )
     app.add_exception_handler(PyMongoError, _mongo_error_handler)
@@ -53,6 +57,7 @@ def create_app() -> FastAPI:
     app.include_router(news.router)
     app.include_router(rankings.router)
     app.include_router(morning_analysis.router)
+    app.include_router(market.router)
     app.include_router(stocks.router)
     app.include_router(creators.router)
     app.include_router(stats.router)
