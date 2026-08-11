@@ -1,13 +1,18 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
-from app.api.dependencies import get_db, get_realtime_index_service
+from app.api.dependencies import (
+    get_db,
+    get_realtime_index_service,
+    get_realtime_stock_crawler,
+)
 from app.api.serializers import serialize_document
+from app.crawlers.realtime_market_crawler import RealtimeMarketCrawler, RealtimeQuote
 from app.services.realtime_index_service import (
     CN_TZ,
     RealtimeIndexService,
@@ -30,45 +35,44 @@ def _normalize_codes(codes: list[str]) -> list[str]:
     return normalized
 
 
-async def _latest_stock_bars(
-    db: AsyncIOMotorDatabase,
-    codes: list[str],
-    interval: RealtimeInterval,
-) -> list[dict[str, Any]]:
-    pipeline: list[dict[str, Any]] = [
-        {"$match": {"code": {"$in": codes}, "interval": interval}},
-        {"$sort": {"timestamp": -1}},
-        {"$group": {"_id": "$code", "latest": {"$first": "$$ROOT"}}},
-        {"$replaceRoot": {"newRoot": "$latest"}},
-    ]
-    rows = await db["stock_realtime_minute_bars"].aggregate(pipeline).to_list(
-        length=None
-    )
-    rows_by_code = {str(row.get("code")): row for row in rows}
-    return [rows_by_code[code] for code in codes if code in rows_by_code]
+def _quote_item(quote: RealtimeQuote) -> dict[str, Any]:
+    return {
+        "code": quote.code,
+        "name": quote.name,
+        "market": quote.market,
+        "price": quote.price,
+        "volume": quote.volume,
+        "amount": quote.amount,
+        "source_time": quote.market_data_time.isoformat()
+        if quote.market_data_time
+        else None,
+        "received_at": quote.received_at.isoformat(),
+        "provider": quote.provider.lower(),
+    }
 
 
-def _stock_response(
-    rows: list[dict[str, Any]],
+def _quote_response(
+    quotes: list[RealtimeQuote],
     requested_codes: list[str],
-    interval: RealtimeInterval,
 ) -> dict[str, Any]:
-    items = [serialize_document(row) for row in rows]
-    trading_dates = [str(item.get("trade_date")) for item in items if item.get("trade_date")]
-    trading_date = max(trading_dates) if trading_dates else None
+    quotes_by_code = {quote.code: quote for quote in quotes}
+    ordered_quotes = [quotes_by_code[code] for code in requested_codes if code in quotes_by_code]
+    source_dates = [
+        quote.market_data_time.astimezone(CN_TZ).date().isoformat()
+        for quote in ordered_quotes
+        if quote.market_data_time
+    ]
     now = datetime.now(CN_TZ)
-    market_status = (
-        "open"
-        if trading_date == now.date().isoformat() and is_market_session_open(now)
-        else "closed"
-    )
-    returned_codes = {str(item.get("code")) for item in items}
+    trading_date = max(source_dates) if source_dates else None
     return {
         "trading_date": trading_date,
-        "market_status": market_status,
-        "interval": interval,
-        "items": items,
-        "missing_codes": [code for code in requested_codes if code not in returned_codes],
+        "market_status": (
+            "open"
+            if trading_date == now.date().isoformat() and is_market_session_open(now)
+            else "closed"
+        ),
+        "items": [_quote_item(quote) for quote in ordered_quotes],
+        "missing_codes": [code for code in requested_codes if code not in quotes_by_code],
     }
 
 
@@ -85,28 +89,60 @@ async def get_realtime_indices(
 @router.get("/api/v1/stocks/realtime")
 async def get_realtime_stocks(
     codes: str = Query(..., description="逗号分隔的六位股票代码，最多 200 只"),
-    interval: RealtimeInterval = Query(default="1m"),
-    db: AsyncIOMotorDatabase = Depends(get_db),
+    crawler: RealtimeMarketCrawler = Depends(get_realtime_stock_crawler),
 ) -> dict[str, Any]:
     try:
         normalized = _normalize_codes(codes.split(","))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    rows = await _latest_stock_bars(db, normalized, interval)
-    return {"data": _stock_response(rows, normalized, interval)}
+    quotes, _ = await crawler.fetch_quotes(normalized)
+    if not quotes:
+        raise HTTPException(status_code=503, detail="实时股票行情暂不可用")
+    return {"data": _quote_response(quotes, normalized)}
+
+
+@router.get("/api/v1/stocks/{code}/intraday")
+async def get_stock_intraday(
+    code: str,
+    trade_date: date | None = Query(default=None),
+    interval: RealtimeInterval = Query(default="1m"),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+) -> dict[str, Any]:
+    try:
+        normalized = _normalize_codes([code])[0]
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    target_date = (trade_date or datetime.now(CN_TZ).date()).isoformat()
+    rows = await db["stock_realtime_minute_bars"].find(
+        {
+            "code": normalized,
+            "trade_date": target_date,
+            "interval": interval,
+        }
+    ).sort([("timestamp", 1)]).to_list(length=None)
+    items = [serialize_document(row) for row in rows]
+    return {
+        "data": {
+            "code": normalized,
+            "name": items[0].get("name") if items else None,
+            "trade_date": target_date,
+            "interval": interval,
+            "count": len(items),
+            "items": items,
+        }
+    }
 
 
 @router.get("/api/v1/stocks/{code}/realtime")
 async def get_realtime_stock(
     code: str,
-    interval: RealtimeInterval = Query(default="1m"),
-    db: AsyncIOMotorDatabase = Depends(get_db),
+    crawler: RealtimeMarketCrawler = Depends(get_realtime_stock_crawler),
 ) -> dict[str, Any]:
     try:
         normalized = _normalize_codes([code])
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    rows = await _latest_stock_bars(db, normalized, interval)
-    if not rows:
-        raise HTTPException(status_code=404, detail="没有找到对应股票实时行情")
-    return {"data": _stock_response(rows, normalized, interval)}
+    quotes, _ = await crawler.fetch_quotes(normalized)
+    if not quotes:
+        raise HTTPException(status_code=503, detail="实时股票行情暂不可用")
+    return {"data": _quote_response(quotes, normalized)}

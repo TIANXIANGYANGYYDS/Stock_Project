@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from fastapi import HTTPException, Query, Request
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
+from app.crawlers.realtime_market_crawler import RealtimeMarketCrawler
 from app.services.realtime_index_service import RealtimeIndexService
 
 
@@ -39,3 +40,10 @@ def get_realtime_index_service(request: Request) -> RealtimeIndexService:
     if service is None:
         raise HTTPException(status_code=503, detail="实时指数服务不可用")
     return service
+
+
+def get_realtime_stock_crawler(request: Request) -> RealtimeMarketCrawler:
+    crawler = getattr(request.app.state, "realtime_stock_crawler", None)
+    if crawler is None:
+        raise HTTPException(status_code=503, detail="实时股票服务不可用")
+    return crawler

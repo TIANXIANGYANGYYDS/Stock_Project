@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from fastapi.testclient import TestClient
 
 from app.api.app import create_app
 from app.api.dependencies import (
     get_db,
     get_realtime_index_service,
+    get_realtime_stock_crawler,
 )
 from app.api.serializers import serialize_mongo_value
+from app.crawlers.realtime_market_crawler import RealtimeQuote
 from tests.api.conftest import sample_database
 
 
@@ -67,18 +71,33 @@ def test_stocks_and_sort_whitelist():
 
 def test_latest_trade_date_and_empty_database():
     database = sample_database()
+    database["daily_market_analysis"].rows.append(
+        {
+            "analysis_date": "2026-08-06",
+            "status": "completed",
+            "analysis": {"mainlines": []},
+        }
+    )
     with make_client(database) as client:
         response = client.get("/api/v1/market/latest-trade-date")
         assert response.status_code == 200
         assert response.json() == {
-            "data": {"latest_trade_date": "2026-08-05"}
+            "data": {
+                "latest_trade_date": "2026-08-05",
+                "latest_analysis_date": "2026-08-06",
+            }
         }
 
     database["stock_daily_detail"].rows = []
     with make_client(database) as client:
         response = client.get("/api/v1/market/latest-trade-date")
         assert response.status_code == 200
-        assert response.json() == {"data": {"latest_trade_date": None}}
+        assert response.json() == {
+            "data": {
+                "latest_trade_date": None,
+                "latest_analysis_date": "2026-08-06",
+            }
+        }
 
 
 def test_realtime_indices_endpoint_uses_index_service() -> None:
@@ -97,21 +116,63 @@ def test_realtime_indices_endpoint_uses_index_service() -> None:
     }
 
 
-def test_realtime_stock_endpoints_read_existing_minute_bars() -> None:
+def test_stock_intraday_returns_all_bars_in_time_order() -> None:
     with make_client() as client:
+        response = client.get(
+            "/api/v1/stocks/600519/intraday?trade_date=2026-08-05&interval=1m"
+        )
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["count"] == 2
+    assert [item["timestamp"] for item in data["items"]] == [
+        "2026-08-05T09:30:00+08:00",
+        "2026-08-05T14:59:00+08:00",
+    ]
+
+
+def test_realtime_stock_endpoints_use_existing_crawler() -> None:
+    cn_tz = timezone(timedelta(hours=8))
+
+    class FakeStockCrawler:
+        def __init__(self) -> None:
+            self.calls = []
+
+        async def fetch_quotes(self, codes):
+            self.calls.append(list(codes))
+            now = datetime(2026, 8, 11, 10, 0, tzinfo=cn_tz)
+            quotes = [
+                RealtimeQuote(
+                    code=code,
+                    name="贵州茅台" if code == "600519" else "平安银行",
+                    market="SH" if code.startswith("6") else "SZ",
+                    provider="TENCENT",
+                    price=1346.48 if code == "600519" else 11.29,
+                    volume=1000.0,
+                    amount=10000.0,
+                    market_data_time=now,
+                    received_at=now,
+                )
+                for code in codes
+            ]
+            return quotes, {"requested": len(codes), "returned": len(quotes)}
+
+    crawler = FakeStockCrawler()
+    app = create_app()
+    app.dependency_overrides[get_db] = lambda: sample_database()
+    app.dependency_overrides[get_realtime_stock_crawler] = lambda: crawler
+    with TestClient(app) as client:
         batch = client.get("/api/v1/stocks/realtime?codes=600519,000001")
         single = client.get("/api/v1/stocks/600519/realtime")
-        missing = client.get("/api/v1/stocks/000002/realtime")
         invalid = client.get("/api/v1/stocks/realtime?codes=not-a-code")
     assert batch.status_code == 200
     assert single.status_code == 200
-    assert missing.status_code == 404
     assert invalid.status_code == 422
     assert [item["code"] for item in batch.json()["data"]["items"]] == [
         "600519",
         "000001",
     ]
-    assert single.json()["data"]["items"][0]["close"] == 1309.22
+    assert single.json()["data"]["items"][0]["price"] == 1346.48
+    assert crawler.calls == [["600519", "000001"], ["600519"]]
 
 
 def test_creator_accounts_works_and_opinions():

@@ -19,12 +19,22 @@ router = APIRouter(tags=["stocks"])
 async def get_latest_trade_date(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ) -> dict[str, Any]:
-    row = await db["stock_daily_detail"].find_one(
+    stock_row = await db["stock_daily_detail"].find_one(
         {"adjust": "qfq"},
         projection={"_id": 0, "trade_date": 1},
         sort=[("trade_date", -1)],
     )
-    return {"data": {"latest_trade_date": (row or {}).get("trade_date")}}
+    analysis_row = await db["daily_market_analysis"].find_one(
+        {},
+        projection={"_id": 0, "analysis_date": 1},
+        sort=[("analysis_date", -1)],
+    )
+    return {
+        "data": {
+            "latest_trade_date": (stock_row or {}).get("trade_date"),
+            "latest_analysis_date": (analysis_row or {}).get("analysis_date"),
+        }
+    }
 
 
 @router.get("/api/v1/stocks")

@@ -10,6 +10,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError
 
 from app.api.routers import creators, health, market, morning_analysis, news, rankings, stats, stocks
+from app.crawlers.realtime_market_crawler import RealtimeMarketCrawler
 from app.core.config import get_settings
 from app.services.realtime_index_service import RealtimeIndexService
 
@@ -26,11 +27,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.mongo_client = client
     app.state.db = client[settings.mongo_db_name]
     index_service = RealtimeIndexService()
+    stock_crawler = RealtimeMarketCrawler()
     app.state.realtime_index_service = index_service
+    app.state.realtime_stock_crawler = stock_crawler
     try:
         yield
     finally:
         await index_service.close()
+        await stock_crawler.close()
         client.close()
 
 
@@ -48,7 +52,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="Stock Project Query API",
         version="1.0.0",
-        description="查询 MongoDB 业务数据和实时大盘指数行情。",
+        description="查询 MongoDB 业务数据和实时行情。",
         lifespan=lifespan,
     )
     app.add_exception_handler(PyMongoError, _mongo_error_handler)
