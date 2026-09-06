@@ -54,6 +54,8 @@ ROUTER_DATA_PATTERN = re.compile(
 )
 # 当前网页端账号作品列表接口。动态签名仍由平台校验，不能用捕获值替代。
 POST_LIST_URL = "https://www.douyin.com/aweme/v1/web/aweme/post/"
+# 当前网页端作品详情接口；移动分享页已不再稳定内嵌作品数据。
+WORK_DETAIL_URL = "https://www.douyin.com/aweme/v1/web/aweme/detail/"
 # 字节跳动统一匿名设备注册接口；返回的 ttwid 仅保存在进程内存中。
 TTWID_REGISTER_URL = "https://ttwid.bytedance.com/ttwid/union/register/"
 TTWID_REGISTER_PAYLOAD = {
@@ -660,16 +662,71 @@ class _DouyinPublicClient:
     async def _fetch_work_detail(self, work_id: str) -> _DouyinWorkDetail:
         """通过协议请求加载一条作品详情并执行统一身份校验。"""
 
-        url = self._share_url(work_id)
-        headers = {"User-Agent": MOBILE_USER_AGENT, "Referer": url}
+        self._require_authorized_session()
+        params = {
+            "device_platform": "webapp",
+            "aid": "6383",
+            "channel": "channel_pc_web",
+            "aweme_id": work_id,
+            "request_source": "600",
+            "origin_type": "video_page",
+            "update_version_code": "170400",
+            "pc_client_type": "1",
+            "pc_libra_divert": "Windows",
+            "support_h265": "1",
+            "support_dash": "1",
+            "cpu_core_num": "16",
+            "version_code": "290100",
+            "version_name": "29.1.0",
+            "cookie_enabled": "true",
+            "screen_width": "1920",
+            "screen_height": "1080",
+            "browser_language": "zh-CN",
+            "browser_platform": "Win32",
+            "browser_name": "Chrome",
+            "browser_version": "124.0.0.0",
+            "browser_online": "true",
+            "engine_name": "Blink",
+            "engine_version": "124.0.0.0",
+            "os_name": "Windows",
+            "os_version": "10",
+            "device_memory": "8",
+            "platform": "PC",
+            "downlink": "10",
+            "effective_type": "4g",
+            "round_trip_time": "100",
+        }
+        headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Referer": f"https://www.douyin.com/video/{work_id}",
+            "User-Agent": DESKTOP_USER_AGENT,
+        }
         try:
             async with curl_requests.AsyncSession(
                 impersonate="chrome124",
-                timeout=self.request_timeout_seconds,
+                timeout=self.protocol_timeout_seconds,
                 allow_redirects=True,
                 headers=headers,
-            ) as client:
-                response = await client.get(url)
+            ) as session:
+                ttwid = self._cookie_value(self.session_cookie, "ttwid")
+                if not ttwid:
+                    ttwid = await self._anonymous_ttwid(session)
+                ms_token = (
+                    self._cookie_value(self.session_cookie, "msToken")
+                    or await self._anonymous_ms_token(session)
+                )
+                cookie_header = self._merge_session_cookie(
+                    self.session_cookie,
+                    ttwid=ttwid,
+                    ms_token=ms_token,
+                )
+                params["msToken"] = ms_token
+                query = urlencode(params)
+                signature = self._signer.sign(query)
+                response = await session.get(
+                    f"{WORK_DETAIL_URL}?{query}&a_bogus={signature}",
+                    headers={"Cookie": cookie_header},
+                )
         except Exception as exc:
             raise DouyinCrawlerError(
                 f"抖音作品详情协议请求失败 work_id={work_id}"
@@ -681,14 +738,38 @@ class _DouyinPublicClient:
         if response.status_code < 200 or response.status_code >= 300:
             raise DouyinCrawlerError(f"抖音作品详情返回 HTTP {response.status_code}")
         try:
-            return self.parse_share_page(
-                response.text,
+            payload = response.json()
+            return self.parse_work_detail_payload(
+                payload,
                 account=self.account,
                 expected_work_id=work_id,
                 fetched_at=datetime.now(timezone.utc),
             )
         except Exception as exc:
             raise DouyinCrawlerError(f"抖音作品详情解析失败 work_id={work_id}") from exc
+
+    @classmethod
+    def parse_work_detail_payload(
+        cls,
+        payload: dict[str, Any],
+        *,
+        account: PlatformAccount,
+        expected_work_id: str,
+        fetched_at: datetime,
+    ) -> _DouyinWorkDetail:
+        """校验网页详情接口响应并规范化其中的作品。"""
+
+        if not isinstance(payload, dict) or payload.get("status_code") != 0:
+            raise DouyinCrawlerError("抖音作品详情接口返回失败状态")
+        item = payload.get("aweme_detail")
+        if not isinstance(item, dict):
+            raise DouyinCrawlerError("抖音作品详情接口缺少 aweme_detail")
+        return cls._parse_work_item(
+            item,
+            account=account,
+            expected_work_id=expected_work_id,
+            fetched_at=fetched_at,
+        )
 
     @classmethod
     def parse_post_list_payload(
@@ -766,7 +847,24 @@ class _DouyinPublicClient:
         items = [] if video_info is None else (video_info.get("item_list") or [])
         if not items or video_info.get("status_code") != 0:
             raise DouyinCrawlerError("抖音作品详情没有有效作品数据")
-        item = items[0]
+        return cls._parse_work_item(
+            items[0],
+            account=account,
+            expected_work_id=expected_work_id,
+            fetched_at=fetched_at,
+        )
+
+    @classmethod
+    def _parse_work_item(
+        cls,
+        item: dict[str, Any],
+        *,
+        account: PlatformAccount,
+        expected_work_id: str,
+        fetched_at: datetime,
+    ) -> _DouyinWorkDetail:
+        """校验并规范化详情接口或旧分享页中的单条作品。"""
+
         work_id = str(item.get("aweme_id") or "")
         author = item.get("author") or {}
         if work_id != expected_work_id:
@@ -968,7 +1066,8 @@ class DouyinPlatformCrawler:
             return await self._client(account).fetch_work(platform_work_id)
         except Exception as exc:
             raise PlatformCrawlerError(
-                f"douyin work fetch failed: {platform_work_id}"
+                f"douyin work fetch failed: {platform_work_id}: "
+                f"{str(exc) or exc.__class__.__name__}"
             ) from exc
 
     async def fetch_media(

@@ -130,3 +130,25 @@ def test_index_service_initializes_once_after_close() -> None:
         assert primary.calls == 1
 
     asyncio.run(run())
+
+
+def test_index_service_refreshes_closed_snapshot_on_next_calendar_day() -> None:
+    async def run() -> None:
+        wall_clock = FakeWallClock(datetime(2026, 8, 10, 16, 0, tzinfo=CN_TZ))
+        primary = FakeProvider("TENCENT")
+        service = RealtimeIndexService(
+            primary=primary,
+            backup=FakeProvider("SINA", fail=True),
+            wall_clock=wall_clock,
+        )
+        try:
+            first = await service.fetch_latest()
+            wall_clock.value = datetime(2026, 8, 11, 16, 0, tzinfo=CN_TZ)
+            second = await service.fetch_latest()
+        finally:
+            await service.close()
+
+        assert primary.calls == 2
+        assert second["updated_at"] != first["updated_at"]
+
+    asyncio.run(run())

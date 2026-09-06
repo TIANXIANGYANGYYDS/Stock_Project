@@ -14,6 +14,7 @@ from app.crawlers.creator_platforms.douyin import (
     DouyinCrawlerError,
     DouyinPlatformCrawler,
     _DouyinPublicClient,
+    ROUTER_DATA_PATTERN,
     parse_douyin_session_cookie_expiry,
 )
 from app.crawlers.creator_platforms.douyin_abogus import DouyinABogusSigner
@@ -122,6 +123,20 @@ def build_share_html(
     if nested:
         payload["loaderData"] = {"layout": {"nested": payload["loaderData"]}}
     return f"<html><script>window._ROUTER_DATA = {json.dumps(payload)};</script></html>"
+
+
+def build_work_detail_payload() -> dict[str, Any]:
+    """构造当前网页详情接口返回的一条完整作品。"""
+
+    router_data = json.loads(
+        ROUTER_DATA_PATTERN.search(build_share_html()).group(1)  # type: ignore[union-attr]
+    )
+    return {
+        "status_code": 0,
+        "aweme_detail": router_data["loaderData"]["video_(id)/page"][
+            "videoInfoRes"
+        ]["item_list"][0],
+    }
 
 
 class FakeProtocolResponse:
@@ -544,9 +559,11 @@ def test_platform_adapter_preserves_blocked_coverage() -> None:
 def test_protocol_detail_request_uses_curl_redirect_option(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """验证分享页详情也使用无浏览器的 curl_cffi 协议会话。"""
+    """验证网页详情接口使用无浏览器的 curl_cffi 协议会话并签名。"""
 
-    session = FakeProtocolSession(FakeProtocolResponse(text=build_share_html()))
+    session = FakeProtocolSession(
+        FakeProtocolResponse(payload=build_work_detail_payload())
+    )
     captured: dict[str, Any] = {}
 
     def session_factory(**kwargs: Any) -> FakeProtocolSession:
@@ -559,12 +576,32 @@ def test_protocol_detail_request_uses_curl_redirect_option(
     )
 
     work = asyncio.run(
-        _DouyinPublicClient(account=douyin_account()).fetch_work("7665718789363309172")
+        _DouyinPublicClient(
+            account=douyin_account(), session_cookie="sessionid=secret"
+        ).fetch_work("7665718789363309172")
     )
 
     assert work.platform_work_id == "7665718789363309172"
     assert captured["allow_redirects"] is True
-    assert session.get_calls[0][0].endswith("/share/video/7665718789363309172/")
+    assert "/aweme/v1/web/aweme/detail/?" in session.get_calls[0][0]
+    query = parse_qs(urlparse(session.get_calls[0][0]).query)
+    assert query["aweme_id"] == ["7665718789363309172"]
+    assert len(query["a_bogus"][0]) > 100
+
+
+def test_work_detail_payload_parser_validates_identity_and_extracts_media() -> None:
+    """验证当前详情接口的 aweme_detail 可转换为统一作品模型。"""
+
+    result = _DouyinPublicClient.parse_work_detail_payload(
+        build_work_detail_payload(),
+        account=douyin_account(),
+        expected_work_id="7665718789363309172",
+        fetched_at=datetime.now(timezone.utc),
+    )
+
+    assert result.work.platform_work_id == "7665718789363309172"
+    assert result.work.metadata["publish_ts"] == 1784814240
+    assert result.media_urls == ["https://example.com/video.mp4"]
 
 
 def test_share_page_parser_validates_identity_and_extracts_media() -> None:

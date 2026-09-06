@@ -200,8 +200,8 @@ def test_verify_work_skips_opinion_due_after_evaluation_day() -> None:
     assert verifier.calls == []
 
 
-def test_verify_work_rejects_work_not_published_on_previous_day() -> None:
-    """验证默认兼容模式不会处理来源窗口之外发布的作品。"""
+def test_verify_work_accepts_older_work_with_still_valid_opinion() -> None:
+    """验证早期发布但仍在有效期内的观点可以进入到期核验。"""
 
     work = finished_work().model_copy(
         update={"published_at": datetime(2026, 7, 22, 4, 0, tzinfo=UTC)}
@@ -210,14 +210,15 @@ def test_verify_work_rejects_work_not_published_on_previous_day() -> None:
         verifier=FakeVerifier(),  # type: ignore[arg-type]
     )
 
-    with pytest.raises(ValueError, match="来源窗口"):
-        asyncio.run(
-            service.verify_work(
-                work=work,
-                evidence=evidence(),
-                evaluation_date="2026-07-24",
-            )
+    result = asyncio.run(
+        service.verify_work(
+            work=work,
+            evidence=evidence(),
+            evaluation_date="2026-07-24",
         )
+    )
+
+    assert len(result) == 1
 
 
 def test_verify_work_accepts_weekend_source_for_monday_window() -> None:
@@ -257,3 +258,77 @@ def test_verify_work_accepts_weekend_source_for_monday_window() -> None:
 
     assert len(result) == 1
     assert verifier.calls[0]["source_window_start"] == date(2026, 7, 24)
+
+
+def test_verify_work_uses_program_for_explicit_index_close_threshold() -> None:
+    """验证明确收盘阈值由程序比较，不把简单算术交给 LLM。"""
+
+    work = finished_work()
+    assert work.analysis is not None
+    opinion = work.analysis.opinions[0].model_copy(
+        update={
+            "target_type": "index",
+            "target_name": "上证指数",
+            "claim": "上证指数收盘站上3950点",
+            "metric": "上证指数收盘点位",
+            "verification_rule": {
+                "kind": "index_close_threshold",
+                "operator": "gte",
+                "threshold": 3950,
+                "unit": "point",
+            },
+        }
+    )
+    work = work.model_copy(
+        update={"analysis": work.analysis.model_copy(update={"opinions": [opinion]})}
+    )
+    verifier = FakeVerifier()
+    service = CreatorOpinionVerificationService(verifier=verifier)  # type: ignore[arg-type]
+    frozen = evidence().model_copy(
+        update={
+            "facts": {
+                "market_review": {
+                    "summary": "截至收盘，上证指数报3952.18点，市场震荡。"
+                }
+            }
+        }
+    )
+
+    result = asyncio.run(
+        service.verify_work(
+            work=work,
+            evidence=frozen,
+            evaluation_date="2026-07-24",
+        )
+    )
+
+    assert result[0].verdict == "corroborated"
+    assert result[0].evidence_refs == ["facts.market_review.summary"]
+    assert verifier.calls == []
+
+
+def test_verify_work_settles_post_close_prediction_as_unverified() -> None:
+    """验证发布晚于当日收盘的到期观点会显式结算，而不是永久 pending。"""
+
+    work = finished_work()
+    assert work.analysis is not None
+    opinion = work.analysis.opinions[0].model_copy(
+        update={"valid_from": datetime(2026, 7, 24, 7, 55, tzinfo=UTC)}
+    )
+    work = work.model_copy(
+        update={"analysis": work.analysis.model_copy(update={"opinions": [opinion]})}
+    )
+    verifier = FakeVerifier()
+    service = CreatorOpinionVerificationService(verifier=verifier)  # type: ignore[arg-type]
+
+    result = asyncio.run(
+        service.verify_work(
+            work=work,
+            evidence=evidence(),
+            evaluation_date="2026-07-24",
+        )
+    )
+
+    assert result[0].verdict == "unverified"
+    assert "不在观点有效区间" in result[0].reason
+    assert verifier.calls == []

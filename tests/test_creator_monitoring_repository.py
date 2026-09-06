@@ -323,6 +323,36 @@ def test_finished_work_query_applies_limit_and_availability_cutoff() -> None:
     assert call["sort"] == [("published_at", -1), ("work_key", 1)]
 
 
+def test_morning_context_query_includes_new_analysis_or_still_active_opinion() -> None:
+    database = FakeDatabase()
+    repository = CreatorWorkRepository(database=database)  # type: ignore[arg-type]
+    collection = database["creator_works"]
+    start = NOW
+    cutoff = NOW + timedelta(days=1)
+
+    asyncio.run(
+        repository.list_finished_works_for_morning_context(
+            creator_id="creator-1",
+            available_after=start,
+            available_at=cutoff,
+        )
+    )
+
+    call = collection.find_calls[0]
+    assert call["filters"] == {
+        "creator_id": "creator-1",
+        "status.status": "finished",
+        "published_at": {"$lte": cutoff},
+        "first_seen_at": {"$lte": cutoff},
+        "analysis.analyzed_at": {"$lte": cutoff},
+        "$or": [
+            {"analysis.analyzed_at": {"$gt": start}},
+            {"analysis.opinions.valid_until": {"$gte": cutoff}},
+        ],
+    }
+    assert call["sort"] == [("published_at", -1), ("work_key", 1)]
+
+
 def test_find_latest_finished_before_uses_cutoff_and_newest_sort() -> None:
     database = FakeDatabase()
     repository = CreatorWorkRepository(database=database)  # type: ignore[arg-type]
@@ -359,3 +389,24 @@ def test_find_latest_finished_before_uses_cutoff_and_newest_sort() -> None:
             "sort": [("published_at", -1), ("work_key", 1)],
         }
     ]
+
+
+def test_ranked_creator_query_is_limited_to_active_creator_ids() -> None:
+    database = FakeDatabase()
+    repository = CreatorOpinionAnalysisRepository(  # type: ignore[arg-type]
+        database=database
+    )
+
+    result = asyncio.run(
+        repository.list_ranked_with_ids(
+            limit=7,
+            creator_ids=("all_round_savage", "xu_xiaoming"),
+        )
+    )
+
+    assert result == []
+    call = database["creator_opinion_analyses"].find_calls[0]
+    assert call["filters"] == {
+        "accuracy_score": {"$ne": None},
+        "_id": {"$in": ["all_round_savage", "xu_xiaoming"]},
+    }

@@ -155,12 +155,12 @@ class FakeEvidenceBuilder:
         return SimpleNamespace(
             evidence=CreatorMarketEvidence(
                 evidence_id="temporary-evidence",
-                market_date="2026-07-24",
-                as_of=AS_OF,
+                market_date=str(kwargs["market_date"]),
+                as_of=kwargs["as_of"],
                 facts={"market_mainline_targets": ["半导体"]},
                 source="test",
                 evidence_version="v1",
-                generated_at=AS_OF,
+                generated_at=kwargs["as_of"],
             )
         )
 
@@ -284,3 +284,49 @@ def test_run_keeps_pending_when_verifier_omits_due_opinion() -> None:
     assert "验证结果与提交观点集合不一致" in result.results[0].reason
     assert len(opinions.docs["creator-1"].pending_opinions) == 1
     assert opinions.settlements == []
+
+
+def test_run_catches_up_overdue_opinion_with_original_market_date() -> None:
+    """验证逾期 pending 按原 verification_date 构建证据并标记迟到结算。"""
+
+    source = work("creator-1", 1)
+    assert source.analysis is not None
+    old_published = datetime(2026, 7, 22, 12, 0, tzinfo=CN_TZ)
+    old_opinion = CreatorOpinion(
+        **{
+            **source.analysis.opinions[0].model_dump(mode="python"),
+            "valid_from": old_published,
+            "valid_until": datetime(2026, 7, 23, 16, 0, tzinfo=CN_TZ),
+            "verification_date": None,
+        }
+    )
+    source = source.model_copy(
+        update={
+            "published_at": old_published,
+            "first_seen_at": old_published,
+            "analysis": source.analysis.model_copy(
+                update={"opinions": [old_opinion], "analyzed_at": old_published}
+            ),
+            "a_share_opinions": [old_opinion],
+        }
+    )
+    works = FakeWorkRepository()
+    works.works = {"creator-1": [source]}
+    opinions = FakeOpinionRepository()
+    asyncio.run(opinions.sync_work_opinions(source))
+    evidence = FakeEvidenceBuilder()
+    service = CreatorDailyVerificationService(
+        work_repository=works,
+        opinion_repository=opinions,
+        evidence_builder=evidence,
+        verifier=FakeVerifier(),
+        accounts=(account("creator-1", 1),),
+    )
+
+    result = asyncio.run(service.run(score_date="2026-07-24", as_of=AS_OF))
+
+    assert result.processed_dates == ("2026-07-23",)
+    assert evidence.build_calls[0]["market_date"].isoformat() == "2026-07-23"
+    record = opinions.docs["creator-1"].verified_opinions[0]
+    assert record.verification_date == "2026-07-23"
+    assert record.is_late_verification is True

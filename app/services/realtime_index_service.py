@@ -318,14 +318,21 @@ class RealtimeIndexService:
             data["warning"] = "upstream_unavailable_using_memory_cache"
         return data
 
+    def _has_current_day_cache(self, now: datetime) -> bool:
+        return (
+            self._cached_quotes is not None
+            and self._cached_at is not None
+            and self._cached_at.astimezone(CN_TZ).date() == now.date()
+        )
+
     async def fetch_latest(self) -> dict[str, Any]:
         now = self._wall_clock().astimezone(CN_TZ)
-        if self._cached_quotes is not None and not is_market_session_open(now):
+        if self._has_current_day_cache(now) and not is_market_session_open(now):
             return self._snapshot(now)
 
         async with self._refresh_lock:
             now = self._wall_clock().astimezone(CN_TZ)
-            if self._cached_quotes is not None and not is_market_session_open(now):
+            if self._has_current_day_cache(now) and not is_market_session_open(now):
                 return self._snapshot(now)
             try:
                 quotes = await self._fetch_quotes()

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from types import SimpleNamespace
 
 from app.scheduler import crawler_jobs
@@ -27,6 +28,35 @@ def test_registers_main_and_automatic_compensation_jobs() -> None:
     }
     assert jobs["sync_stock_daily_detail_1530"]["trigger"].fields[5].expressions[0].first == 15
     assert jobs["sync_stock_daily_detail_1530"]["trigger"].fields[6].expressions[0].first == 30
+
+
+def test_compensation_contains_trade_date_resolution_failure(
+    monkeypatch, caplog
+) -> None:
+    async def failed_resolve(reference_yyyymmdd):
+        raise RuntimeError("calendar unavailable")
+
+    async def unexpected_retry(*args, **kwargs):
+        raise AssertionError("retry should not run without a target trade date")
+
+    monkeypatch.setattr(crawler_jobs, "today_yyyymmdd", lambda: "20260826")
+    monkeypatch.setattr(daily_service, "resolve_a_stock_target_trade_date", failed_resolve)
+    monkeypatch.setattr(
+        daily_service,
+        "retry_latest_incomplete_stock_daily_detail_run",
+        unexpected_retry,
+    )
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(
+            crawler_jobs._run_stock_daily_detail_compensation_job(
+                target_scope="previous",
+                max_automatic_compensations=5,
+            )
+        )
+
+    assert "phase=resolve_trade_date" in caplog.text
+    assert "reference_date=20260825" in caplog.text
 
 
 def test_main_job_compensates_existing_incomplete_run(monkeypatch) -> None:

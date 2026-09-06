@@ -4,7 +4,11 @@ import asyncio
 import json
 from datetime import datetime, timezone
 
-from app.llm.creator_content_analysis_llm import CreatorContentAnalysisLLMAnalyzer
+from app.llm.creator_content_analysis_llm import (
+    ANALYSIS_VERSION,
+    CONTENT_ANALYSIS_SYSTEM_PROMPT,
+    CreatorContentAnalysisLLMAnalyzer,
+)
 from app.models.creator_monitoring import CreatorOpinionDraft
 
 
@@ -361,3 +365,47 @@ def test_materialize_opinions_allows_layout_whitespace_in_quote() -> None:
     )
 
     assert opinions[0].source_quote == "半导体明天会更强"
+
+
+def test_prompt_and_event_materialization_preserve_conditional_event_identity() -> None:
+    """验证新版 PE 要求先分类，并把互斥条件分支合并为同一预测事件。"""
+
+    common = {
+        "target_type": "index",
+        "target_name": "上证指数",
+        "horizon": "次日收盘",
+        "valid_from": PUBLISHED_AT,
+        "valid_until": datetime(2026, 7, 24, 8, 0, tzinfo=UTC),
+        "metric": "上证指数收盘点位",
+        "statement_type": "conditional_forecast",
+        "event_key": "次日上证3980条件分支",
+    }
+    drafts = [
+        CreatorOpinionDraft(
+            **common,
+            direction="bullish",
+            stance_score=60,
+            claim="次日收盘站上3980点则看多",
+            source_quote="站上3980点则看多",
+        ),
+        CreatorOpinionDraft(
+            **common,
+            direction="bearish",
+            stance_score=-60,
+            claim="次日收盘低于3980点则看空",
+            source_quote="低于3980点则看空",
+        ),
+    ]
+
+    opinions = CreatorContentAnalysisLLMAnalyzer._materialize_opinions(
+        drafts,
+        work_key="douyin:conditional",
+        published_at=PUBLISHED_AT,
+        source="站上3980点则看多，低于3980点则看空",
+    )
+
+    assert ANALYSIS_VERSION == "creator_content_analysis_v5_event_rules"
+    assert "statement_type" in CONTENT_ANALYSIS_SYSTEM_PROMPT
+    assert "verification_rule" in CONTENT_ANALYSIS_SYSTEM_PROMPT
+    assert opinions[0].event_id == opinions[1].event_id
+    assert opinions[0].opinion_id != opinions[1].opinion_id

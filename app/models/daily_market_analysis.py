@@ -202,6 +202,30 @@ class CreatorSectorOpinionContext(BaseModel):
     reason: str = Field(min_length=1)
 
 
+class CreatorStructuredOpinionContext(BaseModel):
+    """盘前报告可使用的一条结构化博主观点，不携带原始长文本。"""
+
+    opinion_id: str = Field(min_length=1)
+    event_id: str = Field(min_length=1)
+    target_type: Literal["market", "index", "sector", "stock", "theme"]
+    target_name: str = Field(min_length=1)
+    normalized_target_name: Optional[str] = None
+    direction: Literal["bullish", "bearish", "neutral"]
+    stance_score: int = Field(ge=-100, le=100)
+    claim: str = Field(min_length=1)
+    horizon: str = Field(min_length=1)
+    valid_until: Optional[datetime] = None
+    confidence: float = Field(ge=0, le=1)
+    statement_type: Literal[
+        "forecast",
+        "conditional_forecast",
+        "retrospective",
+        "factual_commentary",
+        "general_opinion",
+    ] = "forecast"
+    reason: str = Field(min_length=1)
+
+
 class CreatorWorkAnalysisContext(BaseModel):
     """表示不含原始提取内容的单条博主作品分析盘前报告副本。"""
 
@@ -209,6 +233,10 @@ class CreatorWorkAnalysisContext(BaseModel):
     summary: str = Field(min_length=1)
     # 通过同花顺行业白名单校验的纯行业观点。
     sector_opinions: List[CreatorSectorOpinionContext] = Field(default_factory=list)
+    # 市场、指数、行业、题材和个股的原子化观点；盘前模型按目标类型限制用途。
+    structured_opinions: List[CreatorStructuredOpinionContext] = Field(
+        default_factory=list
+    )
     # 为审计保留的博主作品分析提示词及校验版本。
     analysis_version: str = ""
     # 生成来源作品分析结果的具体 LLM 模型。
@@ -227,14 +255,19 @@ class CreatorRankingContext(BaseModel):
     creator_id: str = Field(min_length=1)
     # 排行榜和盘前报告展示使用的博主名称。
     creator_name: str = Field(min_length=1)
-    # 按滚动分降序排列后的前五名名次。
-    rank: int = Field(ge=1, le=5)
+    # 按可靠性调整分降序排列后的候选名次。
+    rank: int = Field(ge=1, le=20)
     # 截至前一交易日最近七个自然日有效观点计算出的近期分。
     rolling_score: float = Field(ge=0, le=100)
     # 前一交易日新到期观点得分；当日没有有效新样本时允许为空。
     daily_score: Optional[float] = Field(default=None, ge=0, le=100)
     # 实际参与滚动分计算的历史有效观点数量；累计样本不设人为上限。
     sample_count: int = Field(ge=1)
+    # 近期表现按样本量向 50 分中性先验收缩后的排序分。
+    sample_adjusted_score: Optional[float] = Field(default=None, ge=0, le=100)
+    # 未做时间衰减的全历史展示分及样本量，供审计而非直接排序。
+    lifetime_score: Optional[float] = Field(default=None, ge=0, le=100)
+    lifetime_sample_count: int = Field(default=0, ge=0)
 
 
 class CreatorWorkContext(BaseModel):
@@ -280,11 +313,15 @@ class CreatorContext(BaseModel):
         "",
         "previous_trade_day_rolling_score_top5",
         "cumulative_accuracy_top5",
+        "reliability_adjusted_active_opinions",
     ] = ""
     # 前一交易日按滚动分选出的最多五位高置信度博主。
     ranked_creators: List[CreatorRankingContext] = Field(default_factory=list)
     # 盘前分析要求作品所属的来源日期，通常是分析日前一自然日。
     source_date: Optional[str] = None
+    # 实际纳入候选作品的左闭右闭可用窗口，兼容跨周末和延迟分析作品。
+    source_window_start: Optional[datetime] = None
+    source_window_end: Optional[datetime] = None
     # 数据不可用时的原因，或对当前上下文状态的补充说明。
     reason: str = ""
     # 最新可用作品距盘前分析截止时点的年龄，单位为秒。
@@ -325,11 +362,14 @@ class CreatorContext(BaseModel):
         if len(set(work_ids)) != len(work_ids):
             raise ValueError("creator_context 不允许重复作品")
 
-        opinion_ids = [
-            opinion.opinion_id
-            for work in self.works
-            for opinion in work.analysis.sector_opinions
-        ]
+        opinion_ids = []
+        for work in self.works:
+            opinions = (
+                work.analysis.structured_opinions
+                if work.analysis.structured_opinions
+                else work.analysis.sector_opinions
+            )
+            opinion_ids.extend(opinion.opinion_id for opinion in opinions)
         if len(set(opinion_ids)) != len(opinion_ids):
             raise ValueError("creator_context 不允许重复观点 ID")
 
@@ -341,15 +381,15 @@ class CreatorContext(BaseModel):
             raise ValueError("creator_context 不允许重复排行榜名次")
         if self.selection_rule:
             if not self.ranking_market_date:
-                raise ValueError("Top 5 博主上下文必须记录评分交易日")
+                raise ValueError("博主候选上下文必须记录评分交易日")
             if not self.ranked_creators:
-                raise ValueError("Top 5 博主上下文必须记录入选博主")
+                raise ValueError("博主候选上下文必须记录入选博主")
             ranked_ids = set(creator_ids)
             if any(
                 not work.creator_id or work.creator_id not in ranked_ids
                 for work in self.works
             ):
-                raise ValueError("盘前作品只能来自前一交易日评分 Top 5 博主")
+                raise ValueError("盘前作品只能来自评分 Top 5 或当前可靠性规则已入选博主")
 
         return self
 

@@ -114,6 +114,49 @@ class CreatorWorkStatus(StrictModel):
     reason: str | None = None
 
 
+class CreatorVerificationRule(StrictModel):
+    """把可直接计算的观点判定条件保存为稳定、可审计的规则。"""
+
+    # 规则所需的事实类型；qualitative 表示仍需语义核验。
+    kind: Literal[
+        "index_close_threshold",
+        "daily_return_direction",
+        "relative_return",
+        "volume_ratio",
+        "event_condition",
+        "qualitative",
+    ] = "qualitative"
+    # 对事实值执行的比较；qualitative 可以不提供运算符。
+    operator: Literal[
+        "gt",
+        "gte",
+        "lt",
+        "lte",
+        "between",
+        "direction_match",
+        "event_occurs",
+    ] | None = None
+    # 数值比较的下界或唯一阈值。
+    threshold: float | None = None
+    # between 规则的上界。
+    threshold_upper: float | None = None
+    # 阈值单位，例如 point、percent 或 ratio。
+    unit: str = ""
+
+    @model_validator(mode="after")
+    def validate_operands(self) -> "CreatorVerificationRule":
+        """拒绝缺少操作数的数值规则，避免验证阶段临时猜测。"""
+
+        if self.kind == "index_close_threshold":
+            if self.operator not in {"gt", "gte", "lt", "lte", "between"}:
+                raise ValueError("指数收盘阈值规则必须提供数值比较运算符")
+            if self.threshold is None:
+                raise ValueError("指数收盘阈值规则必须提供 threshold")
+            if self.operator == "between" and self.threshold_upper is None:
+                raise ValueError("between 规则必须提供 threshold_upper")
+        return self
+
+
 class CreatorOpinionDraft(StrictModel):
     """表示单个作品分析 LLM 输出的可证伪观点草稿。"""
 
@@ -131,6 +174,16 @@ class CreatorOpinionDraft(StrictModel):
     stance_score: int = Field(ge=-100, le=100)
     # 可独立验证且可证伪的博主原意陈述。
     claim: str = Field(min_length=1)
+    # 区分真正的事前预测、条件预测、复盘陈述和一般评论。
+    statement_type: Literal[
+        "forecast",
+        "conditional_forecast",
+        "retrospective",
+        "factual_commentary",
+        "general_opinion",
+    ] = "forecast"
+    # 同一预测事件的模型内稳定分组键；互斥条件分支应使用相同键。
+    event_key: str | None = None
     # 原作品中用自然语言表达的观点时间范围。
     horizon: str = Field(min_length=1)
     # 可以开始验证该预测的最早时间。
@@ -139,6 +192,8 @@ class CreatorOpinionDraft(StrictModel):
     valid_until: AwareDatetime | None = None
     # 用于判断可验证观点是否正确的可观测指标。
     metric: str | None = None
+    # 可由程序直接执行的判定规则；没有可靠数值规则时使用 qualitative。
+    verification_rule: CreatorVerificationRule | None = None
     # 判定预测已触发前必须满足的前置条件。
     conditions: list[str] = Field(default_factory=list)
     # 观点提取置信度，并非预测正确的概率。
@@ -160,6 +215,11 @@ class CreatorOpinionDraft(StrictModel):
             raise ValueError("valid_until 不能早于 valid_from")
         if self.verifiable and (self.valid_until is None or not self.metric):
             raise ValueError("可验证观点必须提供 valid_until 和 metric")
+        if self.verifiable and self.statement_type not in {
+            "forecast",
+            "conditional_forecast",
+        }:
+            raise ValueError("复盘、事实评论和一般观点不能标记为可验证预测")
         return self
 
 
@@ -168,6 +228,8 @@ class CreatorOpinion(CreatorOpinionDraft):
 
     # 在单个已分析作品内按原文顺序分配的稳定观点标识。
     opinion_id: str = Field(min_length=1)
+    # 同一预测事件的持久化标识，用于合并互斥分支和避免重复计样本。
+    event_id: str = ""
     # 提取该观点的博主作品外键。
     work_key: str = Field(min_length=3)
     # 该观点计划进入收盘验证的北京时间日期；不可验证观点为空。
@@ -177,6 +239,8 @@ class CreatorOpinion(CreatorOpinionDraft):
     def set_verification_date(self) -> "CreatorOpinion":
         """把观点有效期终点规范为唯一的待验证日期。"""
 
+        if not self.event_id:
+            self.event_id = self.opinion_id
         expected = (
             self.valid_until.astimezone(CN_TZ).date().isoformat()
             if self.verifiable and self.valid_until is not None
@@ -430,6 +494,8 @@ class CreatorOpinionRecord(StrictModel):
     """表示汇总表中一条待验证或已验证的观点。"""
 
     opinion_id: str = Field(min_length=1)
+    # 旧记录缺失该字段时回退为 opinion_id，由业务层在新写入时显式赋值。
+    event_id: str = ""
     work_key: str = Field(min_length=3)
     platform: CreatorPlatform
     published_at_beijing: str = Field(pattern=r"^.+\+08:00$")
@@ -437,16 +503,30 @@ class CreatorOpinionRecord(StrictModel):
     target_name: str = Field(min_length=1)
     direction: Literal["bullish", "bearish", "neutral"]
     opinion: str = Field(min_length=1)
+    statement_type: Literal[
+        "forecast",
+        "conditional_forecast",
+        "retrospective",
+        "factual_commentary",
+        "general_opinion",
+    ] = "forecast"
     verification_date: str = Field(pattern=DATE_PATTERN)
     verified_at_beijing: str | None = Field(default=None, pattern=r"^.+\+08:00$")
     verdict: OpinionVerdict | None = None
     score: float | None = Field(default=None, ge=-1, le=1)
     reason: str | None = None
+    # 持久化本次结论实际引用的冻结行情路径和网页证据，支持人工复核。
+    evidence_refs: list[str] = Field(default_factory=list)
+    web_evidence: list[CreatorWebEvidence] = Field(default_factory=list)
+    # 补跑历史到期观点时标记为迟到结算，不改变原 verification_date。
+    is_late_verification: bool = False
 
     @model_validator(mode="after")
     def validate_state(self) -> "CreatorOpinionRecord":
         """保证待验证和已验证观点不会混用结算字段。"""
 
+        if not self.event_id:
+            self.event_id = self.opinion_id
         if self.verified_at_beijing is None:
             if self.verdict is not None or self.score is not None:
                 raise ValueError("待验证观点不能包含结论或分值")

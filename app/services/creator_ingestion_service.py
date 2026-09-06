@@ -111,6 +111,18 @@ class CreatorIngestionBatchResult:
 
         return sum(item.status in {"failed", "blocked"} for item in self.results)
 
+    @property
+    def partial_account_count(self) -> int:
+        """统计未能完整覆盖请求窗口的部分成功账号数量。"""
+
+        return sum(item.status == "partial" for item in self.results)
+
+    @property
+    def detail_failed_count(self) -> int:
+        """返回所有账号候选作品详情失败总数。"""
+
+        return sum(item.detail_failed_count for item in self.results)
+
 
 class CreatorIngestionService:
     """发现所有已配置博主账号的作品，并只持久化规范化作品。

@@ -437,20 +437,34 @@ def test_verify_rejects_nonverifiable_opinion() -> None:
         )
 
 
-def test_verify_rejects_non_previous_day_source() -> None:
-    """验证底层 LLM 会拒绝默认来源窗口之外发布的作品。"""
+def test_verify_accepts_older_source_when_opinion_is_still_valid() -> None:
+    """验证长周期观点不会因作品早于前一日而被来源窗口误删。"""
 
     llm = verifier()
+    llm.chat = lambda **kwargs: json.dumps(  # type: ignore[method-assign]
+        {
+            "evaluations": [
+                {
+                    "opinion_id": "douyin:work-1:1",
+                    "verdict": "corroborated",
+                    "reason": "半导体相对收益为正。",
+                    "evidence_refs": ["facts.sector_relative_return.半导体"],
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
 
-    with pytest.raises(ValueError, match="来源窗口"):
-        asyncio.run(
-            llm.verify(
-                opinions=[opinion()],
-                source_published_at=datetime(2026, 7, 22, 4, 0, tzinfo=UTC),
-                evidence=evidence(),
-                evaluation_date="2026-07-24",
-            )
+    result = asyncio.run(
+        llm.verify(
+            opinions=[opinion()],
+            source_published_at=datetime(2026, 7, 22, 4, 0, tzinfo=UTC),
+            evidence=evidence(),
+            evaluation_date="2026-07-24",
         )
+    )
+
+    assert result[0].verdict == "corroborated"
 
 
 def test_verify_accepts_weekend_source_for_monday_window() -> None:

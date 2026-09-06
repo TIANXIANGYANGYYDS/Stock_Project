@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 import logging
 from typing import Any, Protocol
 
@@ -32,7 +32,9 @@ from app.services.trading_calendar_service import resolve_morning_trade_dates
 
 logger = logging.getLogger(__name__)
 DEFAULT_VERIFICATION_CONCURRENCY = 1
-FORMULA_VERSION = "creator_cumulative_accuracy_v1"
+FORMULA_VERSION = "creator_event_grouped_accuracy_v2"
+# 单次调度最多补结算五个到期日，限制联网与行情构建成本。
+MAX_VERIFICATION_DATES_PER_RUN = 5
 
 
 def current_source_window_bounds(evaluation_date: date | str) -> tuple[datetime, datetime]:
@@ -134,6 +136,7 @@ class CreatorDailyVerificationBatchResult:
     score_date: str
     evidence_id: str
     results: tuple[CreatorDailyVerificationRunResult, ...]
+    processed_dates: tuple[str, ...] = ()
 
 
 class CreatorDailyVerificationService:
@@ -173,16 +176,99 @@ class CreatorDailyVerificationService:
         as_of: datetime,
         concurrency: int = DEFAULT_VERIFICATION_CONCURRENCY,
     ) -> CreatorDailyVerificationBatchResult:
-        """串行或按显式小并发验证目标交易日到期观点。"""
+        """先补跑逾期观点，再处理目标日；每个到期日使用各自的冻结行情证据。"""
+
+        if as_of.tzinfo is None:
+            raise ValueError("as_of 必须包含时区")
+        if concurrency <= 0:
+            raise ValueError("concurrency 必须大于 0")
+        target_day = self._parse_date(score_date)
+        active_as_of = as_of.astimezone(CN_TZ)
+        if active_as_of < datetime.combine(target_day, time(15), tzinfo=CN_TZ):
+            raise ValueError("收盘验证只能在评价日 15:00 后执行")
+
+        due_dates: set[date] = set()
+        for creator_id, creator_name in self.creators:
+            current = await self.opinion_repository.get_creator(
+                creator_id=creator_id,
+                creator_name=creator_name,
+            )
+            for item in current.pending_opinions:
+                due_day = date.fromisoformat(item.verification_date)
+                if due_day <= target_day:
+                    due_dates.add(due_day)
+
+        ordered_dates = sorted(due_dates)
+        if len(ordered_dates) > MAX_VERIFICATION_DATES_PER_RUN:
+            oldest = ordered_dates[: MAX_VERIFICATION_DATES_PER_RUN - 1]
+            latest = target_day if target_day in due_dates else ordered_dates[-1]
+            ordered_dates = list(dict.fromkeys([*oldest, latest]))
+        if not ordered_dates:
+            ordered_dates = [target_day]
+
+        batches = [
+            await self._run_single_date(
+                score_date=due_day,
+                as_of=active_as_of,
+                concurrency=concurrency,
+            )
+            for due_day in ordered_dates
+        ]
+        if len(batches) == 1:
+            batch = batches[0]
+            return CreatorDailyVerificationBatchResult(
+                score_date=target_day.isoformat(),
+                evidence_id=batch.evidence_id,
+                results=batch.results,
+                processed_dates=tuple(item.isoformat() for item in ordered_dates),
+            )
+
+        aggregate: list[CreatorDailyVerificationRunResult] = []
+        for creator_id, _ in self.creators:
+            rows = [
+                item
+                for batch in batches
+                for item in batch.results
+                if item.creator_id == creator_id
+            ]
+            failed = [item for item in rows if item.status == "failed"]
+            latest = rows[-1]
+            aggregate.append(
+                CreatorDailyVerificationRunResult(
+                    creator_id=creator_id,
+                    status="failed" if failed else "completed",
+                    evaluated_opinion_count=sum(
+                        item.evaluated_opinion_count for item in rows
+                    ),
+                    daily_score=latest.daily_score,
+                    score=latest.score,
+                    reason="；".join(
+                        f"{day.isoformat()}:{row.reason}"
+                        for day, row in zip(ordered_dates, rows)
+                    ),
+                )
+            )
+        return CreatorDailyVerificationBatchResult(
+            score_date=target_day.isoformat(),
+            evidence_id="catchup:" + ",".join(batch.evidence_id for batch in batches),
+            results=tuple(aggregate),
+            processed_dates=tuple(item.isoformat() for item in ordered_dates),
+        )
+
+    async def _run_single_date(
+        self,
+        *,
+        score_date: date | str,
+        as_of: datetime,
+        concurrency: int = DEFAULT_VERIFICATION_CONCURRENCY,
+    ) -> CreatorDailyVerificationBatchResult:
+        """验证单个到期日，供公开入口按历史日期顺序调用。"""
 
         if as_of.tzinfo is None:
             raise ValueError("as_of 必须包含时区")
         if concurrency <= 0:
             raise ValueError("concurrency 必须大于 0")
         score_day = self._parse_date(score_date)
-        decision = resolve_morning_trade_dates(score_day)
-        if not decision.is_current_trade_day:
-            raise ValueError("评分日期必须是 A 股交易日")
         active_as_of = as_of.astimezone(CN_TZ)
         if active_as_of < datetime.combine(score_day, time(15), tzinfo=CN_TZ):
             raise ValueError("收盘验证只能在评价日 15:00 后执行")
@@ -253,9 +339,13 @@ class CreatorDailyVerificationService:
             for creator_id, _ in self.creators
         }
 
+        evidence_as_of = min(
+            active_as_of,
+            datetime.combine(score_day, time(23, 59, 59), tzinfo=CN_TZ),
+        )
         build_result = await self.evidence_builder.build_evidence(
             market_date=score_day,
-            as_of=active_as_of,
+            as_of=evidence_as_of,
         )
         evidence = build_result.evidence
         targets, conditions = self._collect_evidence_names(due_groups)
@@ -264,7 +354,7 @@ class CreatorDailyVerificationService:
                 evidence=evidence,
                 target_names=targets,
                 condition_names=conditions,
-                as_of=active_as_of,
+                as_of=evidence_as_of,
             )
 
         semaphore = asyncio.Semaphore(concurrency)
@@ -281,7 +371,8 @@ class CreatorDailyVerificationService:
                     due_works=due_groups[creator_id],
                     missing_due_opinion_ids=missing_due_by_creator[creator_id],
                     score_day=score_day,
-                    source_window_start=decision.prev_trade_date,
+                    # 仅用于审计和旧接口兼容；验证服务不再以发布日期删除长周期观点。
+                    source_window_start=(score_day - timedelta(days=1)).isoformat(),
                     as_of=active_as_of,
                     evidence=evidence,
                 )
@@ -342,12 +433,7 @@ class CreatorDailyVerificationService:
                         verified_at=as_of,
                     )
                 )
-            all_scores = [
-                item.score
-                for item in [*current.verified_opinions, *records]
-                if item.score is not None
-            ]
-            accuracy = self._score_values(all_scores)
+            accuracy = self._score_records([*current.verified_opinions, *records])
             await self.opinion_repository.settle_opinions(
                 creator_id=creator_id,
                 records=records,
@@ -357,9 +443,7 @@ class CreatorDailyVerificationService:
                 creator_id=creator_id,
                 status="completed",
                 evaluated_opinion_count=len(records),
-                daily_score=self._score_values(
-                    [item.score for item in records if item.score is not None]
-                ),
+                daily_score=self._score_records(records),
                 score=accuracy,
                 reason="到期观点验证完成。" if records else "今天没有到期观点。",
             )
@@ -418,6 +502,7 @@ class CreatorDailyVerificationService:
         return [
             CreatorOpinionRecord(
                 opinion_id=opinion.opinion_id,
+                event_id=opinion.event_id,
                 work_key=work.work_key,
                 platform=work.platform,
                 published_at_beijing=work.published_at_beijing,
@@ -425,11 +510,18 @@ class CreatorDailyVerificationService:
                 target_name=opinion.target_name,
                 direction=opinion.direction,
                 opinion=opinion.claim,
+                statement_type=opinion.statement_type,
                 verification_date=opinion.verification_date,
                 verified_at_beijing=beijing_time_text(verified_at),
                 verdict=by_id[opinion.opinion_id].verdict,
                 score=VERDICT_SCORES[by_id[opinion.opinion_id].verdict],
                 reason=by_id[opinion.opinion_id].reason,
+                evidence_refs=by_id[opinion.opinion_id].evidence_refs,
+                web_evidence=by_id[opinion.opinion_id].web_evidence,
+                is_late_verification=(
+                    verified_at.astimezone(CN_TZ).date().isoformat()
+                    > opinion.verification_date
+                ),
             )
             for opinion in work.analysis.opinions
             if opinion.verification_date is not None
@@ -458,6 +550,22 @@ class CreatorDailyVerificationService:
         if not values:
             return None
         return round((sum(values) / len(values) + 1.0) * 50.0, 2)
+
+    @classmethod
+    def _score_records(
+        cls,
+        records: Collection[CreatorOpinionRecord],
+    ) -> float | None:
+        """先按预测事件合并互斥分支，再计算准确率，避免一件事重复计样本。"""
+
+        by_event: dict[str, list[float]] = {}
+        for item in records:
+            if item.score is None:
+                continue
+            event_id = item.event_id or item.opinion_id
+            by_event.setdefault(event_id, []).append(item.score)
+        event_scores = [sum(values) / len(values) for values in by_event.values()]
+        return cls._score_values(event_scores)
 
     @staticmethod
     def _market_mainline_targets(evidence: CreatorMarketEvidence) -> tuple[str, ...]:

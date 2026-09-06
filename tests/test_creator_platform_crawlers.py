@@ -95,18 +95,20 @@ def account(platform: str, platform_account_id: str, **kwargs: Any) -> PlatformA
     return PlatformAccount(**values)
 
 
-def test_account_registry_contains_confirmed_twenty_accounts() -> None:
-    assert len(CREATOR_ACCOUNTS) == 20
-    assert len(get_enabled_accounts("douyin")) == 11
-    assert len({item.account_key for item in CREATOR_ACCOUNTS}) == 20
+def test_account_registry_contains_selected_seven_accounts() -> None:
+    assert len(CREATOR_ACCOUNTS) == 7
+    assert len(get_enabled_accounts("douyin")) == 3
+    assert len({item.account_key for item in CREATOR_ACCOUNTS}) == 7
 
     tianjin = next(item for item in CREATOR_ACCOUNTS if item.display_name == "天津股侠")
     assert tianjin.platform_account_id == "1896820725"
     assert "7877843932" in tianjin.notes
 
-    tang = next(item for item in CREATOR_ACCOUNTS if item.creator_id == "tang_hao")
-    assert tang.enabled is True
-    assert "业务身份" in tang.notes
+    hexagon = next(
+        item for item in CREATOR_ACCOUNTS if item.creator_id == "hexagon_trader"
+    )
+    assert hexagon.platform_account_id == "45497829913"
+    assert hexagon.sec_uid
 
 
 def test_default_platform_client_uses_low_resource_protocol_session() -> None:

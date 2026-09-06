@@ -336,6 +336,16 @@ def test_sync_queue_retries_all_non_terminal_failures_once(monkeypatch) -> None:
     )
     attempts: dict[str, int] = {}
 
+    class FakeReverseManager:
+        def __init__(self, **kwargs):
+            pass
+
+        def report_stats(self):
+            return {"manager": {}, "provider": {}}
+
+        async def close(self):
+            pass
+
     class FakeWorkerCrawler:
         def __init__(self, **kwargs):
             pass
@@ -354,6 +364,7 @@ def test_sync_queue_retries_all_non_terminal_failures_once(monkeypatch) -> None:
             raise RuntimeError("reverse chip unavailable")
         return 1
 
+    monkeypatch.setattr(service, "TargetAwareProxyManager", FakeReverseManager)
     monkeypatch.setattr(service, "StockDailyDetailCrawler", FakeWorkerCrawler)
     monkeypatch.setattr(
         daily_service,

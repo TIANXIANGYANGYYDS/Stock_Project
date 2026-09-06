@@ -620,6 +620,40 @@ class CreatorWorkRepository(BaseMongoRepository):
         )
         return [CreatorWork(**_restore_mongo_timezones(row)) for row in rows]
 
+    async def list_finished_works_for_morning_context(
+        self,
+        *,
+        creator_id: str,
+        available_after: datetime,
+        available_at: datetime,
+    ) -> list[CreatorWork]:
+        """返回截止盘前时点新分析或仍有有效观点的作品。
+
+        这项查询把“本报告周期内新完成分析”和“更早发布但预测尚未到期”合并，
+        同时严格限制首次发现、发布时间和分析完成时间，避免历史报告穿越未来。
+        """
+
+        start = _require_aware(available_after, "available_after")
+        cutoff = _require_aware(available_at, "available_at")
+        if start >= cutoff:
+            raise ValueError("available_after 必须早于 available_at")
+        rows = await self.find_many(
+            {
+                "creator_id": creator_id,
+                "status.status": "finished",
+                "published_at": {"$lte": cutoff},
+                "first_seen_at": {"$lte": cutoff},
+                "analysis.analyzed_at": {"$lte": cutoff},
+                "$or": [
+                    {"analysis.analyzed_at": {"$gt": start}},
+                    {"analysis.opinions.valid_until": {"$gte": cutoff}},
+                ],
+            },
+            projection={"_id": 0},
+            sort=[("published_at", -1), ("work_key", 1)],
+        )
+        return [CreatorWork(**_restore_mongo_timezones(row)) for row in rows]
+
     async def find_latest_finished_before(
         self,
         *,
@@ -725,6 +759,7 @@ class CreatorOpinionAnalysisRepository(BaseMongoRepository):
         return [
             CreatorOpinionRecord(
                 opinion_id=item.opinion_id,
+                event_id=item.event_id,
                 work_key=work.work_key,
                 platform=work.platform,
                 published_at_beijing=work.published_at_beijing,
@@ -732,6 +767,7 @@ class CreatorOpinionAnalysisRepository(BaseMongoRepository):
                 target_name=item.target_name,
                 direction=item.direction,
                 opinion=item.claim,
+                statement_type=item.statement_type,
                 verification_date=item.verification_date,
             )
             for item in work.a_share_opinions
@@ -869,13 +905,20 @@ class CreatorOpinionAnalysisRepository(BaseMongoRepository):
         self,
         *,
         limit: int = 20,
+        creator_ids: Sequence[str] | None = None,
     ) -> list[tuple[str, CreatorOpinionAnalysisDisplay]]:
         """按累计准确率返回博主 ID 和对应的唯一汇总文档。"""
 
         if limit <= 0:
             raise ValueError("limit 必须大于 0")
+        filters: dict[str, Any] = {"accuracy_score": {"$ne": None}}
+        if creator_ids is not None:
+            active_ids = list(dict.fromkeys(str(item).strip() for item in creator_ids))
+            if not active_ids or any(not item for item in active_ids):
+                return []
+            filters["_id"] = {"$in": active_ids}
         rows = await self.find_many(
-            {"accuracy_score": {"$ne": None}},
+            filters,
             projection={"_id": 1, "creator_name": 1, "verified_opinions": 1,
                         "accuracy_score": 1, "pending_opinions": 1},
             sort=[("accuracy_score", -1), ("creator_name", 1), ("_id", 1)],

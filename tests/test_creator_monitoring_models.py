@@ -125,6 +125,9 @@ def test_verifiable_opinion_requires_metric_and_ordered_window() -> None:
     )
     assert unscorable.verifiable is False
 
+    with pytest.raises(ValidationError, match="不能标记为可验证预测"):
+        build_opinion(statement_type="retrospective")
+
 
 def test_transient_evidence_and_verification_have_no_collection_identity() -> None:
     """验证行情证据和 LLM 2 临时结果不会被仓储基类映射为新集合。"""
@@ -149,5 +152,4 @@ def test_transient_evidence_and_verification_have_no_collection_identity() -> No
     assert verification.verdict == "minor_deviation"
     assert not hasattr(CreatorMarketEvidence, "__tablename__")
     assert not hasattr(CreatorOpinionVerification, "__tablename__")
-
 

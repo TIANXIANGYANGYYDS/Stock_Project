@@ -8,6 +8,7 @@ from typing import Any, Callable
 
 from app.crawlers.ths_market_review_crawler import TonghuashunMarketReviewCrawler
 from app.crawlers.ths_morning_report_crawler import TonghuashunMorningReportCrawler
+from app.crawlers.creator_platforms import get_enabled_accounts
 from app.llm.morning_analysis_llm import MorningAnalysisLLMAnalyzer
 from app.llm.news_sector_judge_llm import load_ths_industry_board_names
 from app.models.creator_monitoring import CreatorWork
@@ -15,6 +16,7 @@ from app.models.daily_market_analysis import (
     CreatorContext,
     CreatorRankingContext,
     CreatorSectorOpinionContext,
+    CreatorStructuredOpinionContext,
     CreatorWorkAnalysisContext,
     CreatorWorkContext,
     DailyMarketAnalysis,
@@ -48,10 +50,15 @@ CN_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 MORNING_ANALYSIS_RANKING_LIMIT = 12
 # 08:20 前最新新闻榜单超过 15 分钟即标记陈旧，并降低报告数据质量。
 MORNING_ANALYSIS_MAX_RANKING_AGE_MINUTES = 15
-# 盘前分析只允许前一交易日滚动评分最高的五位博主进入候选上下文。
-MORNING_ANALYSIS_CREATOR_LIMIT = 5
-# 每位入选博主最多向单份盘前报告提供三条已完成分析的作品。
+# 先读取最多二十位有足够历史样本的博主，再按可靠性调整分选择有效观点。
+MORNING_ANALYSIS_CREATOR_LIMIT = 20
+# 每位入选博主最多向单份盘前报告提供三条原子观点。
 MORNING_ANALYSIS_CREATOR_WORK_LIMIT = 3
+# 单份盘前报告最多接收三十条博主观点，控制上下文长度和相关性。
+MORNING_ANALYSIS_CREATOR_OPINION_LIMIT = 30
+MIN_CREATOR_SCORED_EVENTS = 5
+CREATOR_SCORE_PRIOR_EVENTS = 5.0
+CREATOR_SCORE_HALF_LIFE_DAYS = 30.0
 # 博主观点是当前盘前分析的固定输入来源，生产流程始终启用。
 MORNING_ANALYSIS_CREATOR_ENABLED = True
 FAILED_NEWS_STATUSES = {"sector_judge_failed", "sector_detail_failed"}
@@ -165,7 +172,7 @@ class MorningAnalysisService:
         if creator_limit <= 0:
             raise ValueError("creator_limit 必须大于 0")
         if creator_limit > MORNING_ANALYSIS_CREATOR_LIMIT:
-            raise ValueError("creator_limit 不能超过 5")
+            raise ValueError("creator_limit 不能超过 20")
         if creator_work_limit <= 0:
             raise ValueError("creator_work_limit 必须大于 0")
 
@@ -194,14 +201,14 @@ class MorningAnalysisService:
         previous_trade_date = trade_dates.prev_trade_date
         # 新闻榜单和博主结果共享同一个盘前可用截止时间（例如 7/24 08:20）。
         end_ts = int(analysis_cutoff.timestamp())
-        # 作品来源日按自然日倒推；这与 previous_trade_date（交易日）不是同一概念。
-        creator_source_date = date.fromisoformat(analysis_date) - timedelta(days=1)
+        # 上次交易日盘前截止到本次盘前截止构成增量窗口；跨周末时自然覆盖周五至周一。
+        creator_source_date = date.fromisoformat(previous_trade_date)
         creator_publish_start = datetime.combine(
             creator_source_date,
-            time.min,
+            time(self.analysis_hour, self.analysis_minute),
             tzinfo=CN_TZ,
         )
-        creator_publish_end = creator_publish_start + timedelta(days=1, seconds=-1)
+        creator_publish_end = analysis_cutoff
 
         (
             morning_report,
@@ -294,7 +301,7 @@ class MorningAnalysisService:
                 and creator_context.coverage_status != "incomplete"
                 else "degraded"
             ),
-            prompt_version="morning_analysis_v9",
+            prompt_version="morning_analysis_v10_active_creator_events",
             analysis_model=str(getattr(analyzer, "model", "")),
             thinking_enabled=bool(getattr(analyzer, "thinking_enabled", False)),
             news_window=news_window,
@@ -392,7 +399,10 @@ class MorningAnalysisService:
         try:
             if hasattr(self.creator_opinion_repository, "list_ranked_with_ids"):
                 verification_rows = await self.creator_opinion_repository.list_ranked_with_ids(
-                    limit=creator_limit
+                    limit=creator_limit,
+                    creator_ids=tuple(
+                        account.creator_id for account in get_enabled_accounts()
+                    ),
                 )
             else:
                 # 兼容历史单元测试替身；生产仓储不会走旧每日验证集合路径。
@@ -411,6 +421,7 @@ class MorningAnalysisService:
         ranked_creators = self._ranked_creator_contexts(
             verification_rows,
             limit=creator_limit,
+            as_of_date=date.fromisoformat(ranking_market_date),
         )
         if not ranked_creators:
             return CreatorContext(
@@ -420,21 +431,38 @@ class MorningAnalysisService:
             )
 
         publish_start = datetime.fromtimestamp(publish_start_ts, tz=CN_TZ)
-        publish_end = datetime.fromtimestamp(publish_end_ts + 1, tz=CN_TZ)
+        publish_end = datetime.fromtimestamp(publish_end_ts, tz=CN_TZ)
         available_at = datetime.fromtimestamp(available_at_ts, tz=CN_TZ)
         try:
-            work_groups = await asyncio.gather(
-                *(
-                    self.creator_work_repository.list_finished_works_by_published_window(
-                        creator_id=ranking.creator_id,
-                        start_at=publish_start,
-                        end_at=publish_end,
-                        available_at=available_at,
-                        limit=work_limit,
-                    )
-                    for ranking in ranked_creators
-                )
+            active_query = hasattr(
+                self.creator_work_repository,
+                "list_finished_works_for_morning_context",
             )
+            if active_query:
+                work_groups = await asyncio.gather(
+                    *(
+                        self.creator_work_repository.list_finished_works_for_morning_context(
+                            creator_id=ranking.creator_id,
+                            available_after=publish_start,
+                            available_at=available_at,
+                        )
+                        for ranking in ranked_creators
+                    )
+                )
+            else:
+                # 保留旧仓储替身的调用形状；生产路径使用上面的有效观点查询。
+                work_groups = await asyncio.gather(
+                    *(
+                        self.creator_work_repository.list_finished_works_by_published_window(
+                            creator_id=ranking.creator_id,
+                            start_at=publish_start,
+                            end_at=publish_end + timedelta(seconds=1),
+                            available_at=available_at,
+                            limit=work_limit,
+                        )
+                        for ranking in ranked_creators
+                    )
+                )
             if len(work_groups) != len(ranked_creators):
                 raise RuntimeError("博主作品查询结果数量与候选博主数量不一致")
             eligible_works = [
@@ -442,35 +470,43 @@ class MorningAnalysisService:
                 for ranking, works in zip(ranked_creators, work_groups)
                 for work in works
                 if work.creator_id == ranking.creator_id
-                and publish_start_ts
-                <= int(work.published_at.timestamp())
-                <= publish_end_ts
+                and (
+                    active_query
+                    or publish_start_ts
+                    <= int(work.published_at.timestamp())
+                    <= publish_end_ts
+                )
                 and int(work.first_seen_at.timestamp()) <= available_at_ts
                 and work.analysis is not None
                 and int(work.analysis.analyzed_at.timestamp()) <= available_at_ts
             ]
-            if eligible_works:
+            selected_contexts = self._select_creator_work_contexts(
+                eligible_works,
+                available_at=available_at,
+                per_creator_limit=work_limit,
+                global_limit=MORNING_ANALYSIS_CREATOR_OPINION_LIMIT,
+            )
+            if selected_contexts:
                 newest_publish_ts = max(
-                    int(work.published_at.timestamp()) for work, _ in eligible_works
+                    item.publish_ts for item in selected_contexts
                 )
                 try:
                     return CreatorContext(
                         status="available",
                         ranking_market_date=ranking_market_date,
-                        selection_rule="cumulative_accuracy_top5",
+                        selection_rule="reliability_adjusted_active_opinions",
                         ranked_creators=ranked_creators,
                         source_date=source_date,
+                        source_window_start=publish_start,
+                        source_window_end=available_at,
                         age_seconds=available_at_ts - newest_publish_ts,
-                        works=[
-                            self._to_creator_work_context(work, ranking=ranking)
-                            for work, ranking in eligible_works
-                        ],
+                        works=selected_contexts,
                     )
                 except ValueError as exc:
                     return CreatorContext(
                         status="invalid",
                         ranking_market_date=ranking_market_date,
-                        selection_rule="cumulative_accuracy_top5",
+                        selection_rule="reliability_adjusted_active_opinions",
                         ranked_creators=ranked_creators,
                         source_date=source_date,
                         reason=str(exc),
@@ -480,7 +516,7 @@ class MorningAnalysisService:
                 return CreatorContext(
                     status="invalid",
                     ranking_market_date=ranking_market_date,
-                    selection_rule="cumulative_accuracy_top5",
+                    selection_rule="reliability_adjusted_active_opinions",
                     ranked_creators=ranked_creators,
                     source_date=source_date,
                     reason="博主作品的发现或分析完成时间晚于盘前分析可用时点",
@@ -497,10 +533,10 @@ class MorningAnalysisService:
         return CreatorContext(
             status="missing",
             ranking_market_date=ranking_market_date,
-            selection_rule="cumulative_accuracy_top5",
+            selection_rule="reliability_adjusted_active_opinions",
             ranked_creators=ranked_creators,
             source_date=source_date,
-            reason=f"未找到 {source_date} 已完成分析的博主作品；未回退到更早作品",
+            reason="增量窗口内没有新完成且当前仍有效的结构化博主预测",
         )
 
     @staticmethod
@@ -508,32 +544,46 @@ class MorningAnalysisService:
         verifications: list[Any],
         *,
         limit: int,
+        as_of_date: date | None = None,
     ) -> list[CreatorRankingContext]:
-        """按滚动分选择最多五个具有历史有效样本的博主。
-
-        排序首先使用最近七个自然日有效观点的近期分，其次使用前一交易日当日分，最后
-        使用稳定博主 ID，确保补跑和不同 MongoDB 返回顺序不会改变入选结果。没有
-        滚动分、没有有效历史样本或重复的博主文档不会进入盘前上下文。
-        """
+        """按时间衰减表现和中性先验收缩分选择博主，抑制小样本极端排名。"""
 
         normalized: list[Any] = []
         for value in verifications:
             if isinstance(value, tuple) and len(value) == 2:
                 creator_id, display = value
-                score = getattr(display, "accuracy_score", None)
                 verified = getattr(display, "verified_opinions", ())
-                samples = sum(item.score is not None for item in verified)
-                if score is not None and samples:
+                metrics = MorningAnalysisService._creator_reliability_metrics(
+                    verified,
+                    as_of_date=as_of_date or date.today(),
+                )
+                if metrics is not None and metrics[2] >= MIN_CREATOR_SCORED_EVENTS:
+                    rolling_score, adjusted_score, samples, lifetime_score = metrics
                     normalized.append(
                         SimpleNamespace(
                             creator_id=str(creator_id),
                             creator_name=display.creator_name,
-                            rolling_score=score,
-                            daily_score=score,
+                            rolling_score=rolling_score,
+                            sample_adjusted_score=adjusted_score,
+                            daily_score=None,
                             sample_count=samples,
+                            lifetime_score=lifetime_score,
+                            lifetime_sample_count=samples,
                         )
                     )
             else:
+                sample_count = int(getattr(value, "sample_count", 0) or 0)
+                rolling_score = getattr(value, "rolling_score", None)
+                if rolling_score is not None and not hasattr(
+                    value, "sample_adjusted_score"
+                ):
+                    adjusted = (
+                        float(rolling_score) * sample_count
+                        + 50.0 * CREATOR_SCORE_PRIOR_EVENTS
+                    ) / (sample_count + CREATOR_SCORE_PRIOR_EVENTS)
+                    value.sample_adjusted_score = adjusted
+                    value.lifetime_score = float(rolling_score)
+                    value.lifetime_sample_count = sample_count
                 normalized.append(value)
         candidates = [
             item
@@ -544,6 +594,11 @@ class MorningAnalysisService:
         ]
         candidates.sort(
             key=lambda item: (
+                -float(
+                    getattr(item, "sample_adjusted_score", None)
+                    if getattr(item, "sample_adjusted_score", None) is not None
+                    else item.rolling_score
+                ),
                 -float(item.rolling_score),
                 -float(
                     item.daily_score
@@ -572,11 +627,61 @@ class MorningAnalysisService:
                         else None
                     ),
                     sample_count=int(item.sample_count),
+                    sample_adjusted_score=float(
+                        getattr(item, "sample_adjusted_score", item.rolling_score)
+                    ),
+                    lifetime_score=float(
+                        getattr(item, "lifetime_score", item.rolling_score)
+                    ),
+                    lifetime_sample_count=int(
+                        getattr(item, "lifetime_sample_count", item.sample_count)
+                    ),
                 )
             )
             if len(result) == limit:
                 break
         return result
+
+    @staticmethod
+    def _creator_reliability_metrics(
+        records: Any,
+        *,
+        as_of_date: date,
+    ) -> tuple[float, float, int, float] | None:
+        """按事件合并分支，并计算 30 日半衰期分和五样本中性先验收缩分。"""
+
+        grouped: dict[str, list[Any]] = {}
+        for item in records:
+            if getattr(item, "score", None) is None:
+                continue
+            grouped.setdefault(
+                str(getattr(item, "event_id", "") or item.opinion_id), []
+            ).append(item)
+        if not grouped:
+            return None
+        weighted_sum = 0.0
+        weight_sum = 0.0
+        lifetime_values: list[float] = []
+        for values in grouped.values():
+            event_value = sum(float(item.score) for item in values) / len(values)
+            event_score = (event_value + 1.0) * 50.0
+            due_date = max(date.fromisoformat(item.verification_date) for item in values)
+            age_days = max((as_of_date - due_date).days, 0)
+            weight = 0.5 ** (age_days / CREATOR_SCORE_HALF_LIFE_DAYS)
+            weighted_sum += event_score * weight
+            weight_sum += weight
+            lifetime_values.append(event_score)
+        rolling_score = weighted_sum / weight_sum
+        adjusted_score = (
+            weighted_sum + 50.0 * CREATOR_SCORE_PRIOR_EVENTS
+        ) / (weight_sum + CREATOR_SCORE_PRIOR_EVENTS)
+        lifetime_score = sum(lifetime_values) / len(lifetime_values)
+        return (
+            round(rolling_score, 2),
+            round(adjusted_score, 2),
+            len(lifetime_values),
+            round(lifetime_score, 2),
+        )
 
     def _to_creator_work_context(
         self,
@@ -596,20 +701,44 @@ class MorningAnalysisService:
 
         if work.status.status != "finished" or work.analysis is None:
             raise ValueError("盘前博主上下文只能由 finished 作品生成")
-        sector_opinions = [
-            CreatorSectorOpinionContext(
-                opinion_id=opinion.opinion_id,
-                sector_name=opinion.target_name,
-                stance_score=opinion.stance_score,
-                reason=self._creator_opinion_reason(
-                    claim=opinion.claim,
-                    source_quote=opinion.source_quote,
-                ),
+        structured_opinions: list[CreatorStructuredOpinionContext] = []
+        sector_opinions: list[CreatorSectorOpinionContext] = []
+        for opinion in work.analysis.opinions:
+            normalized_sector = (
+                self._normalize_sector_name(opinion.target_name)
+                if opinion.target_type == "sector"
+                else None
             )
-            for opinion in work.analysis.opinions
-            if opinion.target_type == "sector"
-            and opinion.target_name in self.valid_sector_names
-        ]
+            reason = self._creator_opinion_reason(
+                claim=opinion.claim,
+                source_quote=opinion.source_quote,
+            )
+            structured_opinions.append(
+                CreatorStructuredOpinionContext(
+                    opinion_id=opinion.opinion_id,
+                    event_id=opinion.event_id,
+                    target_type=opinion.target_type,
+                    target_name=opinion.target_name,
+                    normalized_target_name=normalized_sector,
+                    direction=opinion.direction,
+                    stance_score=opinion.stance_score,
+                    claim=opinion.claim,
+                    horizon=opinion.horizon,
+                    valid_until=opinion.valid_until,
+                    confidence=opinion.confidence,
+                    statement_type=opinion.statement_type,
+                    reason=reason,
+                )
+            )
+            if normalized_sector is not None:
+                sector_opinions.append(
+                    CreatorSectorOpinionContext(
+                        opinion_id=opinion.opinion_id,
+                        sector_name=normalized_sector,
+                        stance_score=opinion.stance_score,
+                        reason=reason,
+                    )
+                )
         return CreatorWorkContext(
             work_id=work.work_key,
             creator_id=ranking.creator_id if ranking is not None else work.creator_id,
@@ -619,11 +748,80 @@ class MorningAnalysisService:
             analysis=CreatorWorkAnalysisContext(
                 summary=work.analysis.summary,
                 sector_opinions=sector_opinions,
+                structured_opinions=structured_opinions,
                 analysis_version=work.analysis.analysis_version,
                 analysis_model=work.analysis.analysis_model,
                 analyzed_at=work.analysis.analyzed_at,
             ),
         )
+
+    def _normalize_sector_name(self, value: str) -> str | None:
+        """把“半导体板块”等唯一后缀别名映射到同花顺行业，集合主题不强映射。"""
+
+        normalized = value.strip()
+        if normalized in self.valid_sector_names:
+            return normalized
+        for suffix in ("板块", "行业", "概念"):
+            if normalized.endswith(suffix):
+                candidate = normalized[: -len(suffix)].strip()
+                if candidate in self.valid_sector_names:
+                    return candidate
+        return None
+
+    def _select_creator_work_contexts(
+        self,
+        rows: list[tuple[CreatorWork, CreatorRankingContext]],
+        *,
+        available_at: datetime,
+        per_creator_limit: int,
+        global_limit: int,
+    ) -> list[CreatorWorkContext]:
+        """只保留截止盘前仍有效的事前预测，并按博主与全局观点数截断。"""
+
+        selected: list[CreatorWorkContext] = []
+        used_by_creator: dict[str, int] = {}
+        used_total = 0
+        for work, ranking in rows:
+            remaining_creator = per_creator_limit - used_by_creator.get(
+                ranking.creator_id, 0
+            )
+            remaining_global = global_limit - used_total
+            remaining = min(remaining_creator, remaining_global)
+            if remaining <= 0:
+                continue
+            context = self._to_creator_work_context(work, ranking=ranking)
+            active = [
+                item
+                for item in context.analysis.structured_opinions
+                if item.statement_type in {"forecast", "conditional_forecast"}
+                and item.valid_until is not None
+                and item.valid_until.astimezone(CN_TZ) >= available_at
+            ][:remaining]
+            if not active:
+                continue
+            active_ids = {item.opinion_id for item in active}
+            context = context.model_copy(
+                update={
+                    "analysis": context.analysis.model_copy(
+                        update={
+                            "structured_opinions": active,
+                            "sector_opinions": [
+                                item
+                                for item in context.analysis.sector_opinions
+                                if item.opinion_id in active_ids
+                            ],
+                        }
+                    )
+                }
+            )
+            selected.append(context)
+            used_by_creator[ranking.creator_id] = (
+                used_by_creator.get(ranking.creator_id, 0) + len(active)
+            )
+            used_total += len(active)
+            if used_total >= global_limit:
+                break
+        return selected
 
     @staticmethod
     def _creator_opinion_reason(*, claim: str, source_quote: str) -> str:

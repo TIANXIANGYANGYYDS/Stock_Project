@@ -68,10 +68,13 @@ async def creator_ingestion_job() -> None:
     try:
         result = await run_creator_ingestion()
         logger.info(
-            "creator_ingestion_job completed accounts=%s inserted=%s failed_accounts=%s",
+            "creator_ingestion_job completed accounts=%s inserted=%s "
+            "failed_accounts=%s partial_accounts=%s detail_failed=%s",
             len(result.results),
             result.inserted_count,
             result.failed_account_count,
+            result.partial_account_count,
+            result.detail_failed_count,
         )
     except Exception:
         logger.exception("creator_ingestion_job failed")
@@ -194,7 +197,7 @@ def register_creator_monitoring_jobs(scheduler: AsyncIOScheduler) -> None:
             timezone="Asia/Shanghai",
         ),
         id=CREATOR_INGESTION_JOB_ID,
-        name="抓取20位跨平台博主公开作品",
+        name="抓取7位跨平台博主公开作品",
         replace_existing=True,
         max_instances=1,
         coalesce=True,

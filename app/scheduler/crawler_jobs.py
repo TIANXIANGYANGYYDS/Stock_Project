@@ -311,7 +311,16 @@ async def _run_stock_daily_detail_compensation_job(
     else:
         raise ValueError(f"unsupported compensation target_scope: {target_scope}")
 
-    decision = await resolve_a_stock_target_trade_date(reference_yyyymmdd)
+    try:
+        decision = await resolve_a_stock_target_trade_date(reference_yyyymmdd)
+    except Exception:
+        logger.exception(
+            "sync_stock_daily_detail_compensation_failed target_scope=%s "
+            "reference_date=%s phase=resolve_trade_date",
+            target_scope,
+            reference_yyyymmdd,
+        )
+        return
     logger.info(
         "sync_stock_daily_detail_compensation_start target_scope=%s "
         "target_trade_date=%s max_automatic_compensations=%s",

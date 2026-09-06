@@ -94,6 +94,26 @@ def test_creator_ingestion_job_propagates_failure(monkeypatch) -> None:
         asyncio.run(creator_monitoring_jobs.creator_ingestion_job())
 
 
+def test_creator_ingestion_job_logs_partial_and_detail_failures(
+    monkeypatch, caplog
+) -> None:
+    async def completed():
+        return SimpleNamespace(
+            results=(object(), object()),
+            inserted_count=3,
+            failed_account_count=1,
+            partial_account_count=4,
+            detail_failed_count=12,
+        )
+
+    monkeypatch.setattr(creator_monitoring_jobs, "run_creator_ingestion", completed)
+    with caplog.at_level(logging.INFO):
+        asyncio.run(creator_monitoring_jobs.creator_ingestion_job())
+
+    assert "partial_accounts=4" in caplog.text
+    assert "detail_failed=12" in caplog.text
+
+
 def test_scheduler_reference_datetime_requires_timezone() -> None:
     with pytest.raises(ValueError, match="时区"):
         creator_monitoring_jobs._reference_datetime(datetime(2026, 7, 24, 19))

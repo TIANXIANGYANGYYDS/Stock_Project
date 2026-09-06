@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import math
 
 import pytest
@@ -496,8 +497,7 @@ def test_close_marks_untriggered_candidates_and_completes_timeline() -> None:
     ]
 
 
-@pytest.mark.asyncio
-async def test_repository_saves_one_snapshot_per_strategy_and_trade_date() -> None:
+def test_repository_saves_one_snapshot_per_strategy_and_trade_date() -> None:
     class Collection:
         def __init__(self) -> None:
             self.saved = None
@@ -521,7 +521,7 @@ async def test_repository_saves_one_snapshot_per_strategy_and_trade_date() -> No
         candidates=[candidate()],
     )
 
-    saved = await QuantDailyResultRepository(database).save(flow)
+    saved = asyncio.run(QuantDailyResultRepository(database).save(flow))
 
     assert database.collection.saved == (
         {

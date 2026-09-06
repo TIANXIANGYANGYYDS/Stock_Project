@@ -335,7 +335,7 @@ async def run_probe(
 def main() -> None:
     """解析只读探测命令行选项，运行异步检查并输出格式化 JSON。"""
 
-    parser = argparse.ArgumentParser(description="只读检查 20 位博主的公开采集接口")
+    parser = argparse.ArgumentParser(description="只读检查 7 位博主的公开采集接口")
     parser.add_argument(
         "--platform",
         choices=["douyin", "bilibili", "wechat", "weibo", "sina_blog"],

@@ -323,7 +323,7 @@ def test_morning_analysis_service_builds_and_upserts_report() -> None:
     assert result.report.ranking_snapshot_meta is not None
     assert result.report.ranking_snapshot_meta.snapshot_id.startswith("snapshot-")
     assert result.report.ranking_snapshot_meta.is_stale is False
-    assert result.report.prompt_version == "morning_analysis_v9"
+    assert result.report.prompt_version == "morning_analysis_v10_active_creator_events"
     assert result.report.analysis_model == ""
     assert result.report.thinking_enabled is False
     assert result.report.source_analysis_memos == {
@@ -350,8 +350,8 @@ def test_morning_analysis_service_builds_and_upserts_report() -> None:
     assert creator_repository.list_calls == [
         {
             "creator_id": "creator-1",
-            "start_at": datetime(2026, 7, 22, 0, 0, tzinfo=CN_TZ),
-            "end_at": datetime(2026, 7, 23, 0, 0, tzinfo=CN_TZ),
+            "start_at": datetime(2026, 7, 22, 8, 20, tzinfo=CN_TZ),
+            "end_at": datetime(2026, 7, 23, 8, 20, 1, tzinfo=CN_TZ),
             "available_at": now,
             "limit": 3,
         }
@@ -564,7 +564,7 @@ def test_delayed_run_keeps_the_configured_morning_cutoff() -> None:
     assert result.report.ranking_snapshot_meta is not None
     assert result.report.ranking_snapshot_meta.age_seconds == 60
     assert creator_repository.list_calls[0]["end_at"] == datetime(
-        2026, 7, 23, 0, 0, tzinfo=CN_TZ
+        2026, 7, 23, 9, 0, 1, tzinfo=CN_TZ
     )
     assert creator_repository.list_calls[0]["available_at"] == cutoff
     assert service.ranking_snapshot_repository.dates == [
@@ -680,7 +680,7 @@ def test_creator_context_uses_only_previous_trade_day_top_five_by_rolling_score(
         "creator-5",
     ]
     assert context.status == "available"
-    assert context.selection_rule == "cumulative_accuracy_top5"
+    assert context.selection_rule == "reliability_adjusted_active_opinions"
     assert [item.creator_id for item in context.ranked_creators] == expected_ids
     assert [item.rank for item in context.ranked_creators] == [1, 2, 3, 4, 5]
     assert [item.creator_id for item in context.works] == expected_ids
@@ -921,6 +921,41 @@ def test_creator_context_does_not_fallback_to_older_work() -> None:
     assert context.works == []
     assert context.ranked_creators
     assert creator_repository.latest_calls == []
+
+
+def test_empty_newest_work_does_not_consume_creator_opinion_quota() -> None:
+    """验证没有结构化预测的新作品不会挤掉稍早但仍有效的观点。"""
+
+    cutoff = datetime(2026, 7, 29, 8, 20, tzinfo=CN_TZ)
+    ranking = MorningAnalysisService._ranked_creator_contexts(
+        [build_creator_verification(sample_count=5)],
+        limit=1,
+        as_of_date=cutoff.date(),
+    )[0]
+    newest = build_creator_work(cutoff, age_hours=1, work_id="empty")
+    assert newest.analysis is not None
+    newest = newest.model_copy(
+        update={"analysis": newest.analysis.model_copy(update={"opinions": []})}
+    )
+    meaningful = build_creator_work(cutoff, age_hours=10, work_id="meaningful")
+    service = MorningAnalysisService()
+
+    selected = service._select_creator_work_contexts(
+        [(newest, ranking), (meaningful, ranking)],
+        available_at=cutoff,
+        per_creator_limit=1,
+        global_limit=30,
+    )
+
+    assert [item.work_id for item in selected] == ["douyin:meaningful"]
+    assert len(selected[0].analysis.structured_opinions) == 1
+
+
+def test_sector_suffix_is_normalized_without_mapping_broad_theme() -> None:
+    service = MorningAnalysisService()
+
+    assert service._normalize_sector_name("半导体板块") == "半导体"
+    assert service._normalize_sector_name("大科技") is None
 
 
 def test_resolve_morning_trade_dates_uses_current_and_previous_session() -> None:
