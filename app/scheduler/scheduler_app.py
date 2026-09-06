@@ -21,6 +21,7 @@ from app.scheduler.news_ranking_jobs import (
     register_news_ranking_job,
     run_news_ranking_snapshot,
 )
+from app.scheduler.quant_jobs import register_quant_live_jobs
 
 
 logger = logging.getLogger(__name__)
@@ -50,7 +51,7 @@ def configure_logging() -> None:
 
 
 def build_scheduler() -> AsyncIOScheduler:
-    """创建调度器并注册新闻、博主采集和盘前分析的全部周期任务。
+    """创建调度器并注册采集、分析和量化影子盘的全部周期任务。
 
     博主采集、内容提取、观点分析和评分统一由 creator monitoring 链路负责；
     任务定义和下一次触发时间写入 MongoDB job store，返回尚未启动的调度器，
@@ -82,6 +83,7 @@ def build_scheduler() -> AsyncIOScheduler:
     register_news_ranking_job(scheduler)
     register_creator_monitoring_jobs(scheduler)
     register_morning_analysis_job(scheduler)
+    register_quant_live_jobs(scheduler)
     return scheduler
 
 

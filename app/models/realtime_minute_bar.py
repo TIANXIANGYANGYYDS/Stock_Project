@@ -35,6 +35,11 @@ class RealtimeMinuteBar(BaseModel):
     high: float
     low: float
     close: float
+    previous_close: Optional[float] = Field(
+        default=None,
+        gt=0,
+        description="行情源在当前交易日给出的前收盘参考价",
+    )
     volume: float = Field(default=0, ge=0)
     amount: float = Field(default=0, ge=0)
     provider: str

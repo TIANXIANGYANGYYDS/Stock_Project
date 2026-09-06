@@ -6,6 +6,9 @@ from datetime import datetime, timedelta, timezone
 
 import app.services.realtime_minute_service as realtime_minute_module
 from app.crawlers.realtime_market_crawler import (
+    QuoteBatchResult,
+    RealtimeMarketCrawler,
+    RealtimeQuote,
     SinaQuoteProvider,
     TencentQuoteProvider,
     market_prefix,
@@ -140,6 +143,69 @@ def test_public_quote_parsers_normalize_volume_and_amount() -> None:
 
         asyncio.run(tencent.close())
         asyncio.run(sina.close())
+
+
+def test_realtime_crawler_fetches_market_batches_concurrently() -> None:
+    class ConcurrentProvider:
+        def __init__(self) -> None:
+            self.active = 0
+            self.max_active = 0
+
+        async def fetch_batch(self, codes):
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            await asyncio.sleep(0)
+            now = datetime(2026, 8, 26, 14, 56, tzinfo=CN_TZ)
+            quotes = tuple(
+                RealtimeQuote(
+                    code=code,
+                    name=code,
+                    market="SH",
+                    provider="TEST",
+                    price=10.0,
+                    volume=100.0,
+                    amount=1000.0,
+                    market_data_time=now,
+                    received_at=now,
+                )
+                for code in codes
+            )
+            self.active -= 1
+            return QuoteBatchResult(
+                provider="TEST",
+                requested=len(codes),
+                returned=len(quotes),
+                status_code=200,
+                elapsed_ms=1.0,
+                response_bytes=1,
+                quotes=quotes,
+            )
+
+        async def close(self):
+            return None
+
+    class UnexpectedBackup:
+        async def fetch_batch(self, codes):
+            raise AssertionError("complete primary batches should not use fallback")
+
+        async def close(self):
+            return None
+
+    async def run() -> None:
+        crawler = RealtimeMarketCrawler(batch_size=1)
+        await crawler.close()
+        primary = ConcurrentProvider()
+        crawler.primary = primary  # type: ignore[assignment]
+        crawler.backup = UnexpectedBackup()  # type: ignore[assignment]
+        quotes, metrics = await crawler.fetch_quotes(["600001", "600002", "600003"])
+        await crawler.close()
+
+        assert primary.max_active == 3
+        assert [quote.code for quote in quotes] == ["600001", "600002", "600003"]
+        assert metrics["requests"] == 3
+        assert metrics["failed_batches"] == 0
+
+    asyncio.run(run())
 
 
 def test_local_aggregation_uses_cumulative_volume_delta() -> None:
@@ -382,6 +448,39 @@ def test_flush_writes_one_and_all_requested_aggregate_intervals() -> None:
     assert five_minute.close == 10.1
     assert five_minute.volume == 600
     assert five_minute.amount == 6090
+
+
+def test_force_flush_batches_writes_and_releases_aggregate_memory() -> None:
+    class FakeRepository:
+        def __init__(self) -> None:
+            self.batch_sizes = []
+
+        async def upsert_bars(self, bars):
+            batch = list(bars)
+            self.batch_sizes.append(len(batch))
+            return len(batch)
+
+    async def run():
+        service = RealtimeMinuteService()
+        repository = FakeRepository()
+        service.repository = repository  # type: ignore[assignment]
+        try:
+            base = service_quote(
+                price=10.0,
+                volume=1000,
+                amount=10000,
+                received_at=datetime(2026, 8, 7, 9, 30, 5, tzinfo=CN_TZ),
+            )
+            for index in range(251):
+                service._ingest_quote(replace(base, code=f"{index:06d}"))
+            await service._flush_before(None, force=True)
+            return repository.batch_sizes, service._aggregate_bars
+        finally:
+            await service.close()
+
+    batch_sizes, remaining_aggregates = asyncio.run(run())
+    assert batch_sizes == [1500, 6]
+    assert remaining_aggregates == {}
 
 
 def service_quote(*, price: float, volume: float, amount: float, received_at: datetime):

@@ -9,7 +9,17 @@ from fastapi.responses import JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError
 
-from app.api.routers import creators, health, market, morning_analysis, news, rankings, stats, stocks
+from app.api.routers import (
+    creators,
+    health,
+    market,
+    morning_analysis,
+    news,
+    quant,
+    rankings,
+    stats,
+    stocks,
+)
 from app.crawlers.realtime_market_crawler import RealtimeMarketCrawler
 from app.core.config import get_settings
 from app.services.realtime_index_service import RealtimeIndexService
@@ -65,4 +75,5 @@ def create_app() -> FastAPI:
     app.include_router(stocks.router)
     app.include_router(creators.router)
     app.include_router(stats.router)
+    app.include_router(quant.router)
     return app

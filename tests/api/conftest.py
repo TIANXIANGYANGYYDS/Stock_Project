@@ -105,6 +105,43 @@ def project(document: dict[str, Any], projection: dict[str, Any] | None) -> dict
     return result
 
 
+def aggregate_value(value, row, variables=None):
+    """Small Mongo expression subset used by projected, paginated API fixtures."""
+    variables = variables or {}
+    if isinstance(value, str):
+        if value.startswith("$$"):
+            parts = value[2:].split(".", 1)
+            current = variables.get(parts[0])
+            return _value(current, parts[1]) if len(parts) == 2 else current
+        return _value(row, value[1:]) if value.startswith("$") else value
+    if isinstance(value, list):
+        return [aggregate_value(v, row, variables) for v in value]
+    if not isinstance(value, dict):
+        return value
+    if "$ifNull" in value:
+        values = aggregate_value(value["$ifNull"], row, variables)
+        return next((v for v in values if v is not None), None)
+    if "$and" in value:
+        return all(aggregate_value(v, row, variables) for v in value["$and"])
+    if "$eq" in value:
+        left, right = aggregate_value(value["$eq"], row, variables)
+        return left == right
+    if "$filter" in value:
+        expression = value["$filter"]
+        items = aggregate_value(expression["input"], row, variables)
+        return [item for item in items if aggregate_value(expression["cond"], row,
+                {**variables, expression.get("as", "this"): item})]
+    raise NotImplementedError(f"Unsupported aggregate expression: {value}")
+
+
+def aggregate_project(row, projection):
+    result = project(row, {k: v for k, v in projection.items() if v in (0, 1)})
+    for key, value in projection.items():
+        if value not in (0, 1):
+            _nested_set(result, key, aggregate_value(value, row))
+    return result
+
+
 class FakeCursor:
     def __init__(self, rows: list[dict[str, Any]]):
         self.rows = rows
@@ -152,6 +189,21 @@ class FakeCollection:
             elif "$sort" in stage:
                 fields = [(field, direction) for field, direction in stage["$sort"].items()]
                 FakeCursor(rows).sort(fields)
+            elif "$project" in stage:
+                rows = [aggregate_project(row, stage["$project"]) for row in rows]
+            elif "$unwind" in stage:
+                path = stage["$unwind"].lstrip("$")
+                expanded = []
+                for row in rows:
+                    for value in _value(row, path) or []:
+                        item = copy.deepcopy(row)
+                        _nested_set(item, path, value)
+                        expanded.append(item)
+                rows = expanded
+            elif "$skip" in stage:
+                rows = rows[stage["$skip"]:]
+            elif "$limit" in stage:
+                rows = rows[:stage["$limit"]]
             elif "$group" in stage:
                 group = stage["$group"]
                 if group.get("_id") == "$code":
@@ -173,29 +225,8 @@ class FakeCollection:
             elif "$count" in stage:
                 rows = [{stage["$count"]: len(rows)}]
             elif "$facet" in stage:
-                facet_result = {}
-                for name, stages in stage["$facet"].items():
-                    facet_rows = copy.deepcopy(rows)
-                    for facet_stage in stages:
-                        if "$skip" in facet_stage:
-                            facet_rows = facet_rows[facet_stage["$skip"]:]
-                        elif "$limit" in facet_stage:
-                            facet_rows = facet_rows[:facet_stage["$limit"]]
-                        elif "$project" in facet_stage:
-                            projected = []
-                            for row in facet_rows:
-                                item = {}
-                                for key, value in facet_stage["$project"].items():
-                                    if value == 1 and key in row:
-                                        item[key] = row[key]
-                                    elif isinstance(value, str) and value.startswith("$"):
-                                        item[key] = _value(row, value[1:])
-                                projected.append(item)
-                            facet_rows = projected
-                        elif "$count" in facet_stage:
-                            facet_rows = [{facet_stage["$count"]: len(facet_rows)}]
-                    facet_result[name] = facet_rows
-                rows = [facet_result]
+                rows = [{name: FakeCollection(rows).aggregate(stages).rows
+                         for name, stages in stage["$facet"].items()}]
         return FakeCursor(rows)
 
 

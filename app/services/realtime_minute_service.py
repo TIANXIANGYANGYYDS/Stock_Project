@@ -13,7 +13,9 @@ from app.crawlers.realtime_market_crawler import RealtimeMarketCrawler, Realtime
 from app.crawlers.stock_daily_detail_crawler import StockDailyDetailCrawler
 from app.models.realtime_minute_bar import RealtimeMinuteBar, now_cn
 from app.repositories.realtime_minute_bar_repository import RealtimeMinuteBarRepository
-from app.services.trading_calendar_service import resolve_morning_trade_dates
+from app.services.stock_daily_detail_service import (
+    resolve_a_stock_target_trade_date,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,12 @@ SESSION_CLOSE_STABILITY_SECONDS = 5 * 60
 SESSION_HARD_STOP_GRACE_SECONDS = 10 * 60
 SOURCE_CLOCK_SAMPLE_LIMIT = 31
 MIN_UNIVERSE_SYMBOLS = 1000
+MAX_UNIVERSE_SYMBOLS = 7_000
+REALTIME_PERSIST_STOCK_BATCH_SIZE = 250
+MAX_IN_MEMORY_MINUTE_BARS = MAX_UNIVERSE_SYMBOLS * 3
+MAX_IN_MEMORY_AGGREGATE_BARS = (
+    MAX_UNIVERSE_SYMBOLS * len(AGGREGATE_INTERVAL_MINUTES) * 2
+)
 SOURCE_CLOCK_REFERENCE_CODES = frozenset(
     {"600519", "000001", "300750", "601318", "600036"}
 )
@@ -45,6 +53,7 @@ class _MutableBar:
     high: float
     low: float
     close: float
+    previous_close: Optional[float]
     volume: float
     amount: float
     provider: str
@@ -65,6 +74,7 @@ class _MutableBar:
             high=self.high,
             low=self.low,
             close=self.close,
+            previous_close=self.previous_close,
             volume=max(0.0, self.volume),
             amount=max(0.0, self.amount),
             provider=self.provider,
@@ -155,6 +165,11 @@ class RealtimeMinuteService:
             raise RuntimeError(
                 "realtime stock universe is too small: "
                 f"mongo={len(by_code)} public={len(fresh_by_code)}"
+            )
+        if len(by_code) > MAX_UNIVERSE_SYMBOLS:
+            raise RuntimeError(
+                "realtime stock universe exceeds memory safety limit: "
+                f"{len(by_code)}/{MAX_UNIVERSE_SYMBOLS}"
             )
         rows = [by_code[code] for code in sorted(by_code)]
         logger.info(
@@ -287,12 +302,18 @@ class RealtimeMinuteService:
                 high=quote.price,
                 low=quote.price,
                 close=quote.price,
+                previous_close=quote.previous_close,
                 volume=delta_volume,
                 amount=delta_amount,
                 provider=quote.provider,
                 first_seen_at=first_seen,
                 last_seen_at=first_seen,
             )
+            if len(self._bars) > MAX_IN_MEMORY_MINUTE_BARS:
+                raise RuntimeError(
+                    "realtime minute bars exceed memory safety limit: "
+                    f"{len(self._bars)}/{MAX_IN_MEMORY_MINUTE_BARS}"
+                )
             return
         changed = (
             current.close != quote.price
@@ -304,6 +325,7 @@ class RealtimeMinuteService:
         current.high = max(current.high, quote.price)
         current.low = min(current.low, quote.price)
         current.close = quote.price
+        current.previous_close = quote.previous_close or current.previous_close
         current.volume += delta_volume
         current.amount += delta_amount
         current.provider = quote.provider
@@ -331,6 +353,7 @@ class RealtimeMinuteService:
                     high=minute_bar.high,
                     low=minute_bar.low,
                     close=minute_bar.close,
+                    previous_close=minute_bar.previous_close,
                     volume=minute_bar.volume,
                     amount=minute_bar.amount,
                     provider=minute_bar.provider,
@@ -339,10 +362,22 @@ class RealtimeMinuteService:
                     revision_count=minute_bar.revision_count,
                 )
                 self._aggregate_bars[key] = current
+                if (
+                    len(self._aggregate_bars)
+                    > MAX_IN_MEMORY_AGGREGATE_BARS
+                ):
+                    raise RuntimeError(
+                        "realtime aggregate bars exceed memory safety limit: "
+                        f"{len(self._aggregate_bars)}/"
+                        f"{MAX_IN_MEMORY_AGGREGATE_BARS}"
+                    )
             else:
                 current.high = max(current.high, minute_bar.high)
                 current.low = min(current.low, minute_bar.low)
                 current.close = minute_bar.close
+                current.previous_close = (
+                    minute_bar.previous_close or current.previous_close
+                )
                 current.volume += minute_bar.volume
                 current.amount += minute_bar.amount
                 current.provider = minute_bar.provider
@@ -359,24 +394,49 @@ class RealtimeMinuteService:
             selected = [bar for key, bar in self._bars.items() if cutoff and key[1] < cutoff]
             for bar in selected:
                 self._bars.pop((bar.code, bar.timestamp), None)
-        if not selected:
-            return 0
         selected.sort(key=lambda bar: (bar.timestamp, bar.code))
-        aggregate_updates: dict[tuple[str, str, str], _MutableBar] = {}
-        for minute_bar in selected:
-            for aggregate_bar in self._update_aggregate_bars(minute_bar):
-                key = (aggregate_bar.code, aggregate_bar.interval, aggregate_bar.timestamp)
-                aggregate_updates[key] = aggregate_bar
         corrected_now = self._exchange_now(datetime.now(CN_TZ))
-        documents = [bar.to_model(now=corrected_now) for bar in selected]
-        documents.extend(
-            bar.to_model(now=corrected_now) for bar in aggregate_updates.values()
-        )
-        written = await self.repository.upsert_bars(documents)
+        written = 0
+        aggregate_update_count = 0
+        for offset in range(0, len(selected), REALTIME_PERSIST_STOCK_BATCH_SIZE):
+            minute_chunk = selected[
+                offset : offset + REALTIME_PERSIST_STOCK_BATCH_SIZE
+            ]
+            aggregate_updates: dict[tuple[str, str, str], _MutableBar] = {}
+            for minute_bar in minute_chunk:
+                for aggregate_bar in self._update_aggregate_bars(minute_bar):
+                    key = (
+                        aggregate_bar.code,
+                        aggregate_bar.interval,
+                        aggregate_bar.timestamp,
+                    )
+                    aggregate_updates[key] = aggregate_bar
+            documents = [bar.to_model(now=corrected_now) for bar in minute_chunk]
+            documents.extend(
+                bar.to_model(now=corrected_now)
+                for bar in aggregate_updates.values()
+            )
+            written += await self.repository.upsert_bars(documents)
+            aggregate_update_count += len(aggregate_updates)
+            del documents
+
+        if force:
+            self._aggregate_bars.clear()
+        elif cutoff:
+            cutoff_at = datetime.fromisoformat(cutoff)
+            completed_keys = [
+                key
+                for key in self._aggregate_bars
+                if datetime.fromisoformat(key[2])
+                + timedelta(minutes=int(key[1][:-1]))
+                <= cutoff_at
+            ]
+            for key in completed_keys:
+                self._aggregate_bars.pop(key, None)
         logger.info(
             "realtime_minute_bars_flushed minute_bars=%s aggregate_bars=%s written=%s",
             len(selected),
-            len(aggregate_updates),
+            aggregate_update_count,
             written,
         )
         return written
@@ -387,8 +447,10 @@ class RealtimeMinuteService:
         session_start = datetime.combine(now.date(), start_time, tzinfo=CN_TZ)
         session_end = datetime.combine(now.date(), end_time, tzinfo=CN_TZ)
         wall_deadline = session_end + timedelta(seconds=SESSION_HARD_STOP_GRACE_SECONDS)
-        trade_date = resolve_morning_trade_dates(now.date())
-        if not trade_date.is_current_trade_day:
+        trade_date = await resolve_a_stock_target_trade_date(
+            now.strftime("%Y%m%d")
+        )
+        if not trade_date.is_reference_trade_day:
             logger.info(
                 "realtime_minute_session_skipped session=%s reason=non_trading_day",
                 session,
@@ -403,7 +465,7 @@ class RealtimeMinuteService:
             return {"session": session, "status": "skipped", "reason": "outside_trading_window"}
 
         await self.repository.create_indexes()
-        rows = await self._load_universe(trade_date.reference_date)
+        rows = await self._load_universe(trade_date.reference_trade_date)
         codes = [row["code"] for row in rows]
         name_by_code = {row["code"]: row["name"] for row in rows}
         started = time.perf_counter()

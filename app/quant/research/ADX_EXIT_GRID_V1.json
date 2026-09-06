@@ -1,0 +1,75 @@
+{
+  "version": "ADX_EXIT_V1",
+  "start_date": "2026-06-22",
+  "end_date": "2026-08-31",
+  "initial_cash": 100000,
+  "cost_modes": [
+    "normal",
+    "double_cost"
+  ],
+  "scenarios": [
+    {
+      "period": null,
+      "version": "E0",
+      "key": "baseline",
+      "allow_early": false,
+      "allow_delay": false
+    },
+    {
+      "period": 14,
+      "version": "E0",
+      "key": "adx14_E0",
+      "allow_early": false,
+      "allow_delay": false
+    },
+    {
+      "period": 14,
+      "version": "E1",
+      "key": "adx14_E1",
+      "allow_early": true,
+      "allow_delay": false
+    },
+    {
+      "period": 14,
+      "version": "E2",
+      "key": "adx14_E2",
+      "allow_early": false,
+      "allow_delay": true
+    },
+    {
+      "period": 14,
+      "version": "E3",
+      "key": "adx14_E3",
+      "allow_early": true,
+      "allow_delay": true
+    },
+    {
+      "period": 21,
+      "version": "E0",
+      "key": "adx21_E0",
+      "allow_early": false,
+      "allow_delay": false
+    },
+    {
+      "period": 21,
+      "version": "E1",
+      "key": "adx21_E1",
+      "allow_early": true,
+      "allow_delay": false
+    },
+    {
+      "period": 21,
+      "version": "E2",
+      "key": "adx21_E2",
+      "allow_early": false,
+      "allow_delay": true
+    },
+    {
+      "period": 21,
+      "version": "E3",
+      "key": "adx21_E3",
+      "allow_early": true,
+      "allow_delay": true
+    }
+  ]
+}

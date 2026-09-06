@@ -48,6 +48,7 @@ class RealtimeQuote:
     amount: float
     market_data_time: Optional[datetime]
     received_at: datetime
+    previous_close: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -154,6 +155,7 @@ class TencentQuoteProvider(_PublicQuoteProvider):
                 continue
             try:
                 price = float(fields[3])
+                previous_close = float(fields[4])
                 volume = float(fields[6]) * quote_volume_multiplier(code)
                 amount = float(fields[35].split("/")[2])
             except (ValueError, IndexError):
@@ -170,6 +172,9 @@ class TencentQuoteProvider(_PublicQuoteProvider):
                     amount=max(0.0, amount),
                     market_data_time=market_data_time,
                     received_at=received_at,
+                    previous_close=(
+                        previous_close if previous_close > 0 else None
+                    ),
                 )
             )
         return quotes
@@ -197,6 +202,7 @@ class SinaQuoteProvider(_PublicQuoteProvider):
                 continue
             try:
                 price = float(fields[3])
+                previous_close = float(fields[2])
                 volume = float(fields[8])
                 amount = float(fields[9])
             except (ValueError, IndexError):
@@ -213,6 +219,9 @@ class SinaQuoteProvider(_PublicQuoteProvider):
                     amount=max(0.0, amount),
                     market_data_time=market_data_time,
                     received_at=received_at,
+                    previous_close=(
+                        previous_close if previous_close > 0 else None
+                    ),
                 )
             )
         return quotes
@@ -252,20 +261,29 @@ class RealtimeMarketCrawler:
         fallback_batches = 0
         failed_batches = 0
         started = time.perf_counter()
-        for offset in range(0, len(normalized), self.batch_size):
-            batch = normalized[offset : offset + self.batch_size]
+
+        async def fetch_batch(
+            batch: list[str],
+        ) -> tuple[tuple[RealtimeQuote, ...], int, int, int]:
             result = await self.primary.fetch_batch(batch)
-            requests += 1
             if result.complete:
-                quotes.extend(result.quotes)
-                continue
+                return result.quotes, 1, 0, 0
             fallback = await self.backup.fetch_batch(batch)
-            requests += 1
-            fallback_batches += 1
             if fallback.complete:
-                quotes.extend(fallback.quotes)
-            else:
-                failed_batches += 1
+                return fallback.quotes, 2, 1, 0
+            return (), 2, 1, 1
+
+        batches = [
+            normalized[offset : offset + self.batch_size]
+            for offset in range(0, len(normalized), self.batch_size)
+        ]
+        for batch_quotes, batch_requests, used_fallback, failed in await asyncio.gather(
+            *(fetch_batch(batch) for batch in batches)
+        ):
+            quotes.extend(batch_quotes)
+            requests += batch_requests
+            fallback_batches += used_fallback
+            failed_batches += failed
         return quotes, {
             "requested": len(normalized),
             "returned": len(quotes),

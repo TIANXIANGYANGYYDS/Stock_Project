@@ -12,6 +12,12 @@ from app.api.dependencies import (
 )
 from app.api.serializers import serialize_mongo_value
 from app.crawlers.realtime_market_crawler import RealtimeQuote
+from app.quant import public as quant_public
+from app.quant.runtime.daily_flow import (
+    PreselectionItem,
+    create_daily_flow,
+    daily_flow_document,
+)
 from tests.api.conftest import sample_database
 
 
@@ -197,3 +203,181 @@ def test_stats_and_serialization():
     value = serialize_mongo_value({"_id": "hidden", "nested": {"when": __import__("datetime").datetime(2026, 1, 1)}})
     assert "_id" not in value
     assert value["nested"]["when"] == "2026-01-01T00:00:00"
+
+
+def test_quant_daily_result_latest_date_and_404() -> None:
+    database = sample_database()
+    flow = create_daily_flow(
+        trade_date="2026-08-06",
+        selection_date="2026-08-05",
+        generated_at="2026-08-05T15:30:00+08:00",
+        candidates=[
+            PreselectionItem(
+                code="600176",
+                name="中国巨石",
+                reason="MACD 绿柱谷底确认",
+                reference_price=10.0,
+            )
+        ],
+    )
+    database["quant_daily_results"].rows.append(daily_flow_document(flow))
+
+    with make_client(database) as client:
+        latest = client.get("/api/v1/quant/daily-results/latest")
+        by_date = client.get("/api/v1/quant/daily-results/2026-08-06")
+        missing = client.get("/api/v1/quant/daily-results/2026-08-07")
+
+    assert latest.status_code == 200
+    assert latest.json()["data"]["summary"]["preselection_count"] == 1
+    assert by_date.status_code == 200
+    assert by_date.json()["data"]["trade_date"] == "2026-08-06"
+    assert missing.status_code == 404
+
+
+def test_quant_live_summary_signals_and_observations() -> None:
+    database = sample_database()
+    database["quant_daily_results"].rows.append(
+        {
+            "schema_version": "2.0",
+            "strategy_id": "provisional_daily_macd_3m_v1",
+            "trade_date": "2026-09-03",
+            "selection_date": "2026-09-02",
+            "status": "monitoring",
+            "strategy": {"id": "provisional_daily_macd_3m_v1"},
+            "runtime": {
+                "version": 3,
+                "data_status": "fresh",
+                "observation_state_counts": {
+                    "confirming": 1,
+                    "watching": 1,
+                },
+                "recent_signals": [
+                    {
+                        "signal_id": "buy-1",
+                        "code": "000001",
+                        "action": "buy",
+                        "status": "filled",
+                    },
+                    {
+                        "signal_id": "sell-1",
+                        "code": "000002",
+                        "action": "sell",
+                        "status": "pending_execution",
+                    },
+                ],
+            },
+            "summary": {"signal_count": 2},
+            "observation_pool": {
+                "count": 2,
+                "items": [
+                    {
+                        "code": "000001",
+                        "action": "buy",
+                        "state": "confirming",
+                    },
+                    {
+                        "code": "000002",
+                        "action": "sell",
+                        "state": "watching",
+                    },
+                ],
+            },
+            "signals": {
+                "count": 2,
+                "items": [
+                    {
+                        "signal_id": "buy-1",
+                        "code": "000001",
+                        "action": "buy",
+                        "status": "filled",
+                    },
+                    {
+                        "signal_id": "sell-1",
+                        "code": "000002",
+                        "action": "sell",
+                        "status": "pending_execution",
+                    },
+                ],
+            },
+            "_runtime_state": {"opening_flow": {"private": True}},
+        }
+    )
+
+    with make_client(database) as client:
+        summary = client.get("/api/v1/quant/intraday/latest")
+        signals = client.get(
+            "/api/v1/quant/signals?trade_date=2026-09-03&action=buy"
+        )
+        observations = client.get(
+            "/api/v1/quant/observations?trade_date=2026-09-03&state=watching&action=buy"
+        )
+        daily = client.get("/api/v1/quant/daily-results/2026-09-03")
+
+    assert summary.status_code == 200
+    assert summary.json()["data"]["runtime"]["version"] == 3
+    assert summary.json()["data"]["observation_summary"]["state_counts"] == {
+        "watching": 2,
+    }
+    assert signals.json()["total"] == 1
+    assert signals.json()["items"][0]["signal_id"].startswith("sig_")
+    assert observations.json()["total"] == 1
+    assert observations.json()["items"][0]["code"] == "000001"
+    assert "_runtime_state" not in daily.json()["data"]
+
+
+def test_quant_strategy_routes_keep_same_day_pools_isolated(monkeypatch) -> None:
+    monkeypatch.setattr(quant_public, "PUBLIC_STRATEGIES", {
+        "strategy_1": ("strategy_a", "策略1"), "strategy_2": ("strategy_b", "策略2"),
+    })
+    database = sample_database()
+    for strategy_id, code in (("strategy_a", "000001"), ("strategy_b", "000002")):
+        database["quant_daily_results"].rows.append(
+            {
+                "schema_version": "2.1",
+                "strategy_id": strategy_id,
+                "trade_date": "2026-09-03",
+                "selection_date": "2026-09-02",
+                "status": "monitoring",
+                "strategy": {"id": strategy_id, "name": strategy_id},
+                "runtime": {
+                    "version": 1,
+                    "data_status": "fresh",
+                    "observation_state_counts": {"watching": 1},
+                    "recent_signals": [],
+                },
+                "summary": {"holding_count": 1},
+                "observation_pool": {
+                    "count": 1,
+                    "items": [{"code": code, "state": "watching"}],
+                },
+                "signals": {"count": 0, "items": []},
+                "intraday_trading": {
+                    "count": 1,
+                    "items": [{"code": code, "action": "buy", "status": "filled"}],
+                },
+                "holding_pool": {
+                    "count": 1,
+                    "items": [{"code": code, "total_pnl": 100.0}],
+                },
+                "closed_trades": {"count": 0, "items": []},
+                "_runtime_state": {"private": True},
+            }
+        )
+
+    base = "/api/v1/quant/strategies/strategy_2"
+    with make_client(database) as client:
+        intraday = client.get(f"{base}/intraday/latest")
+        observations = client.get(f"{base}/observations")
+        executions = client.get(f"{base}/executions")
+        holdings = client.get(f"{base}/holdings")
+        daily = client.get(f"{base}/daily-results/2026-09-03")
+
+    assert intraday.status_code == 200
+    assert intraday.json()["data"]["strategy_id"] == "strategy_2"
+    assert observations.json()["strategy_id"] == "strategy_2"
+    assert observations.json()["items"][0]["code"] == "000002"
+    assert executions.json()["items"][0]["code"] == "000002"
+    assert holdings.json()["items"][0]["code"] == "000002"
+    assert holdings.json()["items"][0]["total_pnl"] == 100.0
+    assert daily.json()["data"]["strategy"]["id"] == "strategy_2"
+    assert "_runtime_state" not in daily.json()["data"]
