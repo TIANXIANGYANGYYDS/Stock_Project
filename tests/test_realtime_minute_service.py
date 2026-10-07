@@ -104,13 +104,16 @@ def test_universe_refresh_merges_public_target_date_with_mongo(monkeypatch) -> N
     asyncio.run(service.universe_crawler.close())
     fresh_crawler = FreshUniverseCrawler()
     service.universe_crawler = fresh_crawler
+    async def independent_universe():
+        return [{'code': '920202', 'name': '新股'}]
+    service.crawler.fetch_universe = independent_universe
     try:
         rows = asyncio.run(service._load_universe("2026-08-07"))
     finally:
         asyncio.run(service.close())
 
-    assert fresh_crawler.target_trade_date == "2026-08-07"
-    assert [row["code"] for row in rows] == ["000001", "301707"]
+    assert fresh_crawler.target_trade_date is None
+    assert [row["code"] for row in rows] == ["000001", "301707", "920202"]
     assert rows[0]["name"] == "平安银行"
 
 

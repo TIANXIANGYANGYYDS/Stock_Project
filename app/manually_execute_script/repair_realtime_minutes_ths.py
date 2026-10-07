@@ -30,7 +30,7 @@ from app.manually_execute_script.validate_stock_history_against_ths import (
 
 COLLECTION = 'stock_realtime_minute_bars'
 PROVIDER = 'THS_WEB_ACTUAL_BACKFILL'
-VERSION = 'ths-minute-repair-20260919.2'
+VERSION = 'ths-minute-repair-20261007.3'
 INDEX = 'idx_realtime_trade_date_interval_timestamp_code'
 
 
@@ -84,6 +84,35 @@ def insert_missing(collection, docs):
     return collection.bulk_write(operations, ordered=False).upserted_count if operations else 0
 
 
+def insert_missing_aggregates(collection, code, day):
+    """Build absent larger bars only from a complete 1m constituent grid."""
+    from app.services.realtime_minute_service import RealtimeMinuteService, AGGREGATE_INTERVAL_MINUTES
+    rows = list(collection.find({'code': code, 'trade_date': day, 'interval': '1m'}, {'_id': 0}))
+    by_time = {row['timestamp']: row for row in rows if row['timestamp'] in minute_starts(day)}
+    now = datetime.now(CN_TZ)
+    documents = []
+    for minutes in AGGREGATE_INTERVAL_MINUTES:
+        buckets = {}
+        for timestamp, row in by_time.items():
+            bucket = RealtimeMinuteService._period_bucket_start(datetime.fromisoformat(timestamp), minutes)
+            buckets.setdefault(bucket, []).append(row)
+        for timestamp, parts in buckets.items():
+            if len(parts) != minutes:
+                continue
+            parts.sort(key=lambda row: row['timestamp'])
+            doc = dict(parts[0])
+            doc.update(interval=f'{minutes}m', timestamp=timestamp,
+                       high=max(row['high'] for row in parts), low=min(row['low'] for row in parts),
+                       close=parts[-1]['close'], volume=sum(row['volume'] for row in parts),
+                       amount=sum(row['amount'] for row in parts), provider='ONE_MINUTE_ROLLUP',
+                       source_kind='reconstructed_from_complete_1m',
+                       constituent_providers=sorted({row['provider'] for row in parts}),
+                       first_seen_at=now, last_seen_at=now, created_at=now, updated_at=now,
+                       constituent_count=len(parts), revision_count=0)
+            documents.append(doc)
+    return insert_missing(collection, documents)
+
+
 def prior_universe(collection, start):
     """A suspension must not remove a previously observed stock from audit.
 
@@ -109,28 +138,30 @@ def inventory(db, root, start, end):
     names = prior_universe(db.stock_daily_detail, start)
     tasks, summaries = [], []
     for day in days:
-        names.update({x['code']: x.get('name') for x in db.stock_daily_detail.find(
-            {'trade_date': day}, {'code': 1, 'name': 1, '_id': 0}).hint('idx_trade_date_code')})
+        daily_names = {x['code']: x.get('name') for x in db.stock_daily_detail.find(
+            {'trade_date': day}, {'code': 1, 'name': 1, '_id': 0}).hint('idx_trade_date_code')}
+        names.update(daily_names)
         path = root / f'inventory_{day}.json'
-        if path.exists():
-            data = json.loads(path.read_text())
-        else:
-            observed = {x['_id']: x['timestamps'] for x in db[COLLECTION].aggregate([
-                {'$match': {'trade_date': day, 'interval': '1m'}},
-                {'$group': {'_id': '$code', 'timestamps': {'$push': '$timestamp'}}},
-            ], hint=INDEX, allowDiskUse=True)}
-            expected = minute_starts(day)
-            gaps = []
-            for code in sorted(set(names) | set(observed)):
-                missing = sorted(expected - set(observed.get(code, [])))
-                if missing:
-                    gaps.append(dict(code=code, name=names.get(code), day=day, missing=missing))
-            summary = dict(day=day, symbols=len(set(names) | set(observed)),
-                           stock_days_with_gaps=len(gaps), missing=sum(len(g['missing']) for g in gaps),
-                           whole_day=sum(len(g['missing']) == 240 for g in gaps),
-                           observed=sum(len(set(ts) & expected) for ts in observed.values()))
-            data = dict(summary=summary, gaps=gaps)
-            write_json(path, data)
+        # Always re-read Mongo: cached inventories omit late-listed stocks.
+        observed = {x['_id']: x['timestamps'] for x in db[COLLECTION].aggregate([
+            {'$match': {'trade_date': day, 'interval': '1m'}},
+            {'$group': {'_id': '$code', 'timestamps': {'$push': '$timestamp'}}},
+        ], hint=INDEX, allowDiskUse=True)}
+        expected = minute_starts(day)
+        gaps = []
+        for code in sorted(set(names) | set(observed)):
+            missing = sorted(expected - set(observed.get(code, [])))
+            if missing:
+                gaps.append(dict(code=code, name=names.get(code), day=day, missing=missing))
+        summary = dict(day=day, symbols=len(set(names) | set(observed)),
+                       daily_symbols=len(daily_names),
+                       daily_symbols_with_gaps=sum(g['code'] in daily_names for g in gaps),
+                       daily_missing_minutes=sum(len(g['missing']) for g in gaps if g['code'] in daily_names),
+                       stock_days_with_gaps=len(gaps), missing=sum(len(g['missing']) for g in gaps),
+                       whole_day=sum(len(g['missing']) == 240 for g in gaps),
+                       observed=sum(len(set(ts) & expected) for ts in observed.values()))
+        data = dict(summary=summary, gaps=gaps)
+        write_json(path, data)
         summaries.append(data['summary']); tasks.extend(data['gaps'])
         print('inventory', data['summary'], flush=True)
     write_json(root / 'inventory.json', summaries)
@@ -147,11 +178,6 @@ class Downloader:
     def __call__(self, task):
         code, day = task['code'], task['day']
         result_path = self.root / 'results' / f'{day}_{code}.json'
-        if result_path.exists():
-            result = json.loads(result_path.read_text())
-            if (result['status'] == 'checked' and not result.get('remaining')
-                    and (not self.apply or result['applied'])):
-                return result
         result = dict(code=code, day=day, missing_before=len(task['missing']), applied=self.apply)
         try:
             if not hasattr(self.local, 'session'):
@@ -188,8 +214,10 @@ class Downloader:
                     if doc and doc['timestamp'] in required:
                         docs.append(doc)
                 inserted = insert_missing(self.db[COLLECTION], docs) if self.apply else 0
+                aggregate_inserted = insert_missing_aggregates(self.db[COLLECTION], code, day) if self.apply and docs else 0
                 result.update(status='checked', source_rows=len(rows), usable_missing=len(docs),
                               inserted=inserted, resolved=len(docs),
+                              aggregate_inserted=aggregate_inserted,
                               remaining=sorted(required - {d['timestamp'] for d in docs}))
         except Exception as exc:
             result.update(status='error', error_type=type(exc).__name__, inserted=0, resolved=0)
@@ -209,7 +237,7 @@ def run(*, start, end, output, apply=False, workers=6):
         (root / folder).mkdir(exist_ok=True)
     spec = dict(version=VERSION, start=start, end=end, scope='all A shares SH SZ BJ',
                 universe='all previously observed daily codes carried forward plus daily and observed codes',
-                writes='missing 1m keys only; original rows and aggregate rows unchanged',
+                writes='missing 1m and complete-rollup keys only; existing rows unchanged',
                 adjustment='actual', timestamp='minute end minus 1 minute; auction excluded')
     if (root / 'protocol.json').exists() and json.loads((root / 'protocol.json').read_text()) != spec:
         raise ValueError('output protocol mismatch')
@@ -229,9 +257,24 @@ def run(*, start, end, output, apply=False, workers=6):
                     print('progress', len(results), '/', len(tasks), 'inserted', sum(x['inserted'] for x in results), flush=True)
         summary = dict(tasks=len(tasks), original_missing=sum(len(t['missing']) for t in tasks),
                        inserted=sum(x['inserted'] for x in results),
+                       aggregate_inserted=sum(x.get('aggregate_inserted', 0) for x in results),
                        source_resolved=sum(x['resolved'] for x in results),
-                       source_unresolved=sum(x['status'] != 'checked' for x in results),
+                       source_unresolved=sum(x['status'] != 'checked' or bool(x.get('remaining')) for x in results),
+                       remaining_missing=sum(len(x.get('remaining', [])) if x['status'] == 'checked'
+                                             else x['missing_before'] for x in results),
                        applied=apply, finished_at=datetime.now(CN_TZ).isoformat())
+        if apply:
+            # Verify actual stored keys after writes, including late universe
+            # changes. HTTP success/attempt counts are not a coverage audit.
+            inventory(db, root, start, end)
+            quality = db['stock_realtime_minute_quality']
+            quality.create_index('trade_date', unique=True)
+            for item in json.loads((root / 'inventory.json').read_text()):
+                quality.update_one({'trade_date': item['day']}, {'$set': {
+                    **item, 'audited_at': datetime.now(CN_TZ), 'report_path': str(root),
+                    'coverage_basis': 'observed_1m_keys_not_tick_or_ohlc_accuracy',
+                    'unclassified_gaps_are_not_assumed_suspended': True,
+                }}, upsert=True)
         write_json(root / 'summary.json', summary)
         print('finished', summary, flush=True)
         return summary

@@ -43,6 +43,7 @@ class RealtimeMinuteBar(BaseModel):
     volume: float = Field(default=0, ge=0)
     amount: float = Field(default=0, ge=0)
     provider: str
+    source_kind: str = 'sampled_quotes'
     first_seen_at: datetime
     last_seen_at: datetime
     revision_count: int = Field(default=0, ge=0)

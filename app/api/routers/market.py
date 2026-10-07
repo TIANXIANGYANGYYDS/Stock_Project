@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+import math
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -12,7 +13,7 @@ from app.api.dependencies import (
     get_realtime_stock_crawler,
 )
 from app.api.serializers import serialize_document
-from app.crawlers.realtime_market_crawler import RealtimeMarketCrawler, RealtimeQuote
+from app.crawlers.realtime_market_crawler import RealtimeMarketCrawler, RealtimeQuote, quote_issue, quote_phase
 from app.services.realtime_index_service import (
     CN_TZ,
     RealtimeIndexService,
@@ -40,9 +41,13 @@ def _quote_item(quote: RealtimeQuote) -> dict[str, Any]:
         "code": quote.code,
         "name": quote.name,
         "market": quote.market,
-        "price": quote.price,
-        "volume": quote.volume,
-        "amount": quote.amount,
+        "price": quote.price if math.isfinite(quote.price) else None,
+        "volume": quote.volume if math.isfinite(quote.volume) else None,
+        "amount": quote.amount if math.isfinite(quote.amount) else None,
+        "quality_issue": quote_issue(quote),
+        "phase": quote_phase(quote.market_data_time) if quote.market_data_time else 'unknown',
+        "bids": quote.bids,
+        "asks": quote.asks,
         "source_time": quote.market_data_time.isoformat()
         if quote.market_data_time
         else None,
@@ -63,6 +68,10 @@ def _quote_response(
         if quote.market_data_time
     ]
     now = datetime.now(CN_TZ)
+    references = [q.calibrated_received_at or q.server_time for q in ordered_quotes
+                  if q.calibrated_received_at or q.server_time]
+    if references:
+        now = max(references).astimezone(CN_TZ)
     trading_date = max(source_dates) if source_dates else None
     return {
         "trading_date": trading_date,

@@ -96,7 +96,7 @@ async def resume_realtime_minute_job() -> None:
     )
 
     now = datetime.now(CN_TZ)
-    morning_start = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    morning_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
     morning_deadline = now.replace(hour=11, minute=30, second=0, microsecond=0) + timedelta(
         seconds=SESSION_HARD_STOP_GRACE_SECONDS
     )
@@ -126,12 +126,14 @@ async def repair_realtime_minutes_job() -> None:
 
     now = datetime.now(CN_TZ)
     reference = await resolve_a_stock_target_trade_date(now.strftime("%Y%m%d"))
-    if not reference.is_reference_trade_day:
-        return
     day = now.date().isoformat()
+    # Re-audit recent completed days, including after a missed holiday/startup
+    # run. Late-arriving daily universes must enter a new inventory as well.
+    end = reference.target_trade_date
+    start = (datetime.fromisoformat(end).date() - timedelta(days=14)).isoformat()
     result = await asyncio.to_thread(
-        run, start=day, end=day,
-        output=f".local/realtime_minute_repair/{day}", apply=True, workers=4,
+        run, start=start, end=end,
+        output=f".local/realtime_minute_repair/rolling_{day}", apply=True, workers=4,
     )
     logger.info("realtime_minute_repair_finished %s", result)
 
@@ -636,13 +638,13 @@ def register_stock_daily_detail_job(
 
 
 def register_realtime_minute_jobs(scheduler: AsyncIOScheduler) -> None:
-    """Register the two A-share continuous snapshot sessions.
+    """Register morning auction/continuous and afternoon snapshot sessions.
 
-    APScheduler starts at 09:30 and 13:00 Beijing time.  The service uses the
+    APScheduler starts at 09:15 and 13:00 Beijing time.  The service uses the
     source-clock estimate and keeps a bounded post-close stabilization window.
     """
 
-    for session, hour, minute in (("morning", 9, 30), ("afternoon", 13, 0)):
+    for session, hour, minute in (("morning", 9, 15), ("afternoon", 13, 0)):
         job = scheduler.add_job(
             realtime_minute_session_job,
             trigger=CronTrigger(
@@ -687,7 +689,7 @@ def register_realtime_minute_jobs(scheduler: AsyncIOScheduler) -> None:
     logger.info("registered job id=%s", watchdog.id)
     repair = scheduler.add_job(
         repair_realtime_minutes_job,
-        trigger=CronTrigger(day_of_week="mon-fri", hour="15,17", minute=20, timezone="Asia/Shanghai"),
+        trigger=CronTrigger(day_of_week="mon-fri", hour="15,17,20", minute=20, timezone="Asia/Shanghai"),
         id="realtime_minute_ths_repair", name="同花顺全市场分钟缺口补偿",
         replace_existing=True, max_instances=1, coalesce=True, misfire_grace_time=1800,
     )

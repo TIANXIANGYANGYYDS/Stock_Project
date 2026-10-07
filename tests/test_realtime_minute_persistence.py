@@ -161,6 +161,11 @@ def test_session_continues_polling_after_transient_write_retries_exhaust(monkeyp
     async def run():
         nonlocal current
         service=RealtimeMinuteService()
+        class Snapshots:
+            async def create_indexes(self):pass
+            async def replay_pending(self, **kwargs):pass
+            async def save_cycle(self, *args, **kwargs):pass
+        service.snapshots=Snapshots()
         await service.crawler.close()
         repo=PartialRepository({1,2,3});service.repository=repo
         class Crawler:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import statistics
 import time
 from collections import deque
@@ -11,10 +12,11 @@ from typing import Any, Optional
 
 from pymongo.errors import AutoReconnect
 
-from app.crawlers.realtime_market_crawler import RealtimeMarketCrawler, RealtimeQuote
+from app.crawlers.realtime_market_crawler import RealtimeMarketCrawler, RealtimeQuote, quote_issue, quote_phase
 from app.crawlers.stock_daily_detail_crawler import StockDailyDetailCrawler
 from app.models.realtime_minute_bar import RealtimeMinuteBar, now_cn
 from app.repositories.realtime_minute_bar_repository import RealtimeMinuteBarRepository
+from app.repositories.realtime_snapshot_repository import RealtimeSnapshotRepository
 from app.services.stock_daily_detail_service import (
     resolve_a_stock_target_trade_date,
 )
@@ -103,6 +105,8 @@ class RealtimeMinuteService:
         self.crawler = RealtimeMarketCrawler(batch_size=batch_size)
         self.universe_crawler = StockDailyDetailCrawler()
         self.repository = RealtimeMinuteBarRepository()
+        self.snapshots = RealtimeSnapshotRepository()
+        self._http_clock_offset: Optional[float] = None
         self._bars: dict[tuple[str, str], _MutableBar] = {}
         self._aggregate_bars: dict[tuple[str, str, str], _MutableBar] = {}
         self._totals: dict[str, tuple[float, float]] = {}
@@ -144,9 +148,10 @@ class RealtimeMinuteService:
         mongo_symbol_count = len(by_code)
         fresh_by_code: dict[str, dict[str, str]] = {}
         try:
-            dataframe = await self.universe_crawler.fetch_stock_list(
-                target_trade_date=target_trade_date,
-            )
+            dataframe = await asyncio.wait_for(self.universe_crawler.fetch_stock_list(
+                # At 09:15 today's traded-volume filter is necessarily empty.
+                target_trade_date=None,
+            ), timeout=20)
             for item in dataframe.to_dict("records"):
                 code = str(item.get("代码") or "").strip().zfill(6)
                 name = str(item.get("名称") or "").strip()
@@ -167,6 +172,12 @@ class RealtimeMinuteService:
                 target_trade_date,
                 len(fresh_by_code),
             )
+
+        try:
+            fallback_rows = await asyncio.wait_for(self.crawler.fetch_universe(), timeout=20)
+            by_code.update({row['code']: row for row in fallback_rows})
+        except Exception as exc:
+            logger.warning('realtime_universe_independent_failed error=%s', type(exc).__name__)
 
         if len(by_code) < MIN_UNIVERSE_SYMBOLS:
             raise RuntimeError(
@@ -264,6 +275,8 @@ class RealtimeMinuteService:
             self._source_clock_offsets.append(offset)
 
     def _clock_offset_seconds(self) -> float:
+        if self._http_clock_offset is not None:
+            return self._http_clock_offset
         if not self._source_clock_offsets:
             return 0.0
         return float(statistics.median(self._source_clock_offsets))
@@ -310,7 +323,8 @@ class RealtimeMinuteService:
         *,
         bar_time: Optional[datetime] = None,
     ) -> None:
-        if quote.price <= 0 or quote.volume < 0 or quote.amount < 0 or quote.market_data_time is None:
+        if (not all(math.isfinite(v) for v in (quote.price, quote.volume, quote.amount))
+                or quote.price <= 0 or quote.volume < 0 or quote.amount < 0 or quote.market_data_time is None):
             return
         signature = (
             quote.market_data_time,
@@ -340,6 +354,11 @@ class RealtimeMinuteService:
         first_seen = quote.received_at
         previous = self._totals.get(quote.code)
         self._totals[quote.code] = (quote.volume, quote.amount)
+        # A source switch/reset establishes a new baseline. Never count the
+        # same cumulative volume twice after a lower fallback total.
+        if previous and (quote.volume < previous[0] or quote.amount < previous[1]):
+            logger.warning('realtime_quote_totals_reset code=%s provider=%s', quote.code, quote.provider)
+            self._totals[quote.code] = (max(quote.volume, previous[0]), max(quote.amount, previous[1]))
         delta_volume = 0.0 if previous is None else max(0.0, quote.volume - previous[0])
         delta_amount = 0.0 if previous is None else max(0.0, quote.amount - previous[1])
         current = self._bars.get(key)
@@ -539,8 +558,13 @@ class RealtimeMinuteService:
 
     async def run_session(self, session: str) -> dict[str, Any]:
         start_time, end_time = self._session_window(session)
-        now = datetime.now(CN_TZ)
-        session_start = datetime.combine(now.date(), start_time, tzinfo=CN_TZ)
+        clock_probe = getattr(self.crawler, 'clock_offset', None)
+        if clock_probe:
+            self._http_clock_offset = await clock_probe()
+            logger.info('realtime_http_clock_offset seconds=%s', self._http_clock_offset)
+        now = self._exchange_now(datetime.now(CN_TZ))
+        capture_start = dt_time(9, 15) if session == 'morning' else start_time
+        session_start = datetime.combine(now.date(), capture_start, tzinfo=CN_TZ)
         session_end = datetime.combine(now.date(), end_time, tzinfo=CN_TZ)
         wall_deadline = session_end + timedelta(seconds=SESSION_HARD_STOP_GRACE_SECONDS)
         trade_date = await resolve_a_stock_target_trade_date(
@@ -560,7 +584,13 @@ class RealtimeMinuteService:
             logger.info("realtime_minute_session_skipped session=%s reason=outside_trading_window", session)
             return {"session": session, "status": "skipped", "reason": "outside_trading_window"}
 
-        await self.repository.create_indexes()
+        try:
+            async with asyncio.timeout(5):
+                await self.repository.create_indexes()
+                await self.snapshots.create_indexes()
+        except (AutoReconnect, TimeoutError) as exc:
+            logger.error('realtime_indexes_deferred error=%s', type(exc).__name__)
+        await self.snapshots.replay_pending(limit=3)
         rows = await self._load_universe(trade_date.reference_trade_date)
         codes = [row["code"] for row in rows]
         name_by_code = {row["code"]: row["name"] for row in rows}
@@ -568,13 +598,18 @@ class RealtimeMinuteService:
         cycles = 0
         fetched = 0
         written = 0
+        universe_refresh = None
+        last_cycle_at = None
         try:
             close_target = session_end + timedelta(seconds=SESSION_CLOSE_STABILITY_SECONDS)
             while True:
                 local_now = datetime.now(CN_TZ)
+                if self._exchange_now(local_now) < session_start:
+                    await asyncio.sleep(min(5, (session_start-self._exchange_now(local_now)).total_seconds()))
+                    continue
                 if self._exchange_now(local_now) >= close_target:
                     break
-                if local_now >= wall_deadline:
+                if self._exchange_now(local_now) >= wall_deadline:
                     logger.warning(
                         "realtime_minute_session_hard_stop session=%s "
                         "clock_offset_s=%.3f",
@@ -584,15 +619,46 @@ class RealtimeMinuteService:
                     break
                 cycle_started = time.perf_counter()
                 cycle_now = local_now
+                if universe_refresh is not None and universe_refresh.done():
+                    try:
+                        new_rows = universe_refresh.result()
+                        name_by_code.update({r['code']: r['name'] for r in new_rows})
+                        codes = sorted(name_by_code)
+                    except Exception:
+                        logger.exception('realtime_universe_refresh_failed')
+                    universe_refresh = None
+                if cycles and cycles % 60 == 0 and universe_refresh is None:
+                    universe_refresh = asyncio.create_task(self._load_universe(trade_date.reference_trade_date))
                 quotes, metrics = await self.crawler.fetch_quotes(codes)
-                await self._restore_resume_buckets(quotes, cycle_now, start_time, end_time)
+                if last_cycle_at is not None:
+                    metrics['observation_gap_seconds'] = round((cycle_now - last_cycle_at).total_seconds(), 3)
+                    if metrics['observation_gap_seconds'] > self.poll_interval * 3:
+                        logger.error('realtime_observation_gap session=%s seconds=%s', session, metrics['observation_gap_seconds'])
+                last_cycle_at = cycle_now
+                # Keep all primary/fallback observations, including stale and
+                # invalid rows, before filtering or aggregating any of them.
+                received_at = datetime.now(CN_TZ)
+                await self.snapshots.save_cycle(
+                    getattr(self.crawler, 'last_observations', quotes), expected_codes=codes,
+                    session=session, observed_at=self._exchange_now(received_at),
+                    received_at=received_at, metrics=metrics,
+                )
+                valid_quotes = [q for q in quotes if quote_issue(q) is None]
+                try:
+                    async with asyncio.timeout(5):
+                        await self._restore_resume_buckets(valid_quotes, cycle_now, start_time, end_time)
+                except (AutoReconnect, TimeoutError) as exc:
+                    logger.error('realtime_resume_deferred snapshots_preserved=true error=%s', type(exc).__name__)
+                    valid_quotes = []
                 cycles += 1
                 latest_market_time: Optional[datetime] = None
                 accepted_session_quotes = 0
-                for quote in quotes:
+                for quote in valid_quotes:
                     if quote.code not in name_by_code:
                         continue
                     self._observe_source_clock(quote)
+                    if quote.market_data_time and quote_phase(quote.market_data_time) == 'opening_result':
+                        self._totals[quote.code] = (quote.volume, quote.amount)
                     bar_time = self._bar_time_in_session(
                         quote,
                         cycle_now,
@@ -635,10 +701,16 @@ class RealtimeMinuteService:
                     len(self._bars),
                     (time.perf_counter() - cycle_started) * 1000,
                 )
-                delay = self.poll_interval - (time.perf_counter() - cycle_started)
+                # Faster sampling only during the short opening auction;
+                # routine whole-market collection keeps its existing cost.
+                interval = 2.0 if self._exchange_now(local_now).time() < dt_time(9, 30) else self.poll_interval
+                delay = interval - (time.perf_counter() - cycle_started)
                 if delay > 0:
                     await asyncio.sleep(delay)
         finally:
+            if universe_refresh is not None:
+                universe_refresh.cancel()
+                await asyncio.gather(universe_refresh, return_exceptions=True)
             written += await self._flush_before(None, force=True)
         result = {
             "session": session,

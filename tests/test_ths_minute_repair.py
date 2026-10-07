@@ -112,3 +112,40 @@ def test_long_suspension_stays_in_universe_without_introducing_future_listing():
             assert query['trade_date']=={'$lt':'2026-08-20'}
             return {'code':query['code'],'name':'历史已知'} if query['code']!='301999' else None
     assert set(prior_universe(Collection(),'2026-08-20'))=={'002084','000001'}
+
+
+def test_rollup_requires_all_constituents_and_preserves_existing(monkeypatch):
+    from app.manually_execute_script import repair_realtime_minutes_ths as module
+    rows = [normalized(row(f'09:{minute:02}:00')) for minute in range(31, 36)]
+    inserted = []
+    class Collection:
+        def find(self, *args):return rows
+    monkeypatch.setattr(module, 'insert_missing', lambda collection, docs: inserted.extend(docs) or len(docs))
+    assert module.insert_missing_aggregates(Collection(), '000001', '2026-09-17') == 1
+    assert inserted[0]['interval'] == '5m'
+    assert inserted[0]['volume'] == 500
+    assert inserted[0]['constituent_count'] == 5
+    rows.pop(2)
+    inserted.clear()
+    assert module.insert_missing_aggregates(Collection(), '000001', '2026-09-17') == 0
+
+
+def test_inventory_refresh_includes_newly_arrived_daily_codes(tmp_path, monkeypatch):
+    from app.manually_execute_script import repair_realtime_minutes_ths as module
+    day = '2026-09-30'
+    module.write_json(tmp_path / f'inventory_{day}.json', {'summary': {}, 'gaps': []})
+    class Cursor(list):
+        def hint(self, *args):return self
+    class Daily:
+        def distinct(self, *args):return [day]
+        def find(self, *args):return Cursor([{'code': '301716', 'name': '新股'}])
+    class Minutes:
+        def distinct(self, *args):return []
+        def aggregate(self, *args, **kwargs):return []
+    class DB:
+        stock_daily_detail = Daily()
+        def __getitem__(self, key):return Minutes()
+    monkeypatch.setattr(module, 'prior_universe', lambda *args: {})
+    tasks = module.inventory(DB(), tmp_path, day, day)
+    assert tasks[0]['code'] == '301716'
+    assert len(tasks[0]['missing']) == 240
