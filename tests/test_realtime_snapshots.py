@@ -10,7 +10,8 @@ from app.crawlers.realtime_market_crawler import (
     CN_TZ, QuoteBatchResult, RealtimeMarketCrawler, quote_issue, quote_phase,
 )
 from app.repositories.realtime_snapshot_repository import (
-    RealtimeSnapshotRepository, decode_batch, snapshot_row,
+    RealtimeSnapshotRepository, decode_batch, snapshot_row, snapshot_kind,
+    SNAPSHOT_COLLECTION, AUCTION_COLLECTION,
 )
 from tests.test_realtime_minute_persistence import quote
 
@@ -28,6 +29,67 @@ class Collection:
         if self.ack_lost:
             self.ack_lost = False
             raise AutoReconnect('ack lost')
+
+
+@pytest.mark.parametrize('clock,kind', [
+    ('09:14:59', 'snapshot'), ('09:15:00', 'auction'), ('09:20:00', 'auction'),
+    ('09:25:00', 'auction'), ('09:29:59', 'auction'), ('09:30:00', 'snapshot'),
+    ('11:30:00', 'snapshot'), ('14:56:59', 'snapshot'), ('14:57:00', 'auction'),
+    ('15:00:00', 'auction'), ('15:00:01', 'snapshot'),
+])
+def test_snapshot_collection_boundaries(clock, kind):
+    from datetime import timezone
+    at = datetime.fromisoformat('2026-10-08T' + clock + '+08:00')
+    assert snapshot_kind(at) == kind
+    assert snapshot_kind(at.astimezone(timezone.utc)) == kind
+
+
+def test_separate_collections_route_by_capture_not_stale_quote_phase(tmp_path):
+    async def run():
+        db = {SNAPSHOT_COLLECTION: Collection(), AUCTION_COLLECTION: Collection()}
+        repo = RealtimeSnapshotRepository(db, spool_root=tmp_path)
+        base = quote()
+        opening = base.received_at.replace(minute=20)
+        # System time is five minutes fast; the calibrated observation wins.
+        await repo.save_cycle([base], expected_codes=['000001'], session='morning',
+                              observed_at=opening, received_at=opening+timedelta(minutes=5), metrics={})
+        # An empty auction poll still has to appear in auction quality audits.
+        await repo.save_cycle([], expected_codes=['000001'], session='morning',
+                              observed_at=opening, received_at=opening, metrics={})
+        stale_auction = replace(base, market_data_time=opening)
+        await repo.save_cycle([stale_auction], expected_codes=['000001'], session='morning',
+                              observed_at=base.received_at, received_at=base.received_at, metrics={})
+        assert len(db[AUCTION_COLLECTION].rows) == 2
+        assert len(db[SNAPSHOT_COLLECTION].rows) == 1
+        for document in db[AUCTION_COLLECTION].rows.values():
+            assert document['data_kind'] == 'auction'
+            assert decode_batch(document)['data_kind'] == 'auction'
+        empty = next(row for row in db[AUCTION_COLLECTION].rows.values() if row['returned'] == 0)
+        assert empty['missing_codes'] == ['000001']
+    asyncio.run(run())
+
+
+def test_v1_pending_auction_routes_to_new_collection_and_retries_lost_ack(tmp_path):
+    async def run():
+        db = {SNAPSHOT_COLLECTION: Collection(), AUCTION_COLLECTION: Collection()}
+        repo = RealtimeSnapshotRepository(db, spool_root=tmp_path)
+        base = quote()
+        at = base.received_at.replace(minute=25)
+        path = repo._spool({
+            'version': 1, 'batch_id': 'legacy-pending', 'observed_at': at.isoformat(),
+            'received_at': at.isoformat(), 'clock_offset_seconds': 0, 'session': 'morning',
+            'expected_codes': ['000001'], 'metrics': {}, 'quotes': [snapshot_row(base)],
+        })
+        db[AUCTION_COLLECTION].ack_lost = True
+        assert await repo.replay_pending() == 0
+        assert path.exists()
+        restored = RealtimeSnapshotRepository(db, spool_root=tmp_path)
+        assert await restored.replay_pending() == 1
+        assert not path.exists()
+        assert not db[SNAPSHOT_COLLECTION].rows
+        assert len(db[AUCTION_COLLECTION].rows) == 1
+        assert decode_batch(db[AUCTION_COLLECTION].rows['legacy-pending'])['version'] == 1
+    asyncio.run(run())
 
 
 def test_snapshot_spool_survives_restart_and_lost_ack(tmp_path):
@@ -124,14 +186,19 @@ def test_repeated_stale_sources_have_bounded_retry_cost():
     asyncio.run(run())
 
 
-def test_snapshot_api_filters_symbol_and_bounds_window(tmp_path):
-    from app.api.routers.stocks import list_stock_snapshots
+@pytest.mark.parametrize('kind', ['snapshot', 'auction'])
+def test_snapshot_api_filters_symbol_and_bounds_window(tmp_path, kind):
+    from app.api.routers.stocks import list_stock_snapshots, list_stock_auctions
     from datetime import date
     from fastapi import HTTPException
     async def run():
         saved = Collection()
-        repo = RealtimeSnapshotRepository({'stock_realtime_quote_batches': saved}, spool_root=tmp_path)
+        collection_name = AUCTION_COLLECTION if kind == 'auction' else SNAPSHOT_COLLECTION
+        repo = RealtimeSnapshotRepository({SNAPSHOT_COLLECTION: saved, AUCTION_COLLECTION: saved}, spool_root=tmp_path)
         q = quote()
+        if kind == 'auction':
+            at = q.received_at.replace(minute=20)
+            q = replace(q, received_at=at, market_data_time=at)
         await repo.save_cycle([q, replace(q, code='000002')], expected_codes=['000001', '000002'],
                              session='morning', observed_at=q.received_at,
                              received_at=q.received_at, metrics={})
@@ -144,12 +211,38 @@ def test_snapshot_api_filters_symbol_and_bounds_window(tmp_path):
             def find(self, filters):
                 assert filters['trade_date'] == '2026-09-16'
                 return Cursor()
-        db = {'stock_realtime_quote_batches': Query()}
-        result = await list_stock_snapshots('000001', date(2026,9,16), '09:30:00', '09:31:00', 200, db)
+        # Only the requested collection exists: cross-table reads must fail.
+        db = {collection_name: Query()}
+        endpoint = list_stock_auctions if kind == 'auction' else list_stock_snapshots
+        result = await endpoint('000001', date(2026,9,16), '09:15:00', '09:30:00', 200, db)
         assert len(result['data']) == 1 and result['data'][0]['code'] == '000001'
         assert result['batches'] == 1
+        assert result['collection'] == collection_name
         with pytest.raises(HTTPException):
-            await list_stock_snapshots('000001', date(2026,9,16), '09:00:00', '15:00:00', 200, db)
+            await endpoint('000001', date(2026,9,16), '09:00:00', '15:00:00', 200, db)
+    asyncio.run(run())
+
+
+def test_quality_includes_both_collections_with_separate_labels():
+    from app.api.routers.stocks import realtime_quality
+    from datetime import date
+    class Result:
+        def __init__(self, count):self.count = count
+        async def to_list(self, length):return [{'_id': 'morning', 'batches': self.count}]
+    class Aggregate:
+        def __init__(self, count):self.count = count
+        def aggregate(self, pipeline):
+            assert pipeline[0] == {'$match': {'trade_date': '2026-10-08'}}
+            return Result(self.count)
+    class Minutes:
+        async def find_one(self, filters):return {'trade_date': '2026-10-08', 'daily_missing_minutes': 0}
+    async def run():
+        result = await realtime_quality(date(2026,10,8), {
+            SNAPSHOT_COLLECTION: Aggregate(2), AUCTION_COLLECTION: Aggregate(3),
+            'stock_realtime_minute_quality': Minutes(),
+        })
+        assert [(r['data_kind'], r['batches']) for r in result['data']] == [('snapshot', 2), ('auction', 3)]
+        assert result['minute_quality']['daily_missing_minutes'] == 0
     asyncio.run(run())
 
 

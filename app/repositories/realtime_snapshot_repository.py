@@ -28,7 +28,32 @@ from app.repositories.base import BaseMongoRepository
 
 logger = logging.getLogger(__name__)
 SNAPSHOT_COLLECTION = 'stock_realtime_quote_batches'
+AUCTION_COLLECTION = 'stock_realtime_auction_batches'
 SPOOL_ROOT = PROJECT_ROOT / '.local' / 'realtime_quote_spool'
+
+
+def snapshot_kind(observed_at: datetime) -> str:
+    """Route by calibrated capture time, including empty/invalid batches.
+
+    A stale quote's source phase cannot turn a continuous-session poll into
+    auction data. Individual source phases/timestamps remain in the payload.
+    """
+    if observed_at.tzinfo is None:
+        raise ValueError('snapshot observation time must include timezone')
+    phase = quote_phase(observed_at)
+    if phase in {'opening_auction_cancelable', 'opening_auction_locked',
+                 'opening_result', 'closing_auction'}:
+        return 'auction'
+    # Include the closing uncross at precisely 15:00:00.
+    if observed_at.astimezone(CN_TZ).strftime('%H:%M:%S') == '15:00:00':
+        return 'auction'
+    return 'snapshot'
+
+
+def snapshot_collection(kind: str) -> str:
+    if kind not in {'auction', 'snapshot'}:
+        raise ValueError('unknown snapshot kind')
+    return AUCTION_COLLECTION if kind == 'auction' else SNAPSHOT_COLLECTION
 
 
 def _safe(value):
@@ -68,9 +93,11 @@ class RealtimeSnapshotRepository(BaseMongoRepository):
         self.spool_root = Path(spool_root)
 
     async def create_indexes(self):
-        await self.collection.create_index([('trade_date', 1), ('observed_at', 1)],
+        for name in (SNAPSHOT_COLLECTION, AUCTION_COLLECTION):
+            collection = self.database[name]
+            await collection.create_index([('trade_date', 1), ('observed_at', 1)],
                                            name='idx_quote_day_observed')
-        await self.collection.create_index([('trade_date', 1), ('phases', 1), ('observed_at', 1)],
+            await collection.create_index([('trade_date', 1), ('phases', 1), ('observed_at', 1)],
                                            name='idx_quote_day_phase_observed')
 
     def _spool(self, envelope):
@@ -100,8 +127,12 @@ class RealtimeSnapshotRepository(BaseMongoRepository):
         envelope = json.loads(gzip.decompress(payload))
         quotes = envelope['quotes']
         observed = datetime.fromisoformat(envelope['observed_at'])
+        # Derive for both v1 pending files and new v2 files. Routing must not
+        # depend on today's date or whether an upstream returned any quotes.
+        kind = snapshot_kind(observed)
         return {
             '_id': envelope['batch_id'], 'trade_date': observed.astimezone(CN_TZ).date().isoformat(),
+            'data_kind': kind,
             'observed_at': observed, 'received_at': datetime.fromisoformat(envelope['received_at']),
             'session': envelope['session'], 'phases': sorted({q['phase'] for q in quotes}),
             'clock_offset_seconds': envelope['clock_offset_seconds'],
@@ -117,7 +148,8 @@ class RealtimeSnapshotRepository(BaseMongoRepository):
     async def _persist(self, path):
         document = await asyncio.to_thread(self._load, path)
         async with asyncio.timeout(3):
-            await self.collection.update_one({'_id': document['_id']}, {'$setOnInsert': document}, upsert=True)
+            collection = self.database[snapshot_collection(document['data_kind'])]
+            await collection.update_one({'_id': document['_id']}, {'$setOnInsert': document}, upsert=True)
         await asyncio.to_thread(path.unlink)
         return document['compressed_bytes']
 
@@ -135,7 +167,8 @@ class RealtimeSnapshotRepository(BaseMongoRepository):
 
     async def save_cycle(self, quotes, *, expected_codes, session, observed_at, received_at, metrics):
         envelope = {
-            'version': 1, 'batch_id': received_at.strftime('%Y%m%dT%H%M%S%f') + '-' + uuid.uuid4().hex,
+            'version': 2, 'data_kind': snapshot_kind(observed_at),
+            'batch_id': received_at.strftime('%Y%m%dT%H%M%S%f') + '-' + uuid.uuid4().hex,
             'observed_at': observed_at.isoformat(), 'received_at': received_at.isoformat(),
             'clock_offset_seconds': (observed_at - received_at).total_seconds(), 'session': session,
             'expected_codes': expected_codes, 'metrics': metrics,

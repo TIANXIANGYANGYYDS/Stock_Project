@@ -11,21 +11,13 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.api.dependencies import Pagination, get_db, get_pagination
 from app.api.query import aggregate_page, find_page
 from app.api.serializers import serialize_document
-from app.repositories.realtime_snapshot_repository import decode_batch, SNAPSHOT_COLLECTION
+from app.repositories.realtime_snapshot_repository import decode_batch, SNAPSHOT_COLLECTION, AUCTION_COLLECTION
 
 
 router = APIRouter(tags=["stocks"])
 
 
-@router.get('/api/v1/stocks/{code}/snapshots')
-async def list_stock_snapshots(
-    code: str,
-    trade_date: date,
-    start_time: str = Query(default='09:15:00', pattern=r'^\d{2}:\d{2}:\d{2}$'),
-    end_time: str = Query(default='09:30:00', pattern=r'^\d{2}:\d{2}:\d{2}$'),
-    limit: int = Query(default=200, ge=1, le=1000),
-    db: AsyncIOMotorDatabase = Depends(get_db),
-) -> dict[str, Any]:
+async def _list_stock_batches(code, trade_date, start_time, end_time, limit, db, *, collection_name):
     """Bound reads to fifteen minutes; source and receipt clocks remain distinct."""
     from datetime import datetime
     try:
@@ -37,7 +29,7 @@ async def list_stock_snapshots(
         raise HTTPException(422, '股票代码须为六位，查询窗口须大于零且不超过十五分钟')
     rows = []
     filters = {'trade_date': trade_date.isoformat(), 'observed_at': {'$gte': start, '$lt': end}}
-    batches = db[SNAPSHOT_COLLECTION].find(filters).sort([('observed_at', 1)]).limit(limit)
+    batches = db[collection_name].find(filters).sort([('observed_at', 1)]).limit(limit)
     count = 0
     next_observed_at = None
     async for batch in batches:
@@ -47,23 +39,57 @@ async def list_stock_snapshots(
         rows.extend(dict(q, observed_at=envelope['observed_at'])
                     for q in envelope['quotes'] if q['code'] == code)
     return {'data': rows, 'batches': count, 'possibly_truncated': count == limit,
+            'collection': collection_name,
             'last_observed_at': next_observed_at,
             'sampling': 'public_quote_snapshots_not_exchange_ticks'}
+
+
+@router.get('/api/v1/stocks/{code}/snapshots')
+async def list_stock_snapshots(
+    code: str,
+    trade_date: date,
+    start_time: str = Query(default='09:30:00', pattern=r'^\d{2}:\d{2}:\d{2}$'),
+    end_time: str = Query(default='09:45:00', pattern=r'^\d{2}:\d{2}:\d{2}$'),
+    limit: int = Query(default=200, ge=1, le=1000),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+) -> dict[str, Any]:
+    """Read intraday quote batches; auction batches have their own endpoint."""
+    return await _list_stock_batches(code, trade_date, start_time, end_time, limit, db,
+                                     collection_name=SNAPSHOT_COLLECTION)
+
+
+@router.get('/api/v1/stocks/{code}/auctions')
+async def list_stock_auctions(
+    code: str,
+    trade_date: date,
+    start_time: str = Query(default='09:15:00', pattern=r'^\d{2}:\d{2}:\d{2}$'),
+    end_time: str = Query(default='09:30:00', pattern=r'^\d{2}:\d{2}:\d{2}$'),
+    limit: int = Query(default=1000, ge=1, le=1000),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+) -> dict[str, Any]:
+    """Read opening/closing auction observations from their separate collection."""
+    return await _list_stock_batches(code, trade_date, start_time, end_time, limit, db,
+                                     collection_name=AUCTION_COLLECTION)
 
 
 @router.get('/api/v1/market/realtime-quality/{trade_date}')
 async def realtime_quality(trade_date: date, db: AsyncIOMotorDatabase = Depends(get_db)) -> dict[str, Any]:
     """Return bounded collection diagnostics without decompressing quote data."""
-    rows = await db[SNAPSHOT_COLLECTION].aggregate([
+    pipeline = [
         {'$match': {'trade_date': trade_date.isoformat()}},
         {'$group': {'_id': '$session', 'batches': {'$sum': 1},
                     'first_observed_at': {'$min': '$observed_at'}, 'last_observed_at': {'$max': '$observed_at'},
                     'requested_observations': {'$sum': '$requested'}, 'returned_observations': {'$sum': '$returned'},
                     'usable_observations': {'$sum': '$usable'}, 'quality_issue_count': {'$sum': '$quality_issue_count'},
                     'compressed_bytes': {'$sum': '$compressed_bytes'}}},
-    ]).to_list(length=10)
+    ]
+    data = []
+    for kind, collection_name in (('snapshot', SNAPSHOT_COLLECTION), ('auction', AUCTION_COLLECTION)):
+        rows = await db[collection_name].aggregate(pipeline).to_list(length=10)
+        data.extend(serialize_document(row) | {'session': row['_id'], 'data_kind': kind,
+                                              'collection': collection_name} for row in rows)
     minute_quality = await db['stock_realtime_minute_quality'].find_one({'trade_date': trade_date.isoformat()})
-    return {'data': [serialize_document(row) | {'session': row['_id']} for row in rows],
+    return {'data': data,
             'minute_quality': serialize_document(minute_quality) if minute_quality else None,
             'complete': False, 'coverage_basis': 'observed_samples_only_no_tick_completeness_claim'}
 
