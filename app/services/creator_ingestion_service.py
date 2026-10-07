@@ -391,9 +391,13 @@ class CreatorIngestionService:
         account: PlatformAccount,
         page: CrawlPage,
     ) -> CrawlPage:
-        """拒绝最新候选时间早于库内水位的抖音降级旧页。"""
+        """拒绝早于库内水位的旧页；时间过滤后的空页保留原覆盖状态。"""
 
         if page.coverage in {"failed", "blocked"}:
+            return page
+        # 适配器会先过滤回看窗口外的作品。空的部分列表不能证明接口降级，
+        # 也不能证明没有新作品，因此保留 partial 而不误报为登录阻断。
+        if not page.items and page.coverage == "partial":
             return page
         latest_stored = await self.work_repository.get_latest_published_at(
             account.account_key

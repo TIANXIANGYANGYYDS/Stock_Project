@@ -332,6 +332,54 @@ def test_douyin_stale_success_page_is_reported_as_blocked() -> None:
     assert "陈旧成功响应" in (result.error or "")
 
 
+def test_douyin_empty_partial_window_is_not_reported_as_blocked() -> None:
+    """旧作品被回看窗口过滤后，保留部分覆盖且不误报登录阻断。"""
+
+    target = account("douyin")
+    page = CrawlPage(
+        account_key=target.account_key,
+        platform="douyin",
+        items=[],
+        coverage="partial",
+        coverage_reason="公开协议列表未暴露可靠分页游标，不能证明作品全集",
+    )
+    crawler = PaginatedCrawler({None: page})
+    service, works, _ = build_service(crawler)
+    works.latest_published_at = REFERENCE - timedelta(days=20)
+
+    result = asyncio.run(
+        service.ingest_account(target, reference_datetime=REFERENCE)
+    )
+
+    assert result.status == "partial"
+    assert result.coverage_completed is False
+    assert result.error == page.coverage_reason
+    assert result.discovered_count == result.inserted_count == 0
+    assert not works.rows
+
+
+def test_douyin_explicit_login_block_is_preserved_with_empty_list() -> None:
+    """平台明确要求登录时，空列表仍然是阻断状态。"""
+
+    target = account("douyin")
+    page = CrawlPage(
+        account_key=target.account_key,
+        platform="douyin",
+        coverage="blocked",
+        coverage_reason="登录后查看更多",
+    )
+    service, works, _ = build_service(PaginatedCrawler({None: page}))
+    works.latest_published_at = REFERENCE - timedelta(days=20)
+
+    result = asyncio.run(
+        service.ingest_account(target, reference_datetime=REFERENCE)
+    )
+
+    assert result.status == "blocked"
+    assert result.error == "登录后查看更多"
+    assert not works.rows
+
+
 def test_each_run_scans_contiguous_pages_from_current_head() -> None:
     """验证无状态采集从最新页连续翻页，抵达窗口起点后结束。"""
 
