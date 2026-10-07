@@ -12,6 +12,22 @@ uvicorn app.api.app:create_app --factory --host 0.0.0.0 --port 8100
 
 API 使用 `.local/env/.env` 中的 `MONGO_URI` 和 `MONGO_DB_NAME`。服务生命周期内只创建一个 Motor Client，并在退出时关闭。
 
+股票列表依赖 `stock_daily_detail` 的 `idx_adjust_code_latest_trade_date` 索引
+`(adjust: 1, code: 1, trade_date_int: -1)`，由日线服务的 `ensure_indexes()` 维护。
+已有数据库升级或仅部署 API 时，可在启动前单独幂等创建该索引：
+
+```python
+from pymongo import MongoClient
+from app.core.config import get_settings
+
+settings = get_settings()
+with MongoClient(settings.mongo_uri) as client:
+    client[settings.mongo_db_name].stock_daily_detail.create_index(
+        [("adjust", 1), ("code", 1), ("trade_date_int", -1)],
+        name="idx_adjust_code_latest_trade_date",
+    )
+```
+
 ## 响应约定
 
 列表接口统一返回：
@@ -40,7 +56,7 @@ API 使用 `.local/env/.env` 中的 `MONGO_URI` 和 `MONGO_DB_NAME`。服务生�
 | `GET /api/v1/stocks/realtime?codes=600519,000001` | 现有腾讯/Sina 实时抓取器 | 批量获取个股当前最新价格，不设置分钟缓存 |
 | `GET /api/v1/stocks/{code}/realtime` | 现有腾讯/Sina 实时抓取器 | 获取单只个股当前最新价格 |
 | `GET /api/v1/stocks/{code}/intraday` | `stock_realtime_minute_bars` | 返回指定交易日全部分时 K 线；默认今天和 `interval=1m` |
-| `GET /api/v1/stocks` | `stock_daily_detail` | 聚合每只股票最新一条日线；支持 `keyword`、`adjust` |
+| `GET /api/v1/stocks` | `stock_daily_detail` | 聚合每只股票最新一条日线；支持 `keyword`（代码或最新名称）、`adjust` |
 | `GET /api/v1/stocks/{code}/daily` | `stock_daily_detail` | 单只股票日线分页；支持日期范围和 `adjust` |
 | `GET /api/v1/stocks/{code}/daily/{trade_date}` | `stock_daily_detail` | 单只股票单日完整详情 |
 | `GET /api/v1/stock-daily/{trade_date}` | `stock_daily_detail` | 全市场单日分页；排序字段有白名单 |

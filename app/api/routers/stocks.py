@@ -44,18 +44,21 @@ async def list_stocks(
     keyword: str | None = Query(default=None, min_length=1),
     adjust: str = Query(default="qfq"),
 ) -> dict[str, Any]:
-    match: dict[str, Any] = {"adjust": adjust}
-    if keyword:
-        escaped = re.escape(keyword)
-        match["$or"] = [
-            {"code": {"$regex": escaped, "$options": "i"}},
-            {"name": {"$regex": escaped, "$options": "i"}},
-        ]
+    # Keep the indexed latest-per-code selection ahead of name filtering.
+    # A historical name match must not turn an old bar into the latest quote.
     pipeline: list[dict[str, Any]] = [
-        {"$match": match},
+        {"$match": {"adjust": adjust}},
         {"$sort": {"code": 1, "trade_date_int": -1}},
         {"$group": {"_id": "$code", "latest": {"$first": "$$ROOT"}}},
         {"$replaceRoot": {"newRoot": "$latest"}},
+    ]
+    if keyword:
+        escaped = re.escape(keyword)
+        pipeline.append({"$match": {"$or": [
+            {"code": {"$regex": escaped, "$options": "i"}},
+            {"name": {"$regex": escaped, "$options": "i"}},
+        ]}})
+    pipeline.extend([
         {"$sort": {"trade_date_int": -1, "code": 1}},
         {
             "$facet": {
@@ -75,7 +78,7 @@ async def list_stocks(
                 "meta": [{"$count": "total"}],
             }
         },
-    ]
+    ])
     return await aggregate_page(db["stock_daily_detail"], pipeline, pagination)
 
 

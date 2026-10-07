@@ -24,14 +24,10 @@ from app.services import stock_daily_detail_service as service
 
 
 def test_resolve_a_stock_target_trade_date_keeps_trade_day(monkeypatch) -> None:
-    async def fake_trade_dates(self, start_date, end_date):
-        return "2026-06-25", "2026-06-26"
+    def unexpected_crawler(**kwargs):
+        raise AssertionError("covered dates must not construct a network crawler")
 
-    monkeypatch.setattr(
-        service.StockDailyDetailCrawler,
-        "fetch_trade_dates",
-        fake_trade_dates,
-    )
+    monkeypatch.setattr(service, "StockDailyDetailCrawler", unexpected_crawler)
 
     decision = asyncio.run(service.resolve_a_stock_target_trade_date("20260626"))
 
@@ -44,14 +40,10 @@ def test_resolve_a_stock_target_trade_date_keeps_trade_day(monkeypatch) -> None:
 def test_resolve_a_stock_target_trade_date_falls_back_to_previous_trade_day(
     monkeypatch,
 ) -> None:
-    async def fake_trade_dates(self, start_date, end_date):
-        return "2026-06-25", "2026-06-26"
+    def unexpected_crawler(**kwargs):
+        raise AssertionError("covered dates must not construct a network crawler")
 
-    monkeypatch.setattr(
-        service.StockDailyDetailCrawler,
-        "fetch_trade_dates",
-        fake_trade_dates,
-    )
+    monkeypatch.setattr(service, "StockDailyDetailCrawler", unexpected_crawler)
 
     decision = asyncio.run(service.resolve_a_stock_target_trade_date("20260628"))
 
@@ -64,6 +56,13 @@ def test_resolve_a_stock_target_trade_date_falls_back_to_previous_trade_day(
 def test_resolve_trade_date_uses_stock_list_when_calendar_is_unavailable(
     monkeypatch,
 ) -> None:
+    calendar = service.get_a_share_calendar()
+
+    def uncovered_dates(start, end):
+        raise service.DateOutOfBounds(calendar, end, "end")
+
+    monkeypatch.setattr(calendar, "sessions_in_range", uncovered_dates)
+
     async def failing_trade_dates(self, start_date, end_date):
         raise ConnectionError("index kline unavailable")
 
@@ -85,6 +84,37 @@ def test_resolve_trade_date_uses_stock_list_when_calendar_is_unavailable(
 
     decision = asyncio.run(service.resolve_a_stock_target_trade_date("20260713"))
 
+    assert decision.target_trade_date == "2026-07-13"
+    assert decision.is_reference_trade_day is True
+
+
+@pytest.mark.parametrize(
+    "reference,target,is_trade_day",
+    [("20261001", "2026-09-30", False), ("20261007", "2026-09-30", False),
+     ("20261008", "2026-10-08", True)],
+)
+def test_holiday_and_reopening_checks_work_offline(monkeypatch, reference, target, is_trade_day):
+    def unexpected_crawler(**kwargs):
+        raise AssertionError("watchdog calendar checks must work offline")
+
+    monkeypatch.setattr(service, "StockDailyDetailCrawler", unexpected_crawler)
+    decision = asyncio.run(service.resolve_a_stock_target_trade_date(reference))
+    assert decision.target_trade_date == target
+    assert decision.is_reference_trade_day is is_trade_day
+
+
+def test_uncovered_calendar_falls_back_to_provider(monkeypatch):
+    calendar = service.get_a_share_calendar()
+
+    def uncovered_dates(start, end):
+        raise service.DateOutOfBounds(calendar, end, "end")
+
+    async def provider_dates(self, start_date, end_date):
+        return ("2026-07-13",)
+
+    monkeypatch.setattr(calendar, "sessions_in_range", uncovered_dates)
+    monkeypatch.setattr(service.StockDailyDetailCrawler, "fetch_trade_dates", provider_dates)
+    decision = asyncio.run(service.resolve_a_stock_target_trade_date("20260713"))
     assert decision.target_trade_date == "2026-07-13"
     assert decision.is_reference_trade_day is True
 

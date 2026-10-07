@@ -106,6 +106,31 @@ def test_latest_trade_date_and_empty_database():
         }
 
 
+def test_stock_list_filters_latest_names_and_keeps_suspended_stocks():
+    database = sample_database()
+    database["stock_daily_detail"].rows.extend([
+        {"code": "000001", "name": "新名称", "trade_date": "2026-08-06",
+         "trade_date_int": 20260806, "adjust": "qfq", "close": 12},
+        {"code": "000001", "name": "后复权名称", "trade_date": "2026-08-07",
+         "trade_date_int": 20260807, "adjust": "hfq", "close": 30},
+    ])
+    with make_client(database) as client:
+        first = client.get("/api/v1/stocks?page_size=1").json()
+        assert first["total"] == 2
+        assert first["items"] == [{"code": "000001", "name": "新名称",
+                                    "latest_trade_date": "2026-08-06", "latest_close": 12}]
+        second = client.get("/api/v1/stocks?page=2&page_size=1").json()
+        assert second["items"][0]["code"] == "000002"
+        assert second["items"][0]["latest_trade_date"] == "2026-08-05"
+        for keyword in ("000001", "新名称"):
+            filtered = client.get("/api/v1/stocks", params={"keyword": keyword}).json()
+            assert filtered["total"] == 1
+            assert filtered["items"] == first["items"]
+        assert client.get("/api/v1/stocks?keyword=平安银行").json()["total"] == 0
+        assert client.get("/api/v1/stocks?keyword=.*").json()["total"] == 0
+        assert client.get("/api/v1/stocks?adjust=hfq").json()["items"][0]["latest_close"] == 30
+
+
 def test_realtime_indices_endpoint_uses_index_service() -> None:
     class FakeIndexService:
         async def fetch_latest(self):

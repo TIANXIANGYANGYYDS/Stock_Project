@@ -48,7 +48,7 @@ from app.quant.strategies.provisional_daily_macd_3m import (
 from app.quant.strategies.provisional_daily_macd_3m.adx import (
     LIVE_RECORDING_START, buy_allowed, daily_adx_snapshot,
 )
-from app.quant.strategies.provisional_daily_macd_3m import STRATEGY_VERSION
+from app.quant.strategies.provisional_daily_macd_3m import STRATEGY_ID, STRATEGY_VERSION
 from app.repositories.quant_daily_result_repository import QuantDailyResultRepository
 from app.services.stock_daily_detail_service import (
     resolve_a_stock_target_trade_date,
@@ -794,6 +794,17 @@ class QuantLiveService:
         completed = []
         for day in days:
             document = await self.results.get(day)
+            # record_runtime_error can insert an error-only row before prepare
+            # has created any account state. Retry that day as missing; never
+            # mistake an actual old ledger for such a placeholder.
+            if (document and document.get("status") == "error"
+                    and document.get("schema_version") == "2.0"
+                    and document.get("strategy_id") == STRATEGY_ID
+                    and document.get("strategy") == {"id": STRATEGY_ID}
+                    and document.get("runtime", {}).get("data_status") == "error"
+                    and set(document) <= {"_id", "strategy_id", "trade_date", "runtime",
+                                          "schema_version", "status", "strategy"}):
+                document = None
             if document and document.get("strategy", {}).get("version") != STRATEGY_VERSION:
                 raise RuntimeError(f"{day}仍为旧策略，请先迁移再恢复调度")
             if document and document.get("recording", {}).get("start_date") != LIVE_RECORDING_START:

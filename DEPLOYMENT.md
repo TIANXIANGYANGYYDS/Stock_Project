@@ -117,6 +117,10 @@ python app/manually_execute_script/fetch_eastmoney_daily_detail.py \
 协程。主任务每天 15:30 执行，批次结束后立即补偿剩余网络失败股票，次日 15:20 再
 审计上一交易日。每次调度调用的补偿轮数有限，未完成项会保留给后续调度继续重试。
 
+交易日判断优先使用项目已有的 `exchange_calendars` XSHG 日历，覆盖范围内无需
+联网；超出范围时才回退到东方财富，并记录 `local_trade_calendar_out_of_bounds`。
+出现该告警应更新日历依赖，避免恢复检查反复依赖远端行情接口。
+
 ## 9. 启动 scheduler
 
 ```bash

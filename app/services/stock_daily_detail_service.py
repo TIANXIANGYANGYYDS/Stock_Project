@@ -9,7 +9,8 @@ from uuid import uuid4
 
 from bson.son import SON
 import pandas as pd
-from pymongo import ASCENDING, MongoClient, ReplaceOne
+from exchange_calendars.errors import DateOutOfBounds
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReplaceOne
 from pymongo.collection import Collection
 from pymongo.database import Database
 
@@ -23,6 +24,7 @@ from app.crawlers.eastmoney_reverse_fetcher import (
 )
 from app.crawlers.stock_daily_detail_crawler import StockDailyDetailCrawler
 from app.models.stock_daily_detail import CN_TZ, StockDailyDetail, now_cn
+from app.services.trading_calendar_service import get_a_share_calendar
 
 
 logger = logging.getLogger(__name__)
@@ -128,7 +130,9 @@ class StockDailyDetailItemResult:
 
 async def _load_a_stock_trade_dates(reference_yyyymmdd: str) -> tuple[str, ...]:
     """
-    从东方财富上证指数日 K 推导参考日期附近的 A 股交易日，并缓存到当前进程内。
+    优先使用本地交易所日历，覆盖范围外再查询东方财富。
+
+    调度和恢复检查不依赖行情接口是否在线，也不把当天尚未发布日 K 误判为休市。
 
     返回值：
         升序排列的交易日元组，日期格式为 YYYY-MM-DD。
@@ -142,6 +146,19 @@ async def _load_a_stock_trade_dates(reference_yyyymmdd: str) -> tuple[str, ...]:
     start_yyyymmdd = (
         reference_date - timedelta(days=STOCK_DAILY_TRADE_CALENDAR_LOOKBACK_DAYS)
     ).strftime("%Y%m%d")
+
+    calendar = get_a_share_calendar()
+    try:
+        sessions = calendar.sessions_in_range(
+            pd.Timestamp(start_yyyymmdd), pd.Timestamp(reference_date)
+        )
+    except DateOutOfBounds:
+        logger.warning(
+            "local_trade_calendar_out_of_bounds reference_date=%s fallback=eastmoney",
+            reference_date,
+        )
+    else:
+        return tuple(session.strftime("%Y-%m-%d") for session in sessions)
 
     crawler = StockDailyDetailCrawler(max_retry=1)
     try:
@@ -349,7 +366,8 @@ class StockDailyDetailService:
         - uniq_code_trade_date_adjust：唯一索引，保证同一股票、同一交易日、同一
           复权口径只保留一条记录；
         - idx_trade_date_code：支持按交易日查看全市场；
-        - idx_code_trade_date_int：支持按单只股票时间序列查询。
+        - idx_code_trade_date_int：支持按单只股票时间序列查询；
+        - idx_adjust_code_latest_trade_date：支持按复权口径读取逐股最新日线。
 
         MongoDB create_index 是幂等操作，重复调用不会重复创建同名索引。
         """
@@ -376,6 +394,10 @@ class StockDailyDetailService:
                 ("trade_date_int", ASCENDING),
             ],
             name="idx_code_trade_date_int",
+        )
+        self.collection.create_index(
+            [("adjust", ASCENDING), ("code", ASCENDING), ("trade_date_int", DESCENDING)],
+            name="idx_adjust_code_latest_trade_date",
         )
         self.sync_run_collection.create_index("run_id", unique=True, name="uniq_run_id")
         self.sync_run_collection.create_index(

@@ -488,3 +488,43 @@ def test_rebased_accounts_cannot_continue_from_old_recording_origin():
     service.results = Results()
     with pytest.raises(RuntimeError, match='起点不一致'):
         asyncio.run(service._load_previous_state('2026-09-07', expected_previous_date='2026-09-04'))
+
+
+@pytest.mark.parametrize("extra", [{}, {"strategy": {"id": quant_live_module.STRATEGY_ID, "version": "1.0.0"}},
+                                  {"_runtime_state": {"accounts": [{"cash": 100000}]}},
+                                  {"recording": {"start_date": "2026-08-20"}}])
+def test_catchup_retries_only_error_placeholders_and_preserves_old_ledgers(extra):
+    from datetime import date
+    from copy import deepcopy
+
+    document = {"trade_date": TRADE_DATE, "strategy_id": quant_live_module.STRATEGY_ID,
+                "strategy": {"id": quant_live_module.STRATEGY_ID}, "schema_version": "2.0",
+                "status": "error", "runtime": {"data_status": "error", "last_error": "source unavailable"},
+                **extra}
+    original = deepcopy(document)
+
+    class Daily:
+        async def distinct(self, *args):
+            return [TRADE_DATE]
+
+    class Results:
+        async def get(self, day):
+            return document
+
+    service = QuantLiveService(Database([{"_id": "observed"}]))
+    service.daily_collection, service.results = Daily(), Results()
+    processed = []
+
+    async def process(*, now):
+        processed.append(now.date().isoformat())
+        return {"status": "closed"}
+
+    service.process = process
+    if extra:
+        with pytest.raises(RuntimeError, match="旧策略"):
+            asyncio.run(service.catch_up_completed_days(before_date=date(2026, 9, 4)))
+        assert processed == []
+    else:
+        assert asyncio.run(service.catch_up_completed_days(before_date=date(2026, 9, 4))) == [TRADE_DATE]
+        assert processed == [TRADE_DATE]
+    assert document == original
