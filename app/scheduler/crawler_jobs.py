@@ -115,6 +115,27 @@ async def resume_realtime_minute_job() -> None:
     await realtime_minute_session_job(session=session)
 
 
+async def repair_realtime_minutes_job() -> None:
+    """Repair completed-day missing keys using native THS actual-price bars.
+
+    HTTP and synchronous Mongo work run off the scheduler event loop. An
+    interrupted run resumes its checkpoints; unresolved source gaps remain.
+    """
+    from app.manually_execute_script.repair_realtime_minutes_ths import run
+    from app.services.stock_daily_detail_service import resolve_a_stock_target_trade_date
+
+    now = datetime.now(CN_TZ)
+    reference = await resolve_a_stock_target_trade_date(now.strftime("%Y%m%d"))
+    if not reference.is_reference_trade_day:
+        return
+    day = now.date().isoformat()
+    result = await asyncio.to_thread(
+        run, start=day, end=day,
+        output=f".local/realtime_minute_repair/{day}", apply=True, workers=4,
+    )
+    logger.info("realtime_minute_repair_finished %s", result)
+
+
 async def ensure_news_indexes() -> None:
     """
     确保新闻集合索引已创建。
@@ -654,6 +675,23 @@ def register_realtime_minute_jobs(scheduler: AsyncIOScheduler) -> None:
         misfire_grace_time=60,
     )
     logger.info("registered job id=%s", startup_job.id)
+
+    # The shared session lock makes this a recovery check, not a second
+    # concurrent collector. A failed session no longer waits until tomorrow.
+    watchdog = scheduler.add_job(
+        resume_realtime_minute_job,
+        trigger=CronTrigger(day_of_week="mon-fri", hour="9-15", minute="*/5", timezone="Asia/Shanghai"),
+        id="realtime_minute_watchdog", name="实时分钟采集恢复检查",
+        replace_existing=True, max_instances=1, coalesce=True, misfire_grace_time=60,
+    )
+    logger.info("registered job id=%s", watchdog.id)
+    repair = scheduler.add_job(
+        repair_realtime_minutes_job,
+        trigger=CronTrigger(day_of_week="mon-fri", hour="15,17", minute=20, timezone="Asia/Shanghai"),
+        id="realtime_minute_ths_repair", name="同花顺全市场分钟缺口补偿",
+        replace_existing=True, max_instances=1, coalesce=True, misfire_grace_time=1800,
+    )
+    logger.info("registered job id=%s", repair.id)
 
 
 def register_crawler_jobs(

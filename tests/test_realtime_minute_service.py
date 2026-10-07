@@ -50,6 +50,8 @@ def test_realtime_jobs_are_registered_at_session_boundaries() -> None:
         "realtime_minute_morning",
         "realtime_minute_afternoon",
         "realtime_minute_startup_resume",
+        "realtime_minute_watchdog",
+        "realtime_minute_ths_repair",
     }
     assert jobs["realtime_minute_morning"]["kwargs"] == {"session": "morning"}
     assert jobs["realtime_minute_afternoon"]["kwargs"] == {"session": "afternoon"}

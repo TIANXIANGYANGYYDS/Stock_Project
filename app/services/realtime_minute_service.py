@@ -5,9 +5,11 @@ import logging
 import statistics
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Any, Optional
+
+from pymongo.errors import AutoReconnect
 
 from app.crawlers.realtime_market_crawler import RealtimeMarketCrawler, RealtimeQuote
 from app.crawlers.stock_daily_detail_crawler import StockDailyDetailCrawler
@@ -32,6 +34,8 @@ SOURCE_CLOCK_SAMPLE_LIMIT = 31
 MIN_UNIVERSE_SYMBOLS = 1000
 MAX_UNIVERSE_SYMBOLS = 7_000
 REALTIME_PERSIST_STOCK_BATCH_SIZE = 250
+REALTIME_PERSIST_ATTEMPTS = 3
+REALTIME_PERSIST_RETRY_SECONDS = 1.0
 MAX_IN_MEMORY_MINUTE_BARS = MAX_UNIVERSE_SYMBOLS * 3
 MAX_IN_MEMORY_AGGREGATE_BARS = (
     MAX_UNIVERSE_SYMBOLS * len(AGGREGATE_INTERVAL_MINUTES) * 2
@@ -105,6 +109,9 @@ class RealtimeMinuteService:
         self._last_quote_signatures: dict[
             str, tuple[datetime, float, float, float]
         ] = {}
+        self._last_bar_minutes: dict[str, str] = {}
+        self._resume_loaded: set[str] = set()
+        self._resume_closed_minutes: dict[str, str] = {}
         self._source_clock_offsets: deque[float] = deque(maxlen=SOURCE_CLOCK_SAMPLE_LIMIT)
 
     async def close(self) -> None:
@@ -264,6 +271,39 @@ class RealtimeMinuteService:
     def _exchange_now(self, value: datetime) -> datetime:
         return value + timedelta(seconds=self._clock_offset_seconds())
 
+    async def _restore_resume_buckets(
+        self, quotes: list[RealtimeQuote], now: datetime, start: dt_time, end: dt_time,
+    ) -> None:
+        """Seed existing aggregate buckets before a watchdog/startup restart.
+
+        A previously written 1m key is immutable to the restarted collector;
+        the first observed cumulative totals become the new delta baseline.
+        Unobserved intervals remain unobserved, for historical repair later.
+        """
+        pending = [(q, self._bar_time_in_session(q, now, start, end)) for q in quotes
+                   if q.code not in self._resume_loaded]
+        pending = [(q, at) for q, at in pending if at is not None]
+        for offset in range(0, len(pending), REALTIME_PERSIST_STOCK_BATCH_SIZE):
+            chunk = pending[offset:offset + REALTIME_PERSIST_STOCK_BATCH_SIZE]
+            keys = []
+            for q, at in chunk:
+                keys.append(dict(code=q.code, interval="1m", timestamp=self._minute_key(at)))
+                keys.extend(dict(code=q.code, interval=f"{m}m", timestamp=self._period_bucket_start(at, m))
+                            for m in AGGREGATE_INTERVAL_MINUTES)
+            for row in await self.repository.find_bar_keys(keys):
+                if row["interval"] == "1m":
+                    self._resume_closed_minutes[row["code"]] = row["timestamp"]
+                else:
+                    bar = RealtimeMinuteBar(**row)
+                    for field in ("first_seen_at", "last_seen_at"):
+                        value = getattr(bar, field)
+                        if value.tzinfo is None:  # Motor's default BSON datetime is naive UTC.
+                            setattr(bar, field, value.replace(tzinfo=timezone.utc))
+                    self._aggregate_bars[(bar.code, bar.interval, bar.timestamp)] = _MutableBar(
+                        **{field: getattr(bar, field) for field in _MutableBar.__dataclass_fields__}
+                    )
+            self._resume_loaded.update(q.code for q, _ in chunk)
+
     def _ingest_quote(
         self,
         quote: RealtimeQuote,
@@ -280,11 +320,24 @@ class RealtimeMinuteService:
         )
         if self._last_quote_signatures.get(quote.code) == signature:
             return
+        previous_signature = self._last_quote_signatures.get(quote.code)
+        if previous_signature and quote.market_data_time < previous_signature[0]:
+            # A stale fallback packet must not reopen a persisted old minute
+            # or move the cumulative-volume baseline backwards.
+            logger.warning("realtime_quote_out_of_order code=%s market_time=%s", quote.code, quote.market_data_time)
+            return
         self._last_quote_signatures[quote.code] = signature
         effective_time = bar_time or quote.market_data_time
         minute = self._minute_key(effective_time)
+        self._last_bar_minutes[quote.code] = minute
+        closed = self._resume_closed_minutes.get(quote.code)
+        if closed and minute <= closed:
+            self._totals[quote.code] = (quote.volume, quote.amount)
+            return
         key = (quote.code, minute)
-        first_seen = self._exchange_now(quote.received_at)
+        # Clock estimation only controls session boundaries. Receipt time is
+        # audit evidence and must not be shifted back towards market time.
+        first_seen = quote.received_at
         previous = self._totals.get(quote.code)
         self._totals[quote.code] = (quote.volume, quote.amount)
         delta_volume = 0.0 if previous is None else max(0.0, quote.volume - previous[0])
@@ -386,16 +439,19 @@ class RealtimeMinuteService:
             updated.append(current)
         return updated
 
-    async def _flush_before(self, cutoff: Optional[str], *, force: bool = False) -> int:
+    async def _flush_before(
+        self, cutoff: Optional[str], *, force: bool = False, per_symbol: bool = False,
+    ) -> int:
         if force:
             selected = list(self._bars.values())
-            self._bars.clear()
         else:
             selected = [bar for key, bar in self._bars.items() if cutoff and key[1] < cutoff]
-            for bar in selected:
-                self._bars.pop((bar.code, bar.timestamp), None)
+            if per_symbol:
+                selected = [bar for bar in selected
+                            if bar.code in self._last_bar_minutes
+                            and bar.timestamp < self._last_bar_minutes[bar.code]]
         selected.sort(key=lambda bar: (bar.timestamp, bar.code))
-        corrected_now = self._exchange_now(datetime.now(CN_TZ))
+        persisted_at = datetime.now(CN_TZ)
         written = 0
         aggregate_update_count = 0
         for offset in range(0, len(selected), REALTIME_PERSIST_STOCK_BATCH_SIZE):
@@ -403,7 +459,17 @@ class RealtimeMinuteService:
                 offset : offset + REALTIME_PERSIST_STOCK_BATCH_SIZE
             ]
             aggregate_updates: dict[tuple[str, str, str], _MutableBar] = {}
+            aggregate_before: dict[tuple[str, str, str], Optional[_MutableBar]] = {}
             for minute_bar in minute_chunk:
+                # Stage a chunk only once. Mongo may have committed part of an
+                # unordered bulk before the connection failed; retries must
+                # write the same absolute values, never add volume again.
+                minute_time = datetime.fromisoformat(minute_bar.timestamp)
+                for minutes in AGGREGATE_INTERVAL_MINUTES:
+                    key = (minute_bar.code, f"{minutes}m", self._period_bucket_start(minute_time, minutes))
+                    if key not in aggregate_before:
+                        previous = self._aggregate_bars.get(key)
+                        aggregate_before[key] = replace(previous) if previous else None
                 for aggregate_bar in self._update_aggregate_bars(minute_bar):
                     key = (
                         aggregate_bar.code,
@@ -411,12 +477,35 @@ class RealtimeMinuteService:
                         aggregate_bar.timestamp,
                     )
                     aggregate_updates[key] = aggregate_bar
-            documents = [bar.to_model(now=corrected_now) for bar in minute_chunk]
+            documents = [bar.to_model(now=persisted_at) for bar in minute_chunk]
             documents.extend(
-                bar.to_model(now=corrected_now)
+                bar.to_model(now=persisted_at)
                 for bar in aggregate_updates.values()
             )
-            written += await self.repository.upsert_bars(documents)
+            try:
+                for attempt in range(1, REALTIME_PERSIST_ATTEMPTS + 1):
+                    try:
+                        written += await self.repository.upsert_bars(documents)
+                        break
+                    except AutoReconnect as exc:
+                        logger.warning(
+                            "realtime_minute_persist_retry attempt=%s/%s minute_bars=%s error=%s",
+                            attempt, REALTIME_PERSIST_ATTEMPTS, len(minute_chunk), type(exc).__name__,
+                        )
+                        if attempt == REALTIME_PERSIST_ATTEMPTS:
+                            raise
+                        await asyncio.sleep(REALTIME_PERSIST_RETRY_SECONDS * attempt)
+            except BaseException:
+                # Keep all unacknowledged minutes, including on cancellation.
+                # Restore aggregates so a later flush can rebuild this chunk.
+                for key, previous in aggregate_before.items():
+                    if previous is None:
+                        self._aggregate_bars.pop(key, None)
+                    else:
+                        self._aggregate_bars[key] = previous
+                raise
+            for minute_bar in minute_chunk:
+                self._bars.pop((minute_bar.code, minute_bar.timestamp), None)
             aggregate_update_count += len(aggregate_updates)
             del documents
 
@@ -424,12 +513,19 @@ class RealtimeMinuteService:
             self._aggregate_bars.clear()
         elif cutoff:
             cutoff_at = datetime.fromisoformat(cutoff)
+            # Slow symbols may still own observations in an earlier bucket.
+            # Keep that bucket until its own pending minutes have been flushed.
+            pending_starts: dict[str, datetime] = {}
+            if per_symbol:
+                for bar in self._bars.values():
+                    start = datetime.fromisoformat(bar.timestamp)
+                    pending_starts[bar.code] = min(start, pending_starts.get(bar.code, start))
             completed_keys = [
                 key
                 for key in self._aggregate_bars
                 if datetime.fromisoformat(key[2])
                 + timedelta(minutes=int(key[1][:-1]))
-                <= cutoff_at
+                <= min(cutoff_at, pending_starts.get(key[0], cutoff_at))
             ]
             for key in completed_keys:
                 self._aggregate_bars.pop(key, None)
@@ -489,8 +585,10 @@ class RealtimeMinuteService:
                 cycle_started = time.perf_counter()
                 cycle_now = local_now
                 quotes, metrics = await self.crawler.fetch_quotes(codes)
+                await self._restore_resume_buckets(quotes, cycle_now, start_time, end_time)
                 cycles += 1
                 latest_market_time: Optional[datetime] = None
+                accepted_session_quotes = 0
                 for quote in quotes:
                     if quote.code not in name_by_code:
                         continue
@@ -503,19 +601,26 @@ class RealtimeMinuteService:
                     )
                     if bar_time is None:
                         continue
+                    accepted_session_quotes += 1
                     self._ingest_quote(quote, bar_time=bar_time)
                     quote_time = quote.market_data_time.astimezone(CN_TZ)
                     if latest_market_time is None or quote_time > latest_market_time:
                         latest_market_time = quote_time
                 fetched += len(quotes)
                 if latest_market_time is not None:
-                    written += await self._flush_before(
-                        self._minute_key(latest_market_time)
-                    )
+                    try:
+                        written += await self._flush_before(
+                            self._minute_key(latest_market_time), per_symbol=True,
+                        )
+                    except AutoReconnect as exc:
+                        logger.error(
+                            "realtime_minute_persist_deferred session=%s pending_minutes=%s error=%s",
+                            session, len(self._bars), type(exc).__name__,
+                        )
                 logger.info(
                     "realtime_minute_cycle session=%s cycle=%s requested=%s returned=%s "
                     "requests=%s fallback_batches=%s failed_batches=%s elapsed_ms=%s "
-                    "clock_offset_s=%.3f",
+                    "clock_offset_s=%.3f accepted_session_quotes=%s latest_market_time=%s pending_minutes=%s cycle_elapsed_ms=%.3f",
                     session,
                     cycles,
                     metrics["requested"],
@@ -525,6 +630,10 @@ class RealtimeMinuteService:
                     metrics["failed_batches"],
                     metrics["elapsed_ms"],
                     self._clock_offset_seconds(),
+                    accepted_session_quotes,
+                    latest_market_time.isoformat() if latest_market_time else None,
+                    len(self._bars),
+                    (time.perf_counter() - cycle_started) * 1000,
                 )
                 delay = self.poll_interval - (time.perf_counter() - cycle_started)
                 if delay > 0:

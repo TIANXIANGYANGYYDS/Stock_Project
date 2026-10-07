@@ -67,3 +67,11 @@ class RealtimeMinuteBarRepository(BaseMongoRepository):
             return 0
         result = await self.collection.bulk_write(operations, ordered=False)
         return int(result.upserted_count + result.modified_count)
+
+    async def find_bar_keys(self, keys: list[dict[str, str]]) -> list[dict[str, Any]]:
+        """Bounded exact-key reads for an interrupted collector's restart."""
+        if not keys:
+            return []
+        return await self.collection.find({"$or": keys}, {"_id": 0}).hint(
+            "uniq_realtime_code_interval_timestamp"
+        ).to_list(length=len(keys))

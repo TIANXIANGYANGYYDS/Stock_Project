@@ -22,6 +22,7 @@ from app.scheduler.news_ranking_jobs import (
     run_news_ranking_snapshot,
 )
 from app.scheduler.quant_jobs import register_quant_live_jobs
+from app.scheduler.sentiment_jobs import register_sentiment_job
 
 
 logger = logging.getLogger(__name__)
@@ -84,6 +85,7 @@ def build_scheduler() -> AsyncIOScheduler:
     register_creator_monitoring_jobs(scheduler)
     register_morning_analysis_job(scheduler)
     register_quant_live_jobs(scheduler)
+    register_sentiment_job(scheduler)
     return scheduler
 
 

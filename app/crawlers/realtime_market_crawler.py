@@ -268,10 +268,18 @@ class RealtimeMarketCrawler:
             result = await self.primary.fetch_batch(batch)
             if result.complete:
                 return result.quotes, 1, 0, 0
-            fallback = await self.backup.fetch_batch(batch)
-            if fallback.complete:
-                return fallback.quotes, 2, 1, 0
-            return (), 2, 1, 1
+            # One suspended/unavailable symbol must not discard the other
+            # genuine observations in a batch. Only request missing symbols.
+            merged = {quote.code: quote for quote in result.quotes if quote.code in batch}
+            missing = [code for code in batch if code not in merged]
+            if not missing:
+                return tuple(merged[code] for code in batch), 1, 0, 0
+            fallback = await self.backup.fetch_batch(missing)
+            merged.update({quote.code: quote for quote in fallback.quotes if quote.code in missing})
+            return (
+                tuple(merged[code] for code in batch if code in merged),
+                2, 1, int(len(merged) < len(batch)),
+            )
 
         batches = [
             normalized[offset : offset + self.batch_size]
@@ -290,5 +298,6 @@ class RealtimeMarketCrawler:
             "requests": requests,
             "fallback_batches": fallback_batches,
             "failed_batches": failed_batches,
+            "missing_symbols": len(normalized) - len(quotes),
             "elapsed_ms": round((time.perf_counter() - started) * 1000, 3),
         }
