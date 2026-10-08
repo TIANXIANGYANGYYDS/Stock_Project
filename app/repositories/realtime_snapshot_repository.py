@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 SNAPSHOT_COLLECTION = 'stock_realtime_quote_batches'
 AUCTION_COLLECTION = 'stock_realtime_auction_batches'
 SPOOL_ROOT = PROJECT_ROOT / '.local' / 'realtime_quote_spool'
+PARTITIONED_CODEC = 'json-gzip-partitioned-v2'
 
 
 def snapshot_kind(observed_at: datetime) -> str:
@@ -78,11 +79,69 @@ def snapshot_row(quote):
     return row
 
 
-def decode_batch(document):
-    payload = bytes(document['payload'])
-    if hashlib.sha256(payload).hexdigest() != document['sha256']:
+def _decode_checked(payload, checksum):
+    payload = bytes(payload)
+    if hashlib.sha256(payload).hexdigest() != checksum:
         raise ValueError('realtime snapshot checksum mismatch')
     return json.loads(gzip.decompress(payload))
+
+
+def encode_batch(envelope):
+    """Partition by code suffix so a symbol query reads about 1% of quotes.
+
+    Keep original row positions: duplicate providers and their ordering are
+    evidence, not rows to deduplicate. The on-disk WAL stays in the old format.
+    """
+    groups = {}
+    for index, row in enumerate(envelope['quotes']):
+        groups.setdefault(row['code'][-2:], []).append([index, row])
+
+    def compress(value):
+        return gzip.compress(json.dumps(value, ensure_ascii=False, separators=(',', ':'),
+                                        allow_nan=False).encode(), compresslevel=3, mtime=0)
+
+    chunks = {key: Binary(compress(rows)) for key, rows in groups.items()}
+    header = {key: value for key, value in envelope.items() if key != 'quotes'}
+    payload = compress(header)
+    return {'codec': PARTITIONED_CODEC, 'payload': Binary(payload),
+            'sha256': hashlib.sha256(payload).hexdigest(), 'quote_chunks': chunks,
+            'chunk_sha256': {key: hashlib.sha256(value).hexdigest() for key, value in chunks.items()},
+            'compressed_bytes': len(payload) + sum(map(len, chunks.values()))}
+
+
+def decode_batch(document):
+    envelope = _decode_checked(document['payload'], document['sha256'])
+    if document.get('codec', 'json-gzip-v1') == PARTITIONED_CODEC:
+        rows = []
+        for key, checksum in document['chunk_sha256'].items():
+            rows.extend(_decode_checked(document['quote_chunks'][key], checksum))
+        envelope['quotes'] = [row for _, row in sorted(rows, key=lambda item: item[0])]
+    return envelope
+
+
+def symbol_projection(code):
+    key = code[-2:]
+    return {'_id': 0, 'observed_at': 1, 'codec': 1, 'payload': 1, 'sha256': 1,
+            f'quote_chunks.{key}': 1, f'chunk_sha256.{key}': 1}
+
+
+def decode_symbol_batch(document, code):
+    """Read projected v2 batches and full legacy batches during migration."""
+    if document.get('codec', 'json-gzip-v1') != PARTITIONED_CODEC:
+        envelope = decode_batch(document)
+    else:
+        envelope = _decode_checked(document['payload'], document['sha256'])
+        key = code[-2:]
+        checksums = document.get('chunk_sha256', {})
+        rows = (_decode_checked(document['quote_chunks'][key], checksums[key])
+                if key in checksums else [])
+        envelope['quotes'] = [row for _, row in rows]
+    return [dict(row, observed_at=envelope['observed_at'])
+            for row in envelope['quotes'] if row['code'] == code]
+
+
+def decode_symbol_batches(documents, code):
+    return [row for document in documents for row in decode_symbol_batch(document, code)]
 
 
 class RealtimeSnapshotRepository(BaseMongoRepository):
@@ -140,9 +199,7 @@ class RealtimeSnapshotRepository(BaseMongoRepository):
             'usable': len({q['code'] for q in quotes if not q['quality_issue']}),
             'missing_codes': sorted(set(envelope['expected_codes']) - {q['code'] for q in quotes}),
             'quality_issue_count': sum(bool(q['quality_issue']) for q in quotes),
-            'metrics': envelope['metrics'], 'codec': 'json-gzip-v1',
-            'sha256': hashlib.sha256(payload).hexdigest(), 'compressed_bytes': len(payload),
-            'payload': Binary(payload),
+            'metrics': envelope['metrics'], **encode_batch(envelope),
         }
 
     async def _persist(self, path):

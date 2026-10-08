@@ -11,7 +11,9 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.api.dependencies import Pagination, get_db, get_pagination
 from app.api.query import aggregate_page, find_page
 from app.api.serializers import serialize_document
-from app.repositories.realtime_snapshot_repository import decode_batch, SNAPSHOT_COLLECTION, AUCTION_COLLECTION
+from app.repositories.realtime_snapshot_repository import (
+    decode_symbol_batches, symbol_projection, SNAPSHOT_COLLECTION, AUCTION_COLLECTION, PARTITIONED_CODEC,
+)
 
 
 router = APIRouter(tags=["stocks"])
@@ -29,15 +31,21 @@ async def _list_stock_batches(code, trade_date, start_time, end_time, limit, db,
         raise HTTPException(422, '股票代码须为六位，查询窗口须大于零且不超过十五分钟')
     rows = []
     filters = {'trade_date': trade_date.isoformat(), 'observed_at': {'$gte': start, '$lt': end}}
-    batches = db[collection_name].find(filters).sort([('observed_at', 1)]).limit(limit)
+    batches = db[collection_name].find(filters, symbol_projection(code)).sort([('observed_at', 1)]).limit(limit)
     count = 0
     next_observed_at = None
+    pending = []
     async for batch in batches:
         count += 1
         next_observed_at = batch['observed_at'].isoformat()
-        envelope = await asyncio.to_thread(decode_batch, batch)
-        rows.extend(dict(q, observed_at=envelope['observed_at'])
-                    for q in envelope['quotes'] if q['code'] == code)
+        pending.append(batch)
+        # Amortize thread dispatch for small projections. Legacy full-market
+        # batches are still decoded immediately to bound memory during rollout.
+        if len(pending) >= 32 or batch.get('codec') != PARTITIONED_CODEC:
+            rows.extend(await asyncio.to_thread(decode_symbol_batches, pending, code))
+            pending = []
+    if pending:
+        rows.extend(await asyncio.to_thread(decode_symbol_batches, pending, code))
     return {'data': rows, 'batches': count, 'possibly_truncated': count == limit,
             'collection': collection_name,
             'last_observed_at': next_observed_at,

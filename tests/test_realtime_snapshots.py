@@ -208,8 +208,10 @@ def test_snapshot_api_filters_symbol_and_bounds_window(tmp_path, kind):
             async def __aiter__(self):
                 for row in saved.rows.values():yield row
         class Query:
-            def find(self, filters):
+            def find(self, filters, projection):
                 assert filters['trade_date'] == '2026-09-16'
+                assert projection['quote_chunks.01'] == 1
+                assert 'quote_chunks' not in projection
                 return Cursor()
         # Only the requested collection exists: cross-table reads must fail.
         db = {collection_name: Query()}
