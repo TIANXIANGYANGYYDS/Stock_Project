@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from datetime import datetime, timedelta
@@ -10,6 +11,8 @@ from bs4 import BeautifulSoup
 
 from app.models import FetchedNews
 from app.crawlers.base_news_crawler import BaseNewsCrawler, CN_TZ
+
+logger = logging.getLogger(__name__)
 
 
 class Jin10NewsCrawler(BaseNewsCrawler):
@@ -26,6 +29,44 @@ class Jin10NewsCrawler(BaseNewsCrawler):
     base_url = "https://www.jin10.com/"
     #: 用于拼接和校验快讯详情地址的固定来源站点。
     detail_base = "https://flash.jin10.com"
+    feed_url = "https://www.jin10.com/flash_newest.js"
+
+    def parse_feed(self, text: str) -> list[FetchedNews]:
+        """Read the public JSON assignment without executing remote JavaScript."""
+        match = re.fullmatch(r"\s*var\s+newest\s*=\s*(\[.*\])\s*;?\s*", text, re.S)
+        if not match:
+            raise ValueError("jin10_feed_invalid_format")
+        payload = json.loads(match.group(1))
+        if not isinstance(payload, list) or not payload:
+            raise ValueError("jin10_feed_empty")
+        rows = []
+        for item in payload:
+            # Economic release cards and VIP placeholders are not news bodies.
+            if item.get("type") != 0:
+                continue
+            data = item.get("data") or {}
+            content = BeautifulSoup(data.get("content") or "", "html.parser").get_text(" ", strip=True)
+            if not content or "解锁VIP快讯" in content:
+                continue
+            flash_id = str(item.get("id", ""))
+            if not flash_id.isdigit():
+                raise ValueError("jin10_feed_invalid_id")
+            at = datetime.strptime(item["time"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=CN_TZ)
+            title, body = self.split_title_and_content(
+                data.get("title") or self.extract_title("", content),
+                self.strict_clean_content_for_dedup(content),
+            )
+            if not body:
+                continue
+            rows.append(FetchedNews(
+                event_id=self.build_event_id(f"{self.source}:{self.detail_base}/detail/{flash_id}"),
+                publish_ts=int(at.timestamp()), publish_time=at.strftime("%Y-%m-%d %H:%M:%S"),
+                subjects=[], title=title or self.build_title_from_content(body),
+                content=body, source=self.source, llm_analysis=None,
+            ))
+        if not rows:
+            raise ValueError("jin10_feed_no_public_news")
+        return self.dedupe_news(rows, limit=50)
 
     #: 请求金十首页及详情页时使用的桌面浏览器请求头。
     headers = {
@@ -375,6 +416,21 @@ class Jin10NewsCrawler(BaseNewsCrawler):
         )
 
     def fetch_latest_telegraphs(self) -> list[FetchedNews]:
+        """Prefer the public feed; retain HTML fallback and surface zero output."""
+        try:
+            text = self.request_text_with_local_first(
+                self.feed_url, headers=self.headers,
+                params={"_": time.time_ns()},
+            )
+            return self.parse_feed(text)
+        except Exception:
+            logger.warning("jin10_feed_failed_using_html", exc_info=True)
+        rows = self._fetch_html_telegraphs()
+        if not rows:
+            raise ValueError("jin10_all_sources_empty_or_invalid")
+        return rows
+
+    def _fetch_html_telegraphs(self) -> list[FetchedNews]:
         """抓取最近二十条金十候选、详情并返回去重后的新闻列表。
 
         每条候选按顺序请求详情且短暂限速，然后合并、清洗并按 ``event_id``

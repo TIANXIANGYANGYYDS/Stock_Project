@@ -31,6 +31,7 @@ def test_quant_live_jobs_are_registered_with_safe_single_instance_policy() -> No
         quant_jobs.QUANT_LIVE_MORNING_JOB_ID,
         quant_jobs.QUANT_LIVE_AFTERNOON_JOB_ID,
         quant_jobs.QUANT_LIVE_STARTUP_JOB_ID,
+        quant_jobs.QUANT_LIVE_RECOVERY_JOB_ID,
     }
     assert all(job["max_instances"] == 1 for job in jobs.values())
     assert all(job["coalesce"] is True for job in jobs.values())
@@ -65,6 +66,9 @@ def test_refresh_failure_is_persisted_without_replacing_last_snapshot(
         def __init__(self):
             self.results = Results()
 
+        async def catch_up_completed_days(self, **kwargs):
+            return []
+
         async def process(self, *, now):
             raise RuntimeError("量化观察代码超过内存安全上限")
 
@@ -88,6 +92,9 @@ def test_startup_refresh_can_finalize_after_regular_job_window(monkeypatch) -> N
         def __init__(self):
             self.results = object()
 
+        async def catch_up_completed_days(self, **kwargs):
+            return []
+
         async def process(self, *, now):
             processed.append(now)
             return {"status": "closed", "trade_date": "2026-09-03"}
@@ -103,3 +110,73 @@ def test_startup_refresh_can_finalize_after_regular_job_window(monkeypatch) -> N
 
     assert result["status"] == "closed"
     assert len(processed) == 1
+
+
+def test_regular_refresh_recovers_history_before_processing_today(monkeypatch):
+    calls = []
+
+    class Service:
+        async def catch_up_completed_days(self, *, before_date):
+            calls.append(('recover', before_date.isoformat()))
+            return ['2026-10-09', '2026-10-12']
+
+        async def process(self, *, now):
+            calls.append(('process', now.date().isoformat()))
+            return {'trade_date': now.date().isoformat(), 'status': 'monitoring'}
+
+    monkeypatch.setattr(quant_jobs, 'QuantLiveService', Service)
+    asyncio.run(quant_jobs.refresh_quant_live_job(now=datetime.fromisoformat('2026-10-13T10:00:00+08:00')))
+    assert calls == [('recover', '2026-10-13'), ('process', '2026-10-13')]
+
+
+def test_scheduled_refresh_passes_calibrated_time_to_bar_and_close_checks(monkeypatch):
+    corrected = datetime.fromisoformat('2026-10-16T15:04:00+08:00')
+    calls = []
+
+    async def clock(): return corrected, -307
+
+    class Service:
+        async def catch_up_completed_days(self, *, before_date):
+            calls.append(before_date)
+        async def process(self, *, now):
+            calls.append(now)
+            return {'status': 'monitoring'}
+
+    monkeypatch.setattr(quant_jobs, 'observation_now', clock)
+    monkeypatch.setattr(quant_jobs, 'QuantLiveService', Service)
+    asyncio.run(quant_jobs.refresh_quant_live_job())
+    assert calls == [corrected.date(), corrected]
+
+
+def test_prepare_uses_calibrated_trade_date_and_clock_failure_never_writes(monkeypatch):
+    corrected = datetime.fromisoformat('2026-10-15T23:59:00+08:00')
+    calls = []
+
+    async def clock(): return corrected, -307
+
+    class Service:
+        async def catch_up_completed_days(self, *, before_date): calls.append(before_date)
+        async def prepare(self, *, reference_date):
+            calls.append(reference_date)
+            return {'trade_date': reference_date.isoformat()}
+
+    monkeypatch.setattr(quant_jobs, 'observation_now', clock)
+    monkeypatch.setattr(quant_jobs, 'QuantLiveService', Service)
+    asyncio.run(quant_jobs.prepare_quant_live_job())
+    assert calls == [corrected.date(), corrected.date()]
+
+    async def unverified(): raise RuntimeError('market_observation_clock_unverified')
+    monkeypatch.setattr(quant_jobs, 'observation_now', unverified)
+    with pytest.raises(RuntimeError, match='clock_unverified'):
+        asyncio.run(quant_jobs.prepare_quant_live_job())
+    with pytest.raises(RuntimeError, match='clock_unverified'):
+        asyncio.run(quant_jobs.refresh_quant_live_job())
+    assert calls == [corrected.date(), corrected.date()]
+
+
+def test_startup_before_calibrated_prepare_time_skips(monkeypatch):
+    async def clock(): return datetime.fromisoformat('2026-10-16T09:19:00+08:00'), -307
+    async def prepare(): raise AssertionError('must not prepare early')
+    monkeypatch.setattr(quant_jobs, 'observation_now', clock)
+    monkeypatch.setattr(quant_jobs, 'prepare_quant_live_job', prepare)
+    assert asyncio.run(quant_jobs.resume_quant_live_job())['reason'] == 'before_prepare_window'

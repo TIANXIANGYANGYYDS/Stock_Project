@@ -9,7 +9,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar
 
-import httpx
+from curl_cffi.requests import AsyncSession
 import pandas as pd
 
 from app.crawlers.eastmoney_reverse_fetcher import EastMoneyReverseFetcher
@@ -45,7 +45,7 @@ CN_TZ = timezone(timedelta(hours=8))
 class EastMoneyDataFetcher:
     """通过东方财富公开 JSON 接口读取股票清单、交易日和基础日 K 数据。
 
-    实例按代理地址复用独立的 httpx 客户端，避免本地连接和不同代理连接池混用；
+    实例按代理地址复用独立的 Chrome TLS 客户端，避免本地连接和不同代理连接池混用；
     多个备用域名按顺序尝试，所有返回值在进入上层组装流程前完成结构校验。
     """
 
@@ -81,7 +81,7 @@ class EastMoneyDataFetcher:
         timeout: tuple[int, int] = DEFAULT_TIMEOUT,
     ) -> None:
         """初始化超时、东方财富请求头和按代理地址分组的客户端缓存。"""
-        self.timeout = timeout  #: httpx 使用的 ``(连接超时, 读取超时)`` 秒数。
+        self.timeout = timeout  #: ``(连接超时, 读取超时)`` 秒数。
         #: 东方财富 JSON 接口使用的统一桌面浏览器请求头。
         self.headers = {
             "User-Agent": (
@@ -93,18 +93,18 @@ class EastMoneyDataFetcher:
             "Accept": "application/json,text/plain,*/*",
         }
         #: 以代理 URL 为键复用的异步客户端；``None`` 键代表本地直连客户端。
-        self._clients: Dict[Optional[str], httpx.AsyncClient] = {}
+        self._clients: Dict[Optional[str], AsyncSession] = {}
 
     async def close(self) -> None:
-        """关闭所有本地和代理 httpx 客户端，并清空客户端缓存。"""
+        """关闭所有本地和代理客户端，并清空客户端缓存。"""
         for client in self._clients.values():
-            await client.aclose()
+            await client.close()
         self._clients.clear()
 
     def _get_client(
         self,
         proxies: Optional[Dict[str, str]],
-    ) -> httpx.AsyncClient:
+    ) -> AsyncSession:
         """返回与给定代理映射匹配的复用客户端，必要时创建新客户端。
 
         代理映射必须至少含 ``https`` 或 ``http`` 地址；每个代理 URL 使用独立
@@ -117,16 +117,11 @@ class EastMoneyDataFetcher:
                 raise RuntimeError(f"代理配置缺少 http/https 地址: {proxies!r}")
         client = self._clients.get(proxy)
         if client is None:
-            connect_timeout, read_timeout = self.timeout
-            client = httpx.AsyncClient(
+            client = AsyncSession(
+                impersonate="chrome124",
                 headers=self.headers,
                 proxy=proxy,
-                timeout=httpx.Timeout(
-                    connect=connect_timeout,
-                    read=read_timeout,
-                    write=read_timeout,
-                    pool=connect_timeout,
-                ),
+                timeout=self.timeout,
                 trust_env=False,
             )
             self._clients[proxy] = client

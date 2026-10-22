@@ -233,8 +233,10 @@ def test_quality_includes_both_collections_with_separate_labels():
         async def to_list(self, length):return [{'_id': 'morning', 'batches': self.count}]
     class Aggregate:
         def __init__(self, count):self.count = count
-        def aggregate(self, pipeline):
+        def aggregate(self, pipeline, **kwargs):
             assert pipeline[0] == {'$match': {'trade_date': '2026-10-08'}}
+            assert kwargs['hint'] == 'idx_quote_quality_metadata'
+            assert kwargs['maxTimeMS'] == 10000
             return Result(self.count)
     class Minutes:
         async def find_one(self, filters):return {'trade_date': '2026-10-08', 'daily_missing_minutes': 0}

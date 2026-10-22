@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from types import SimpleNamespace
+import pytest
 
 from app.scheduler import crawler_jobs
 from app.services import stock_daily_detail_service as daily_service
@@ -21,6 +22,7 @@ def test_registers_main_and_automatic_compensation_jobs() -> None:
         "sync_stock_daily_detail_1530",
         "sync_stock_daily_detail_startup",
         "sync_stock_daily_detail_audit_1520",
+        "sync_stock_daily_detail_retry_1600",
     }
     assert jobs["sync_stock_daily_detail_audit_1520"]["kwargs"] == {
         "target_scope": "previous",
@@ -241,3 +243,39 @@ def test_startup_full_sync_uses_low_concurrency(monkeypatch) -> None:
     asyncio.run(crawler_jobs._run_stock_daily_detail_job(run_mode="startup"))
 
     assert captured["concurrency"] == 8
+
+
+def test_compensation_starts_missing_run_without_a_failure_record(monkeypatch):
+    calls = []
+
+    async def resolve(_):
+        return SimpleNamespace(target_trade_date='2026-10-12', target_yyyymmdd='20261012')
+
+    async def no_retry(*args, **kwargs):
+        return None
+
+    async def no_run(*args, **kwargs):
+        return False
+
+    async def sync(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(failed_count=0)
+
+    monkeypatch.setattr(daily_service, 'resolve_a_stock_target_trade_date', resolve)
+    monkeypatch.setattr(daily_service, 'retry_latest_incomplete_stock_daily_detail_run', no_retry)
+    monkeypatch.setattr(daily_service, 'stock_daily_detail_has_successful_sync_run', no_run)
+    monkeypatch.setattr(daily_service, 'stock_daily_detail_has_incomplete_sync_run', no_run)
+    monkeypatch.setattr(daily_service, 'run_stock_daily_detail_sync', sync)
+    asyncio.run(crawler_jobs._run_stock_daily_detail_compensation_job(
+        target_scope='previous', max_automatic_compensations=5))
+    assert calls[0]['target_trade_date'] == '2026-10-12'
+    assert calls[0]['run_mode'] == 'startup'
+
+
+def test_main_sync_failure_reaches_scheduler(monkeypatch):
+    async def failed(_):
+        raise RuntimeError('provider failed')
+
+    monkeypatch.setattr(daily_service, 'resolve_a_stock_target_trade_date', failed)
+    with pytest.raises(RuntimeError, match='provider failed'):
+        asyncio.run(crawler_jobs._run_stock_daily_detail_job(run_mode='scheduled'))

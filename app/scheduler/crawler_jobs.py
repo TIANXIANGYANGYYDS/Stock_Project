@@ -323,8 +323,12 @@ async def _run_stock_daily_detail_compensation_job(
 
     from app.services.stock_daily_detail_service import (
         STOCK_DAILY_DEFAULT_ADJUST,
+        STOCK_DAILY_RETRY_CONCURRENCY,
         resolve_a_stock_target_trade_date,
         retry_latest_incomplete_stock_daily_detail_run,
+        run_stock_daily_detail_sync,
+        stock_daily_detail_has_successful_sync_run,
+        stock_daily_detail_has_incomplete_sync_run,
     )
 
     if target_scope == "today":
@@ -358,6 +362,20 @@ async def _run_stock_daily_detail_compensation_job(
             max_automatic_compensations=max_automatic_compensations,
         )
         if result is None:
+            if (not await stock_daily_detail_has_successful_sync_run(
+                    decision.target_trade_date, STOCK_DAILY_DEFAULT_ADJUST)
+                    and not await stock_daily_detail_has_incomplete_sync_run(
+                        decision.target_trade_date, STOCK_DAILY_DEFAULT_ADJUST)):
+                # Older list-stage failures have no persisted run to retry.
+                result = await run_stock_daily_detail_sync(
+                    start_date=decision.target_yyyymmdd, end_date=decision.target_yyyymmdd,
+                    target_trade_date=decision.target_trade_date, run_mode="startup",
+                    adjust=STOCK_DAILY_DEFAULT_ADJUST, concurrency=STOCK_DAILY_RETRY_CONCURRENCY)
+                if result.failed_count:
+                    await _run_immediate_stock_daily_detail_compensations(
+                        target_trade_date=decision.target_trade_date, adjust=STOCK_DAILY_DEFAULT_ADJUST,
+                        max_automatic_compensations=max_automatic_compensations)
+                return
             logger.info(
                 "sync_stock_daily_detail_compensation_skipped target_scope=%s "
                 "target_trade_date=%s reason=no_retryable_incomplete_run",
@@ -520,6 +538,7 @@ async def _run_stock_daily_detail_job(*, run_mode: str) -> None:
             )
     except Exception:
         logger.exception("sync_stock_daily_detail_job_failed")
+        raise
     finally:
         logger.info("sync_stock_daily_detail_job_finished")
 
@@ -613,6 +632,7 @@ def register_stock_daily_detail_job(
     )
 
     compensation_jobs = (
+        (16, 0, "today", STOCK_DAILY_TOTAL_MAX_COMPENSATIONS, "retry_1600"),
         (15, 20, "previous", STOCK_DAILY_TOTAL_MAX_COMPENSATIONS, "audit_1520"),
     )
     for hour, minute, target_scope, max_compensations, suffix in compensation_jobs:
@@ -714,3 +734,7 @@ def register_crawler_jobs(
 
     register_stock_daily_detail_job(scheduler)
     register_realtime_minute_jobs(scheduler)
+    from app.scheduler.market_observation_jobs import register_market_observation_jobs
+    register_market_observation_jobs(scheduler)
+    from app.scheduler.realtime_snapshot_retention_jobs import register_realtime_snapshot_retention_job
+    register_realtime_snapshot_retention_job(scheduler)

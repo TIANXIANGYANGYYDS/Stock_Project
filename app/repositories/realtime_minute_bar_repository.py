@@ -19,11 +19,14 @@ class RealtimeMinuteBarRepository(BaseMongoRepository):
         super().__init__(database=database)
 
     async def create_indexes(self) -> None:
-        await self.collection.update_many(
-            {"interval": {"$exists": False}},
-            {"$set": {"interval": "1m"}},
-        )
         existing_indexes = await self.collection.index_information()
+        # The new unique index is installed after migration. Do not rescan the
+        # entire minute history at every market-session startup.
+        if "uniq_realtime_code_interval_timestamp" not in existing_indexes:
+            await self.collection.update_many(
+                {"interval": {"$exists": False}},
+                {"$set": {"interval": "1m"}},
+            )
         for obsolete_name in (
             "uniq_realtime_code_timestamp",
             "idx_realtime_trade_date_timestamp_code",

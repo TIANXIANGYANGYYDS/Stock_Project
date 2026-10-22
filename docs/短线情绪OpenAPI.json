@@ -1,0 +1,3109 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "短线情绪看板 API",
+    "version": "1.3.0"
+  },
+  "paths": {
+    "/api/v1/sentiment/dashboard": {
+      "get": {
+        "tags": [
+          "sentiment"
+        ],
+        "summary": "Dashboard",
+        "operationId": "dashboard_api_v1_sentiment_dashboard_get",
+        "parameters": [
+          {
+            "name": "trade_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Trade Date"
+            }
+          },
+          {
+            "name": "snapshot_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 64
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot Id"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "all_a",
+                "hs_mainboard"
+              ],
+              "type": "string",
+              "default": "all_a",
+              "title": "Scope"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DashboardResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sentiment/ladder": {
+      "get": {
+        "tags": [
+          "sentiment"
+        ],
+        "summary": "Ladder",
+        "operationId": "ladder_api_v1_sentiment_ladder_get",
+        "parameters": [
+          {
+            "name": "theme_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 64
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Theme Id"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "limit_up",
+                "opened",
+                "touched"
+              ],
+              "type": "string",
+              "default": "limit_up",
+              "title": "Status"
+            }
+          },
+          {
+            "name": "min_streak",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 100,
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Min Streak"
+            }
+          },
+          {
+            "name": "board_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "sh_mainboard",
+                    "sz_mainboard",
+                    "chinext",
+                    "star",
+                    "bse"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Board Type"
+            }
+          },
+          {
+            "name": "group_by",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "theme",
+                "market"
+              ],
+              "type": "string",
+              "default": "theme",
+              "title": "Group By"
+            }
+          },
+          {
+            "name": "trade_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Trade Date"
+            }
+          },
+          {
+            "name": "snapshot_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 64
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot Id"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "all_a",
+                "hs_mainboard"
+              ],
+              "type": "string",
+              "default": "all_a",
+              "title": "Scope"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LadderResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sentiment/themes/{theme_id}": {
+      "get": {
+        "tags": [
+          "sentiment"
+        ],
+        "summary": "Theme Detail",
+        "operationId": "theme_detail_api_v1_sentiment_themes__theme_id__get",
+        "parameters": [
+          {
+            "name": "theme_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Theme Id"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "default": 1,
+              "title": "Page"
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 50,
+              "title": "Page Size"
+            }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "board_strength",
+                "change_ratio"
+              ],
+              "type": "string",
+              "default": "board_strength",
+              "title": "Sort"
+            }
+          },
+          {
+            "name": "trade_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Trade Date"
+            }
+          },
+          {
+            "name": "snapshot_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 64
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot Id"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "all_a",
+                "hs_mainboard"
+              ],
+              "type": "string",
+              "default": "all_a",
+              "title": "Scope"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThemeResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sentiment/stocks/{code}": {
+      "get": {
+        "tags": [
+          "sentiment"
+        ],
+        "summary": "Stock Detail",
+        "operationId": "stock_detail_api_v1_sentiment_stocks__code__get",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Code"
+            }
+          },
+          {
+            "name": "trade_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Trade Date"
+            }
+          },
+          {
+            "name": "snapshot_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 64
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot Id"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "all_a",
+                "hs_mainboard"
+              ],
+              "type": "string",
+              "default": "all_a",
+              "title": "Scope"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StockResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sentiment/events": {
+      "get": {
+        "tags": [
+          "sentiment"
+        ],
+        "summary": "Events",
+        "operationId": "events_api_v1_sentiment_events_get",
+        "parameters": [
+          {
+            "name": "after",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 80
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 200,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "theme_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 64
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Theme Id"
+            }
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "pattern": "^\\d{6}$"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Code"
+            }
+          },
+          {
+            "name": "event_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "first_touch",
+                    "first_seal",
+                    "open",
+                    "reseal",
+                    "limit_down",
+                    "open_limit_down",
+                    "rapid_rise",
+                    "rapid_fall",
+                    "quick_rebound",
+                    "high_dive",
+                    "volume_surge",
+                    "emotion_changed"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Event Type"
+            }
+          },
+          {
+            "name": "trade_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Trade Date"
+            }
+          },
+          {
+            "name": "snapshot_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 64
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot Id"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "all_a",
+                "hs_mainboard"
+              ],
+              "type": "string",
+              "default": "all_a",
+              "title": "Scope"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SentimentEventsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sentiment/timeseries": {
+      "get": {
+        "tags": [
+          "sentiment"
+        ],
+        "summary": "Timeseries",
+        "operationId": "timeseries_api_v1_sentiment_timeseries_get",
+        "parameters": [
+          {
+            "name": "start_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Start Date"
+            }
+          },
+          {
+            "name": "end_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "End Date"
+            }
+          },
+          {
+            "name": "interval",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "1m",
+                "5m",
+                "1d"
+              ],
+              "type": "string",
+              "default": "1m",
+              "title": "Interval"
+            }
+          },
+          {
+            "name": "theme_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 64
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Theme Id"
+            }
+          },
+          {
+            "name": "trade_date",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Trade Date"
+            }
+          },
+          {
+            "name": "snapshot_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 64
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot Id"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "all_a",
+                "hs_mainboard"
+              ],
+              "type": "string",
+              "default": "all_a",
+              "title": "Scope"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SentimentResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sentiment/stream": {
+      "get": {
+        "tags": [
+          "sentiment"
+        ],
+        "summary": "Stream",
+        "operationId": "stream_api_v1_sentiment_stream_get",
+        "parameters": [
+          {
+            "name": "scope",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "all_a",
+                "hs_mainboard"
+              ],
+              "type": "string",
+              "default": "all_a",
+              "title": "Scope"
+            }
+          },
+          {
+            "name": "last-event-id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 80
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Last-Event-Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "DashboardResponse": {
+        "properties": {
+          "meta": {
+            "$ref": "#/components/schemas/SentimentMeta"
+          },
+          "data": {
+            "$ref": "#/components/schemas/DashboardData"
+          }
+        },
+        "type": "object",
+        "required": [
+          "meta",
+          "data"
+        ],
+        "title": "DashboardResponse"
+      },
+      "SentimentMeta": {
+        "properties": {
+          "trade_date": {
+            "type": "string",
+            "title": "Trade Date"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "all_a",
+              "hs_mainboard"
+            ],
+            "title": "Scope"
+          },
+          "snapshot_id": {
+            "type": "string",
+            "title": "Snapshot Id"
+          },
+          "as_of": {
+            "type": "string",
+            "title": "As Of",
+            "description": "当前展示的完整观察实际截止时间；保留时不会改写成收盘时间"
+          },
+          "generated_at": {
+            "type": "string",
+            "title": "Generated At"
+          },
+          "session": {
+            "type": "string",
+            "title": "Session"
+          },
+          "is_final": {
+            "type": "boolean",
+            "title": "Is Final"
+          },
+          "is_stale": {
+            "type": "boolean",
+            "title": "Is Stale"
+          },
+          "coverage": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Coverage"
+          },
+          "classification_version": {
+            "type": "string",
+            "title": "Classification Version"
+          },
+          "rule_version": {
+            "type": "string",
+            "title": "Rule Version"
+          },
+          "age_seconds": {
+            "type": "number",
+            "title": "Age Seconds"
+          },
+          "environment_interval_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Environment Interval Seconds"
+          },
+          "event_rule_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Event Rule Version"
+          },
+          "popularity": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PopularitySummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "is_retained": {
+            "type": "boolean",
+            "title": "Is Retained",
+            "default": false
+          },
+          "retention_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retention Reason"
+          },
+          "retained_from_snapshot_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retained From Snapshot Id"
+          },
+          "processed_as_of": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Processed As Of",
+            "description": "已消费的最新真实归档时间；可能晚于展示观察的 as_of"
+          },
+          "finalization": {
+            "$ref": "#/components/schemas/FinalizationState"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "trade_date",
+          "scope",
+          "snapshot_id",
+          "as_of",
+          "generated_at",
+          "session",
+          "is_final",
+          "is_stale",
+          "coverage",
+          "classification_version",
+          "rule_version",
+          "age_seconds"
+        ],
+        "title": "SentimentMeta"
+      },
+      "PopularitySummary": {
+        "properties": {
+          "provider": {
+            "type": "string",
+            "const": "ths",
+            "title": "Provider",
+            "default": "ths"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "available",
+              "missing",
+              "stale"
+            ],
+            "title": "Status"
+          },
+          "snapshot_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Id"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "age_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Age Seconds"
+          },
+          "max_age_seconds": {
+            "type": "integer",
+            "title": "Max Age Seconds",
+            "default": 900
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "snapshot_id",
+          "observed_at",
+          "age_seconds"
+        ],
+        "title": "PopularitySummary"
+      },
+      "FinalizationState": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "not_due",
+              "pending",
+              "finalized"
+            ],
+            "title": "Status"
+          },
+          "pending_reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Pending Reasons"
+          }
+        },
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "FinalizationState"
+      },
+      "DashboardData": {
+        "properties": {
+          "market": {
+            "$ref": "#/components/schemas/SentimentStats"
+          },
+          "boards": {
+            "items": {
+              "$ref": "#/components/schemas/BoardStats"
+            },
+            "type": "array",
+            "title": "Boards"
+          },
+          "themes": {
+            "items": {
+              "$ref": "#/components/schemas/DashboardThemeStats"
+            },
+            "type": "array",
+            "title": "Themes"
+          },
+          "recent_events": {
+            "items": {
+              "$ref": "#/components/schemas/SentimentEvent"
+            },
+            "type": "array",
+            "title": "Recent Events"
+          },
+          "unique_stock_count": {
+            "type": "integer",
+            "title": "Unique Stock Count"
+          }
+        },
+        "type": "object",
+        "required": [
+          "market",
+          "themes",
+          "recent_events",
+          "unique_stock_count"
+        ],
+        "title": "DashboardData"
+      },
+      "SentimentStats": {
+        "properties": {
+          "values": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Values"
+          },
+          "feedback": {
+            "additionalProperties": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "object",
+            "title": "Feedback"
+          },
+          "emotion": {
+            "$ref": "#/components/schemas/Emotion"
+          },
+          "missing_reasons": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Missing Reasons"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "values",
+          "feedback",
+          "emotion",
+          "missing_reasons"
+        ],
+        "title": "SentimentStats"
+      },
+      "Emotion": {
+        "properties": {
+          "state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State"
+          },
+          "candidate_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Candidate State"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "confirmed",
+              "pending_confirmation",
+              "insufficient_data",
+              "unclassified"
+            ],
+            "title": "Status"
+          },
+          "state_since": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "State Since"
+          },
+          "previous_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous State"
+          },
+          "intraday_change": {
+            "type": "string",
+            "enum": [
+              "unknown",
+              "improving",
+              "deteriorating",
+              "stable"
+            ],
+            "title": "Intraday Change"
+          },
+          "extreme_tag": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Extreme Tag"
+          },
+          "evidence": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Evidence"
+          },
+          "counter_evidence": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Counter Evidence"
+          },
+          "evaluated_at": {
+            "type": "string",
+            "title": "Evaluated At"
+          },
+          "rule_version": {
+            "type": "string",
+            "title": "Rule Version"
+          },
+          "method": {
+            "type": "string",
+            "title": "Method"
+          },
+          "validated_for_trading": {
+            "type": "boolean",
+            "title": "Validated For Trading"
+          },
+          "evaluation_interval_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Evaluation Interval Seconds"
+          },
+          "support": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Support"
+          },
+          "support_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Support Status"
+          },
+          "last_supported_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Supported At"
+          },
+          "entry": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "object",
+            "title": "Entry"
+          },
+          "hold": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "boolean"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "object",
+            "title": "Hold"
+          },
+          "facts": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Facts"
+          },
+          "candidates": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Candidates"
+          },
+          "support_unknown_reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Support Unknown Reasons"
+          },
+          "data_quality": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Data Quality"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "state",
+          "candidate_state",
+          "status",
+          "state_since",
+          "previous_state",
+          "intraday_change",
+          "extreme_tag",
+          "evidence",
+          "counter_evidence",
+          "evaluated_at",
+          "rule_version",
+          "method",
+          "validated_for_trading"
+        ],
+        "title": "Emotion"
+      },
+      "BoardStats": {
+        "properties": {
+          "values": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Values"
+          },
+          "feedback": {
+            "additionalProperties": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "object",
+            "title": "Feedback"
+          },
+          "emotion": {
+            "$ref": "#/components/schemas/Emotion"
+          },
+          "missing_reasons": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Missing Reasons"
+          },
+          "board_type": {
+            "type": "string",
+            "enum": [
+              "sh_mainboard",
+              "sz_mainboard",
+              "chinext",
+              "star",
+              "bse"
+            ],
+            "title": "Board Type"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "member_count": {
+            "type": "integer",
+            "title": "Member Count"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "values",
+          "feedback",
+          "emotion",
+          "missing_reasons",
+          "board_type",
+          "name",
+          "member_count"
+        ],
+        "title": "BoardStats"
+      },
+      "DashboardThemeStats": {
+        "properties": {
+          "values": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Values"
+          },
+          "feedback": {
+            "additionalProperties": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "object",
+            "title": "Feedback"
+          },
+          "emotion": {
+            "$ref": "#/components/schemas/Emotion"
+          },
+          "missing_reasons": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Missing Reasons"
+          },
+          "theme_id": {
+            "type": "string",
+            "title": "Theme Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "member_count": {
+            "type": "integer",
+            "title": "Member Count"
+          },
+          "scope_member_count": {
+            "type": "integer",
+            "title": "Scope Member Count"
+          },
+          "membership_basis": {
+            "type": "string",
+            "title": "Membership Basis"
+          },
+          "historical_membership_verified": {
+            "type": "boolean",
+            "title": "Historical Membership Verified"
+          },
+          "top_stocks": {
+            "items": {
+              "$ref": "#/components/schemas/SentimentStock"
+            },
+            "type": "array",
+            "title": "Top Stocks"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "values",
+          "feedback",
+          "emotion",
+          "missing_reasons",
+          "theme_id",
+          "name",
+          "member_count",
+          "scope_member_count",
+          "membership_basis",
+          "historical_membership_verified"
+        ],
+        "title": "DashboardThemeStats"
+      },
+      "SentimentStock": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "market": {
+            "type": "string",
+            "title": "Market"
+          },
+          "board_type": {
+            "type": "string",
+            "title": "Board Type"
+          },
+          "price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price"
+          },
+          "change_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Change Ratio"
+          },
+          "previous_close": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Close"
+          },
+          "amount_yuan": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Amount Yuan"
+          },
+          "turnover_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turnover Ratio"
+          },
+          "open_change_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Open Change Ratio"
+          },
+          "drawdown_from_high_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Drawdown From High Ratio"
+          },
+          "limit_up_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Up Price"
+          },
+          "limit_down_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Down Price"
+          },
+          "limit_rule": {
+            "type": "string",
+            "title": "Limit Rule"
+          },
+          "limit_status": {
+            "type": "string",
+            "enum": [
+              "unknown",
+              "sealed",
+              "at_limit",
+              "opened",
+              "not_touched"
+            ],
+            "title": "Limit Status"
+          },
+          "is_limit_up": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Limit Up"
+          },
+          "is_limit_down": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Limit Down"
+          },
+          "is_sealed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Sealed"
+          },
+          "touched_up": {
+            "type": "boolean",
+            "title": "Touched Up"
+          },
+          "seal_amount_yuan": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seal Amount Yuan"
+          },
+          "seal_volume_shares": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seal Volume Shares"
+          },
+          "observed_open_count": {
+            "type": "integer",
+            "title": "Observed Open Count"
+          },
+          "first_touch_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Touch At"
+          },
+          "first_seal_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Seal At"
+          },
+          "last_reseal_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Reseal At"
+          },
+          "last_open_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Open At"
+          },
+          "confirmed_streak_before_today": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confirmed Streak Before Today"
+          },
+          "intraday_streak": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intraday Streak"
+          },
+          "target_streak": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Streak"
+          },
+          "board_run": {
+            "$ref": "#/components/schemas/BoardRun"
+          },
+          "popularity": {
+            "$ref": "#/components/schemas/Popularity"
+          },
+          "theme_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Theme Ids"
+          },
+          "attributed_theme_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attributed Theme Id"
+          },
+          "attribution_basis": {
+            "type": "string",
+            "title": "Attribution Basis"
+          },
+          "source_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Time"
+          },
+          "received_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Received At"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          },
+          "valid": {
+            "type": "boolean",
+            "title": "Valid"
+          },
+          "eligible": {
+            "type": "boolean",
+            "title": "Eligible"
+          },
+          "excluded_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Excluded Reason"
+          },
+          "is_stale": {
+            "type": "boolean",
+            "title": "Is Stale"
+          },
+          "missing_reasons": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Missing Reasons"
+          },
+          "timing_basis": {
+            "type": "string",
+            "title": "Timing Basis"
+          },
+          "path_complete": {
+            "type": "boolean",
+            "title": "Path Complete"
+          },
+          "status_basis": {
+            "type": "string",
+            "title": "Status Basis"
+          },
+          "is_final": {
+            "type": "boolean",
+            "title": "Is Final"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "code",
+          "name",
+          "market",
+          "board_type",
+          "price",
+          "change_ratio",
+          "amount_yuan",
+          "turnover_ratio",
+          "open_change_ratio",
+          "drawdown_from_high_ratio",
+          "limit_up_price",
+          "limit_down_price",
+          "limit_rule",
+          "limit_status",
+          "is_limit_up",
+          "is_limit_down",
+          "is_sealed",
+          "touched_up",
+          "seal_amount_yuan",
+          "seal_volume_shares",
+          "observed_open_count",
+          "first_touch_at",
+          "first_seal_at",
+          "last_reseal_at",
+          "last_open_at",
+          "confirmed_streak_before_today",
+          "intraday_streak",
+          "target_streak",
+          "board_run",
+          "theme_ids",
+          "attributed_theme_id",
+          "attribution_basis",
+          "source_time",
+          "received_at",
+          "provider",
+          "valid",
+          "eligible",
+          "excluded_reason",
+          "is_stale",
+          "missing_reasons",
+          "timing_basis",
+          "path_complete",
+          "status_basis",
+          "is_final"
+        ],
+        "title": "SentimentStock"
+      },
+      "BoardRun": {
+        "properties": {
+          "window_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Window Days"
+          },
+          "limit_up_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Up Days"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "is_final": {
+            "type": "boolean",
+            "title": "Is Final"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "window_days",
+          "limit_up_days",
+          "label",
+          "is_final"
+        ],
+        "title": "BoardRun"
+      },
+      "Popularity": {
+        "properties": {
+          "provider": {
+            "type": "string",
+            "const": "ths",
+            "title": "Provider",
+            "default": "ths"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "ranked",
+              "not_ranked",
+              "missing",
+              "stale"
+            ],
+            "title": "Status",
+            "default": "missing"
+          },
+          "rank": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rank"
+          },
+          "heat": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Heat"
+          },
+          "rank_change": {
+            "title": "Rank Change"
+          },
+          "snapshot_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Snapshot Id"
+          },
+          "observed_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Observed At"
+          },
+          "age_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Age Seconds"
+          },
+          "max_age_seconds": {
+            "type": "integer",
+            "title": "Max Age Seconds",
+            "default": 900
+          }
+        },
+        "type": "object",
+        "title": "Popularity"
+      },
+      "SentimentEvent": {
+        "properties": {
+          "event_id": {
+            "type": "string",
+            "title": "Event Id"
+          },
+          "snapshot_id": {
+            "type": "string",
+            "title": "Snapshot Id"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "first_touch",
+              "first_seal",
+              "open",
+              "reseal",
+              "limit_down",
+              "open_limit_down",
+              "rapid_rise",
+              "rapid_fall",
+              "quick_rebound",
+              "high_dive",
+              "volume_surge",
+              "emotion_changed"
+            ],
+            "title": "Type"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "evidence": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Evidence"
+          },
+          "rule_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rule Version"
+          },
+          "cooldown_seconds": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cooldown Seconds"
+          },
+          "code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "theme_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Theme Ids"
+          },
+          "observed_at": {
+            "type": "string",
+            "title": "Observed At"
+          },
+          "source_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Time"
+          },
+          "timing_basis": {
+            "type": "string",
+            "title": "Timing Basis"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "event_id",
+          "snapshot_id",
+          "type",
+          "observed_at",
+          "timing_basis"
+        ],
+        "title": "SentimentEvent"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "type": "array",
+            "title": "Detail"
+          }
+        },
+        "type": "object",
+        "title": "HTTPValidationError"
+      },
+      "ValidationError": {
+        "properties": {
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Location"
+          },
+          "msg": {
+            "type": "string",
+            "title": "Message"
+          },
+          "type": {
+            "type": "string",
+            "title": "Error Type"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "ctx": {
+            "type": "object",
+            "title": "Context"
+          }
+        },
+        "type": "object",
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError"
+      },
+      "LadderResponse": {
+        "properties": {
+          "meta": {
+            "$ref": "#/components/schemas/SentimentMeta"
+          },
+          "data": {
+            "$ref": "#/components/schemas/LadderData"
+          }
+        },
+        "type": "object",
+        "required": [
+          "meta",
+          "data"
+        ],
+        "title": "LadderResponse"
+      },
+      "LadderData": {
+        "properties": {
+          "groups": {
+            "items": {
+              "$ref": "#/components/schemas/LadderGroup"
+            },
+            "type": "array",
+            "title": "Groups"
+          },
+          "unique_count": {
+            "type": "integer",
+            "title": "Unique Count"
+          },
+          "membership_count": {
+            "type": "integer",
+            "title": "Membership Count"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          }
+        },
+        "type": "object",
+        "required": [
+          "groups",
+          "unique_count",
+          "membership_count",
+          "status"
+        ],
+        "title": "LadderData"
+      },
+      "LadderGroup": {
+        "properties": {
+          "theme_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Theme Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "levels": {
+            "items": {
+              "$ref": "#/components/schemas/LadderLevel"
+            },
+            "type": "array",
+            "title": "Levels"
+          }
+        },
+        "type": "object",
+        "required": [
+          "theme_id",
+          "name",
+          "levels"
+        ],
+        "title": "LadderGroup"
+      },
+      "LadderLevel": {
+        "properties": {
+          "height": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Height"
+          },
+          "height_basis": {
+            "type": "string",
+            "title": "Height Basis"
+          },
+          "count": {
+            "type": "integer",
+            "title": "Count"
+          },
+          "stocks": {
+            "items": {
+              "$ref": "#/components/schemas/SentimentStock"
+            },
+            "type": "array",
+            "title": "Stocks"
+          }
+        },
+        "type": "object",
+        "required": [
+          "height",
+          "height_basis",
+          "count",
+          "stocks"
+        ],
+        "title": "LadderLevel"
+      },
+      "ThemeResponse": {
+        "properties": {
+          "meta": {
+            "$ref": "#/components/schemas/SentimentMeta"
+          },
+          "data": {
+            "$ref": "#/components/schemas/ThemeDetail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "meta",
+          "data"
+        ],
+        "title": "ThemeResponse"
+      },
+      "ThemeDetail": {
+        "properties": {
+          "values": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Values"
+          },
+          "feedback": {
+            "additionalProperties": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "object",
+            "title": "Feedback"
+          },
+          "emotion": {
+            "$ref": "#/components/schemas/Emotion"
+          },
+          "missing_reasons": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Missing Reasons"
+          },
+          "theme_id": {
+            "type": "string",
+            "title": "Theme Id"
+          },
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "member_count": {
+            "type": "integer",
+            "title": "Member Count"
+          },
+          "scope_member_count": {
+            "type": "integer",
+            "title": "Scope Member Count"
+          },
+          "membership_basis": {
+            "type": "string",
+            "title": "Membership Basis"
+          },
+          "historical_membership_verified": {
+            "type": "boolean",
+            "title": "Historical Membership Verified"
+          },
+          "members": {
+            "$ref": "#/components/schemas/ThemeMembers"
+          },
+          "ladder": {
+            "$ref": "#/components/schemas/LadderData"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "values",
+          "feedback",
+          "emotion",
+          "missing_reasons",
+          "theme_id",
+          "name",
+          "member_count",
+          "scope_member_count",
+          "membership_basis",
+          "historical_membership_verified",
+          "members",
+          "ladder"
+        ],
+        "title": "ThemeDetail"
+      },
+      "ThemeMembers": {
+        "properties": {
+          "total": {
+            "type": "integer",
+            "title": "Total"
+          },
+          "page": {
+            "type": "integer",
+            "title": "Page"
+          },
+          "page_size": {
+            "type": "integer",
+            "title": "Page Size"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SentimentStock"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "sort": {
+            "type": "string",
+            "enum": [
+              "board_strength",
+              "change_ratio"
+            ],
+            "title": "Sort",
+            "default": "board_strength"
+          },
+          "sort_fields": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Sort Fields"
+          }
+        },
+        "type": "object",
+        "required": [
+          "total",
+          "page",
+          "page_size",
+          "items"
+        ],
+        "title": "ThemeMembers"
+      },
+      "StockResponse": {
+        "properties": {
+          "meta": {
+            "$ref": "#/components/schemas/SentimentMeta"
+          },
+          "data": {
+            "$ref": "#/components/schemas/StockDetail"
+          }
+        },
+        "type": "object",
+        "required": [
+          "meta",
+          "data"
+        ],
+        "title": "StockResponse"
+      },
+      "StockDetail": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "title": "Code"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "market": {
+            "type": "string",
+            "title": "Market"
+          },
+          "board_type": {
+            "type": "string",
+            "title": "Board Type"
+          },
+          "price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Price"
+          },
+          "change_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Change Ratio"
+          },
+          "previous_close": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Close"
+          },
+          "amount_yuan": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Amount Yuan"
+          },
+          "turnover_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Turnover Ratio"
+          },
+          "open_change_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Open Change Ratio"
+          },
+          "drawdown_from_high_ratio": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Drawdown From High Ratio"
+          },
+          "limit_up_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Up Price"
+          },
+          "limit_down_price": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Limit Down Price"
+          },
+          "limit_rule": {
+            "type": "string",
+            "title": "Limit Rule"
+          },
+          "limit_status": {
+            "type": "string",
+            "enum": [
+              "unknown",
+              "sealed",
+              "at_limit",
+              "opened",
+              "not_touched"
+            ],
+            "title": "Limit Status"
+          },
+          "is_limit_up": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Limit Up"
+          },
+          "is_limit_down": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Limit Down"
+          },
+          "is_sealed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Sealed"
+          },
+          "touched_up": {
+            "type": "boolean",
+            "title": "Touched Up"
+          },
+          "seal_amount_yuan": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seal Amount Yuan"
+          },
+          "seal_volume_shares": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Seal Volume Shares"
+          },
+          "observed_open_count": {
+            "type": "integer",
+            "title": "Observed Open Count"
+          },
+          "first_touch_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Touch At"
+          },
+          "first_seal_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Seal At"
+          },
+          "last_reseal_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Reseal At"
+          },
+          "last_open_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Open At"
+          },
+          "confirmed_streak_before_today": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confirmed Streak Before Today"
+          },
+          "intraday_streak": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Intraday Streak"
+          },
+          "target_streak": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Streak"
+          },
+          "board_run": {
+            "$ref": "#/components/schemas/BoardRun"
+          },
+          "popularity": {
+            "$ref": "#/components/schemas/Popularity"
+          },
+          "theme_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Theme Ids"
+          },
+          "attributed_theme_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attributed Theme Id"
+          },
+          "attribution_basis": {
+            "type": "string",
+            "title": "Attribution Basis"
+          },
+          "source_time": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source Time"
+          },
+          "received_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Received At"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          },
+          "valid": {
+            "type": "boolean",
+            "title": "Valid"
+          },
+          "eligible": {
+            "type": "boolean",
+            "title": "Eligible"
+          },
+          "excluded_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Excluded Reason"
+          },
+          "is_stale": {
+            "type": "boolean",
+            "title": "Is Stale"
+          },
+          "missing_reasons": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "title": "Missing Reasons"
+          },
+          "timing_basis": {
+            "type": "string",
+            "title": "Timing Basis"
+          },
+          "path_complete": {
+            "type": "boolean",
+            "title": "Path Complete"
+          },
+          "status_basis": {
+            "type": "string",
+            "title": "Status Basis"
+          },
+          "is_final": {
+            "type": "boolean",
+            "title": "Is Final"
+          },
+          "board_history": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Board History"
+          },
+          "events": {
+            "$ref": "#/components/schemas/EventPage"
+          },
+          "themes": {
+            "items": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "type": "array",
+            "title": "Themes"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "code",
+          "name",
+          "market",
+          "board_type",
+          "price",
+          "change_ratio",
+          "amount_yuan",
+          "turnover_ratio",
+          "open_change_ratio",
+          "drawdown_from_high_ratio",
+          "limit_up_price",
+          "limit_down_price",
+          "limit_rule",
+          "limit_status",
+          "is_limit_up",
+          "is_limit_down",
+          "is_sealed",
+          "touched_up",
+          "seal_amount_yuan",
+          "seal_volume_shares",
+          "observed_open_count",
+          "first_touch_at",
+          "first_seal_at",
+          "last_reseal_at",
+          "last_open_at",
+          "confirmed_streak_before_today",
+          "intraday_streak",
+          "target_streak",
+          "board_run",
+          "theme_ids",
+          "attributed_theme_id",
+          "attribution_basis",
+          "source_time",
+          "received_at",
+          "provider",
+          "valid",
+          "eligible",
+          "excluded_reason",
+          "is_stale",
+          "missing_reasons",
+          "timing_basis",
+          "path_complete",
+          "status_basis",
+          "is_final",
+          "board_history",
+          "events",
+          "themes"
+        ],
+        "title": "StockDetail"
+      },
+      "EventPage": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SentimentEvent"
+            },
+            "type": "array",
+            "title": "Items"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "has_more": {
+            "type": "boolean",
+            "title": "Has More"
+          }
+        },
+        "type": "object",
+        "required": [
+          "items",
+          "next_cursor",
+          "has_more"
+        ],
+        "title": "EventPage"
+      },
+      "SentimentEventsResponse": {
+        "properties": {
+          "meta": {
+            "$ref": "#/components/schemas/SentimentMeta"
+          },
+          "data": {
+            "$ref": "#/components/schemas/EventPage"
+          }
+        },
+        "type": "object",
+        "required": [
+          "meta",
+          "data"
+        ],
+        "title": "SentimentEventsResponse"
+      },
+      "SentimentResponse": {
+        "properties": {
+          "meta": {
+            "$ref": "#/components/schemas/SentimentMeta"
+          },
+          "data": {
+            "additionalProperties": true,
+            "type": "object",
+            "title": "Data"
+          }
+        },
+        "type": "object",
+        "required": [
+          "meta",
+          "data"
+        ],
+        "title": "SentimentResponse"
+      }
+    }
+  }
+}

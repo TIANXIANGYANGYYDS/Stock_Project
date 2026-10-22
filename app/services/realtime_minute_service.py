@@ -5,7 +5,7 @@ import logging
 import math
 import statistics
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, replace
 from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Any, Optional
@@ -117,6 +117,7 @@ class RealtimeMinuteService:
         self._resume_loaded: set[str] = set()
         self._resume_closed_minutes: dict[str, str] = {}
         self._source_clock_offsets: deque[float] = deque(maxlen=SOURCE_CLOCK_SAMPLE_LIMIT)
+        self._quote_anomalies: Counter[str] = Counter()
 
     async def close(self) -> None:
         await self.crawler.close()
@@ -338,7 +339,7 @@ class RealtimeMinuteService:
         if previous_signature and quote.market_data_time < previous_signature[0]:
             # A stale fallback packet must not reopen a persisted old minute
             # or move the cumulative-volume baseline backwards.
-            logger.warning("realtime_quote_out_of_order code=%s market_time=%s", quote.code, quote.market_data_time)
+            self._quote_anomalies['out_of_order'] += 1
             return
         self._last_quote_signatures[quote.code] = signature
         effective_time = bar_time or quote.market_data_time
@@ -357,7 +358,7 @@ class RealtimeMinuteService:
         # A source switch/reset establishes a new baseline. Never count the
         # same cumulative volume twice after a lower fallback total.
         if previous and (quote.volume < previous[0] or quote.amount < previous[1]):
-            logger.warning('realtime_quote_totals_reset code=%s provider=%s', quote.code, quote.provider)
+            self._quote_anomalies['totals_reset'] += 1
             self._totals[quote.code] = (max(quote.volume, previous[0]), max(quote.amount, previous[1]))
         delta_volume = 0.0 if previous is None else max(0.0, quote.volume - previous[0])
         delta_amount = 0.0 if previous is None else max(0.0, quote.amount - previous[1])
@@ -590,7 +591,8 @@ class RealtimeMinuteService:
                 await self.snapshots.create_indexes()
         except (AutoReconnect, TimeoutError) as exc:
             logger.error('realtime_indexes_deferred error=%s', type(exc).__name__)
-        await self.snapshots.replay_pending(limit=3)
+        await self.snapshots.replay_pending(limit=3,
+            calibrated_now=now if self._http_clock_offset is not None else None)
         rows = await self._load_universe(trade_date.reference_trade_date)
         codes = [row["code"] for row in rows]
         name_by_code = {row["code"]: row["name"] for row in rows}
@@ -642,6 +644,7 @@ class RealtimeMinuteService:
                     getattr(self.crawler, 'last_observations', quotes), expected_codes=codes,
                     session=session, observed_at=self._exchange_now(received_at),
                     received_at=received_at, metrics=metrics,
+                    clock_verified=self._http_clock_offset is not None,
                 )
                 valid_quotes = [q for q in quotes if quote_issue(q) is None]
                 try:
@@ -651,6 +654,7 @@ class RealtimeMinuteService:
                     logger.error('realtime_resume_deferred snapshots_preserved=true error=%s', type(exc).__name__)
                     valid_quotes = []
                 cycles += 1
+                self._quote_anomalies.clear()
                 latest_market_time: Optional[datetime] = None
                 accepted_session_quotes = 0
                 for quote in valid_quotes:
@@ -673,6 +677,9 @@ class RealtimeMinuteService:
                     if latest_market_time is None or quote_time > latest_market_time:
                         latest_market_time = quote_time
                 fetched += len(quotes)
+                if self._quote_anomalies:
+                    logger.warning('realtime_quote_anomalies session=%s cycle=%s counts=%s',
+                                   session, cycles, dict(self._quote_anomalies))
                 if latest_market_time is not None:
                     try:
                         written += await self._flush_before(

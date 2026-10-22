@@ -55,6 +55,7 @@ from app.services.stock_daily_detail_service import (
 )
 from app.services.trading_calendar_service import (
     MorningTradeDateDecision,
+    get_a_share_calendar,
     resolve_morning_trade_dates,
 )
 
@@ -65,7 +66,10 @@ REALTIME_SOURCE_COLLECTION = "stock_realtime_minute_bars"
 LIVE_RESULT_SCHEMA_VERSION = "3.0"
 MARKET_CLOSE_FINALIZE_TIME = time(15, 5)
 MARKET_CLOSE_HARD_FINALIZE_TIME = time(15, 10)
-MAX_TRACKED_CODES = 2_000
+# Cover the full current A-share universe, including held/pending codes. The
+# old 2,000 cap rejected valid pools (2,086 on 2026-10-16) before any replay.
+# Raw bars still stream one stock at a time; all resource guards remain finite.
+MAX_TRACKED_CODES = 6_000
 MAX_DAILY_BARS_PER_CODE = 10_000
 MAX_MINUTE_ROWS_PER_CODE = 300
 MAX_THREE_MINUTE_BARS_TOTAL = (
@@ -73,6 +77,19 @@ MAX_THREE_MINUTE_BARS_TOTAL = (
 )
 MONGO_STREAM_BATCH_SIZE = 1_000
 LATEST_MARK_QUERY_BATCH_SIZE = 50
+
+
+def _is_error_placeholder(document: Mapping[str, Any]) -> bool:
+    """Only an error-only insert is safe to rebuild without migrating a ledger."""
+    return (
+        document.get("status") == "error"
+        and document.get("schema_version") == "2.0"
+        and document.get("strategy_id") == STRATEGY_ID
+        and document.get("strategy") == {"id": STRATEGY_ID}
+        and document.get("runtime", {}).get("data_status") == "error"
+        and set(document) <= {"_id", "strategy_id", "trade_date", "runtime",
+                              "schema_version", "status", "strategy"}
+    )
 
 
 def _holding_from_public_document(document: Mapping[str, Any]) -> HoldingItem:
@@ -182,6 +199,13 @@ class QuantLiveService:
 
     async def ensure_indexes(self) -> None:
         await self.results.create_indexes()
+
+    async def _require_daily_sync_ready(self, trade_date: str) -> None:
+        run = await self.database["stock_daily_detail_sync_runs"].find_one(
+            {"target_trade_date": trade_date, "adjust": "qfq", "scope_key": "all"},
+            {"status": 1}, sort=[("started_at", -1)])
+        if run and run.get("status") != "success":
+            raise RuntimeError(f"{trade_date}日线同步尚未成功，等待补数完成后恢复账本")
 
     async def _resolve_trade_dates(
         self, target: date
@@ -471,6 +495,11 @@ class QuantLiveService:
             raise RuntimeError(f"新版独立账户缺少前序记录，请先从{LIVE_RECORDING_START}顺序补录")
         if expected_previous_date and previous["trade_date"] != expected_previous_date:
             raise RuntimeError("独立账户记录有交易日缺口，请先按日补录，禁止跳日继续交易")
+        if _is_error_placeholder(previous):
+            raise RuntimeError(
+                f"前一交易日{previous['trade_date']}建账失败，请先补齐行情并恢复账本："
+                f"{previous.get('runtime', {}).get('last_error', '')}"
+            )
         if previous.get("strategy", {}).get("version") != STRATEGY_VERSION:
             raise RuntimeError("前序记录仍为旧策略，禁止混用账户；请先完成迁移")
         if previous.get("recording", {}).get("start_date") != LIVE_RECORDING_START:
@@ -693,6 +722,7 @@ class QuantLiveService:
             }
         trade_date = decision.analysis_date
 
+        await self._require_daily_sync_ready(decision.prev_trade_date)
         holdings, opening_pending, accounts, opening_exit_states = await self._load_previous_state(trade_date, expected_previous_date=decision.prev_trade_date)
         candidates, sell_candidates, specs, quality, accounts = (
             await self._build_observation_pool(
@@ -788,29 +818,35 @@ class QuantLiveService:
 
     async def catch_up_completed_days(self, *, before_date: date | None = None) -> list[str]:
         """重启后顺序补齐缺失的已结束交易日，真实行情不足时保留异常状态。"""
-        cutoff = (before_date or datetime.now(CN_TZ).date()).isoformat()
-        days = sorted(await self.daily_collection.distinct("trade_date", {
-            "adjust": "qfq", "trade_date": {"$gte": LIVE_RECORDING_START, "$lt": cutoff}}))
+        cutoff = before_date or datetime.now(CN_TZ).date()
+        if cutoff.isoformat() <= LIVE_RECORDING_START:
+            return []
+        # A day with no daily rows is still a trading day; never skip that gap.
+        days = [day.strftime("%Y-%m-%d") for day in get_a_share_calendar().sessions_in_range(
+            LIVE_RECORDING_START, (cutoff - timedelta(days=1)).isoformat())]
         completed = []
         for day in days:
-            document = await self.results.get(day)
+            document = await self.results.get(day, {
+                "schema_version": 1, "strategy_id": 1, "trade_date": 1,
+                "status": 1, "strategy": 1, "recording": 1, "runtime.data_status": 1})
             # record_runtime_error can insert an error-only row before prepare
             # has created any account state. Retry that day as missing; never
             # mistake an actual old ledger for such a placeholder.
-            if (document and document.get("status") == "error"
-                    and document.get("schema_version") == "2.0"
-                    and document.get("strategy_id") == STRATEGY_ID
-                    and document.get("strategy") == {"id": STRATEGY_ID}
-                    and document.get("runtime", {}).get("data_status") == "error"
-                    and set(document) <= {"_id", "strategy_id", "trade_date", "runtime",
-                                          "schema_version", "status", "strategy"}):
-                document = None
+            if document and document.get("status") == "error" and document.get("schema_version") == "2.0":
+                document = await self.results.get(day)
+                if document and _is_error_placeholder(document):
+                    document = None
             if document and document.get("strategy", {}).get("version") != STRATEGY_VERSION:
                 raise RuntimeError(f"{day}仍为旧策略，请先迁移再恢复调度")
             if document and document.get("recording", {}).get("start_date") != LIVE_RECORDING_START:
                 raise RuntimeError(f"{day}的账户起点不一致，请先完成连续补录")
             if document and document.get("status") == "closed":
                 continue
+            await self._require_daily_sync_ready(day)
+            if not await self.daily_collection.find_one(
+                {"adjust": "qfq", "trade_date": day}, {"_id": 1}
+            ):
+                raise RuntimeError(f"{day}缺少日线行情，等待日线补数后恢复账本")
             available = await self.minute_collection.find_one(
                 {"trade_date": day, "interval": "1m"}, {"_id": 1})
             if not available:

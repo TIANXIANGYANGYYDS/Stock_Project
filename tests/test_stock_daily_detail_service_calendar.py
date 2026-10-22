@@ -588,3 +588,108 @@ def test_only_terminal_reverse_failures_are_not_retryable() -> None:
     assert not service.StockDailyDetailService._is_retryable_item_error(
         "指定日期范围内没有日 K 数据"
     )
+
+
+def test_stock_list_failure_is_recorded_before_reraising():
+    from types import SimpleNamespace
+    updates = []
+
+    class Runs:
+        def update_one(self, query, update, **kwargs):
+            updates.append((query, update))
+
+    async def unavailable(**kwargs):
+        raise RuntimeError('stock list connection reset')
+
+    instance = service.StockDailyDetailService.__new__(service.StockDailyDetailService)
+    instance.ensure_indexes = lambda: None
+    instance.sync_run_collection = Runs()
+    instance.crawler = SimpleNamespace(fetch_stock_list=unavailable)
+    today = service.datetime.now(service.CN_TZ).date().isoformat()
+    with pytest.raises(RuntimeError, match='connection reset'):
+        asyncio.run(instance.sync_all(end_date=today.replace('-', ''),
+            target_trade_date=today, run_mode='scheduled'))
+    assert updates[0][1]['$set']['status'] == 'running'
+    assert updates[1][1]['$set']['status'] == 'failed'
+    assert updates[-1][1]['$set']['failure_phase'] == 'stock_list'
+    assert len({query['run_id'] for query, _ in updates}) == 1
+
+
+def test_list_stage_failure_retries_original_date_without_stock_failures():
+    from types import SimpleNamespace
+    source = dict(run_id='failed-list', failure_phase='stock_list', failed_items=[],
+                  start_date='20261012', end_date='20261012', target_trade_date='2026-10-12',
+                  adjust='qfq', run_mode='scheduled')
+    calls = []
+    instance = service.StockDailyDetailService.__new__(service.StockDailyDetailService)
+    instance.sync_run_collection = SimpleNamespace(
+        find_one=lambda *args, **kwargs: source,
+        update_one=lambda *args, **kwargs: None)
+
+    async def sync(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(status='success', run_id='recovered')
+
+    instance.sync_all = sync
+    result = asyncio.run(instance.retry_failed_run('failed-list'))
+    assert result.status == 'success'
+    assert calls == [dict(start_date='20261012', end_date='20261012', adjust='qfq',
+                         target_trade_date='2026-10-12', run_mode='scheduled', parent_run_id='failed-list')]
+
+
+def test_past_day_sync_uses_observed_trades_instead_of_today_live_list(monkeypatch):
+    from types import SimpleNamespace
+    calls = []
+
+    class Minutes:
+        def aggregate(self, pipeline, **kwargs):
+            assert pipeline[0]['$match'] == {'trade_date': '2026-10-12', 'interval': '1m', 'volume': {'$gt': 0}}
+            return [{'_id': '000001', 'name': 'test'}]
+
+    async def unexpected_live_list(**kwargs):
+        raise AssertionError('live list cannot prove historical trading activity')
+
+    async def sync_rows(**kwargs):
+        calls.append(kwargs)
+        return [service.StockDailyDetailItemResult(index=1, total=1, code='000001', name='test', affected=1)]
+
+    class Clock(service.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 13, 14, tzinfo=tz)
+
+    monkeypatch.setattr(service, 'datetime', Clock)
+    instance = service.StockDailyDetailService.__new__(service.StockDailyDetailService)
+    instance.ensure_indexes = lambda: None
+    instance.sync_run_collection = SimpleNamespace(update_one=lambda *args, **kwargs: None)
+    instance.db = {'stock_realtime_minute_bars': Minutes()}
+    instance.crawler = SimpleNamespace(fetch_stock_list=unexpected_live_list)
+    instance.concurrency = 8
+    instance._sync_stock_rows = sync_rows
+    result = asyncio.run(instance.sync_all(start_date='20261012', end_date='20261012',
+        target_trade_date='2026-10-12', run_mode='startup'))
+    assert result.status == 'success'
+    assert calls[0]['stock_rows'] == [(1, '000001', 'test')]
+
+
+def test_same_day_stock_list_outage_falls_back_to_actual_trades(monkeypatch):
+    from types import SimpleNamespace
+    calls = []
+    today = service.datetime.now(service.CN_TZ).date().isoformat()
+    class Minutes:
+        def aggregate(self, pipeline, **kwargs):
+            assert pipeline[0]['$match'] == {'trade_date':today, 'interval':'1m', 'volume':{'$gt':0}}
+            return [{'_id':'000001','name':'test'}]
+    async def failed(**kwargs): raise ConnectionError('list unavailable')
+    async def sync_rows(**kwargs):
+        calls.append(kwargs)
+        return [service.StockDailyDetailItemResult(index=1,total=1,code='000001',name='test',affected=1)]
+    instance = service.StockDailyDetailService.__new__(service.StockDailyDetailService)
+    instance.ensure_indexes=lambda:None
+    instance.sync_run_collection=SimpleNamespace(update_one=lambda *a,**k:None)
+    instance.db={'stock_realtime_minute_bars':Minutes()}
+    instance.crawler=SimpleNamespace(fetch_stock_list=failed)
+    instance.concurrency=8;instance._sync_stock_rows=sync_rows
+    result=asyncio.run(instance.sync_all(start_date=today.replace('-',''),end_date=today.replace('-',''),target_trade_date=today,run_mode='scheduled'))
+    assert result.status=='success'
+    assert calls[0]['stock_rows']==[(1,'000001','test')]

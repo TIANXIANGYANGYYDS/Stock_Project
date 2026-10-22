@@ -621,6 +621,17 @@ class StockDailyDetailService:
         )
         return doc is not None
 
+    async def _observed_stock_list(self, target_trade_date: str) -> pd.DataFrame:
+        rows = await asyncio.to_thread(lambda: list(
+            self.db["stock_realtime_minute_bars"].aggregate([
+                {"$match": {"trade_date": target_trade_date, "interval": "1m", "volume": {"$gt": 0}}},
+                {"$group": {"_id": "$code", "name": {"$last": "$name"}}},
+                {"$sort": {"_id": 1}},
+            ], maxTimeMS=120000)))
+        if not rows:
+            raise RuntimeError(f"{target_trade_date}缺少历史成交股票清单，无法安全补录日线")
+        return pd.DataFrame([{"代码": row["_id"], "名称": row.get("name")} for row in rows])
+
     async def sync_all(
         self,
         start_date: Optional[str] = None,
@@ -692,14 +703,47 @@ class StockDailyDetailService:
             )
         else:
             try:
-                active_trade_date = (
-                    target_trade_date if run_mode in {"startup", "scheduled"} else None
-                )
-                stock_df = await self.crawler.fetch_stock_list(
-                    target_trade_date=active_trade_date,
-                )
-            except Exception:
+                if (run_mode in {"startup", "scheduled"}
+                        and target_trade_date < datetime.now(CN_TZ).date().isoformat()):
+                    # Today's live list cannot identify yesterday's traded universe.
+                    stock_df = await self._observed_stock_list(target_trade_date)
+                else:
+                    active_trade_date = (
+                        target_trade_date if run_mode in {"startup", "scheduled"} else None
+                    )
+                    try:
+                        stock_df = await self.crawler.fetch_stock_list(
+                            target_trade_date=active_trade_date,
+                        )
+                    except Exception:
+                        if run_mode not in {"startup", "scheduled"}:
+                            raise
+                        # Same-day source outages must not defer all daily data
+                        # until tomorrow. Use actual trades from this exact day,
+                        # never the stale list of every historical security.
+                        try:
+                            stock_df = await self._observed_stock_list(target_trade_date)
+                        except Exception:
+                            logger.exception("observed_stock_list_fallback_failed")
+                            stock_df = None
+                        if stock_df is None:
+                            raise
+                        logger.warning("stock_list_using_observed_trades day=%s count=%s",
+                                       target_trade_date, len(stock_df))
+            except Exception as exc:
                 if run_mode in {"startup", "scheduled"}:
+                    scope_key = self._build_scope_key(only_code=only_code, limit=limit, offset=offset)
+                    run_id = self._build_run_id(target_trade_date=target_trade_date,
+                        adjust=adjust, run_mode=run_mode, scope_key=scope_key)
+                    self._start_sync_run(run_id=run_id, target_trade_date=target_trade_date,
+                        adjust=adjust, run_mode=run_mode, scope_key=scope_key,
+                        start_date=start_date, end_date=end_date, expected_count=0,
+                        only_code=only_code, limit=limit, parent_run_id=parent_run_id, offset=offset)
+                    self._finish_sync_run(StockDailyDetailSyncResult(
+                        run_id=run_id, target_trade_date=target_trade_date, adjust=adjust,
+                        run_mode=run_mode, scope_key=scope_key, status=SYNC_STATUS_FAILED))
+                    self.sync_run_collection.update_one({"run_id": run_id}, {"$set": {
+                        "failure_phase": "stock_list", "last_error": str(exc)[:1000]}})
                     logger.exception(
                         "active_stock_list_fetch_failed; daily sync aborted"
                     )
@@ -1078,7 +1122,7 @@ class StockDailyDetailService:
         latest_trade_date = self.get_latest_trade_date(code=code, adjust=adjust)
 
         if latest_trade_date:
-            write_start_date = latest_trade_date
+            write_start_date = min(latest_trade_date, target_trade_date) if target_trade_date else latest_trade_date
         else:
             write_start_date = self._yyyymmdd_to_trade_date(default_start_date)
 
@@ -1306,6 +1350,16 @@ class StockDailyDetailService:
         if not source_run:
             raise ValueError(f"未找到同步批次: {run_id}")
 
+        if source_run.get("failure_phase") == "stock_list":
+            result = await self.sync_all(start_date=source_run["start_date"],
+                end_date=source_run["end_date"], adjust=source_run["adjust"],
+                target_trade_date=source_run["target_trade_date"],
+                run_mode=source_run["run_mode"], parent_run_id=run_id)
+            self.sync_run_collection.update_one({"run_id": run_id}, {"$set": {
+                "status": "superseded", "last_retry_run_id": result.run_id,
+                "updated_at": now_cn()}})
+            return result
+
         failed_items = source_run.get("failed_items") or []
         if not failed_items:
             raise ValueError(f"同步批次没有失败股票，无需补偿: {run_id}")
@@ -1469,7 +1523,7 @@ class StockDailyDetailService:
                 "scope_key": "all",
                 "run_mode": {"$in": ["startup", "scheduled"]},
                 "status": {"$in": [SYNC_STATUS_PARTIAL_FAILED, SYNC_STATUS_FAILED]},
-                "failed_items.0": {"$exists": True},
+                "$or": [{"failed_items.0": {"$exists": True}}, {"failure_phase": "stock_list"}],
             },
             projection={"_id": 0},
             sort=[("started_at", -1)],

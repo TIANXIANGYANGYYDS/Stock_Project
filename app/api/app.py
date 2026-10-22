@@ -17,6 +17,7 @@ from app.api.routers import (
     news,
     quant,
     rankings,
+    sentiment,
     stats,
     stocks,
 )
@@ -72,6 +73,7 @@ def create_app() -> FastAPI:
     app.include_router(rankings.router)
     app.include_router(morning_analysis.router)
     app.include_router(market.router)
+    app.include_router(sentiment.router)
     app.include_router(stocks.router)
     app.include_router(creators.router)
     app.include_router(stats.router)

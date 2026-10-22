@@ -13,6 +13,7 @@ from app.api.query import aggregate_page, find_page
 from app.api.serializers import serialize_document
 from app.repositories.realtime_snapshot_repository import (
     decode_symbol_batches, symbol_projection, SNAPSHOT_COLLECTION, AUCTION_COLLECTION, PARTITIONED_CODEC,
+    QUALITY_INDEX_NAME,
 )
 
 
@@ -93,7 +94,8 @@ async def realtime_quality(trade_date: date, db: AsyncIOMotorDatabase = Depends(
     ]
     data = []
     for kind, collection_name in (('snapshot', SNAPSHOT_COLLECTION), ('auction', AUCTION_COLLECTION)):
-        rows = await db[collection_name].aggregate(pipeline).to_list(length=10)
+        rows = await db[collection_name].aggregate(
+            pipeline, hint=QUALITY_INDEX_NAME, maxTimeMS=10000).to_list(length=10)
         data.extend(serialize_document(row) | {'session': row['_id'], 'data_kind': kind,
                                               'collection': collection_name} for row in rows)
     minute_quality = await db['stock_realtime_minute_quality'].find_one({'trade_date': trade_date.isoformat()})

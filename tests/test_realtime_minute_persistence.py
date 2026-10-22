@@ -12,6 +12,24 @@ from app.services.realtime_minute_service import RealtimeMinuteService, CN_TZ
 from tests.test_realtime_minute_service import service_quote
 
 
+def test_migrated_minute_collection_does_not_rescan_history_on_startup():
+    from app.repositories.realtime_minute_bar_repository import RealtimeMinuteBarRepository
+
+    class Collection:
+        async def index_information(self):
+            return {'uniq_realtime_code_interval_timestamp': {}}
+
+        async def update_many(self, *args):
+            raise AssertionError('migrated minute history must not be scanned')
+
+        async def create_index(self, *args, **kwargs):
+            pass
+
+    repository = RealtimeMinuteBarRepository.__new__(RealtimeMinuteBarRepository)
+    repository.collection = Collection()
+    asyncio.run(repository.create_indexes())
+
+
 class PartialRepository:
     def __init__(self, fail_calls=()):
         self.fail_calls = set(fail_calls)

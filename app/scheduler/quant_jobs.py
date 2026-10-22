@@ -12,6 +12,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
 from app.services.quant_live_service import QuantLiveService
+from app.services.market_observation_service import observation_now
 
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,7 @@ QUANT_LIVE_PREPARE_JOB_ID = "quant_live_prepare_0920"
 QUANT_LIVE_MORNING_JOB_ID = "quant_live_refresh_morning"
 QUANT_LIVE_AFTERNOON_JOB_ID = "quant_live_refresh_afternoon"
 QUANT_LIVE_STARTUP_JOB_ID = "quant_live_startup_resume"
+QUANT_LIVE_RECOVERY_JOB_ID = "quant_live_after_close_recovery"
 
 MORNING_WINDOW = (time(9, 30), time(11, 35))
 AFTERNOON_WINDOW = (time(13, 0), time(15, 10, 59))
@@ -53,11 +55,12 @@ async def prepare_quant_live_job() -> dict[str, Any]:
     if job_lock.locked():
         return {"status": "skipped", "reason": "quant_job_already_running"}
     async with job_lock:
+        evaluated, _ = await observation_now()
         service = QuantLiveService()
         try:
-            result = await service.prepare()
+            await service.catch_up_completed_days(before_date=evaluated.date())
+            result = await service.prepare(reference_date=evaluated.date())
         except Exception as exc:
-            evaluated = datetime.now(CN_TZ)
             try:
                 await service.results.record_runtime_error(
                     trade_date=evaluated.date().isoformat(),
@@ -83,7 +86,7 @@ async def refresh_quant_live_job(
 ) -> dict[str, Any]:
     """在交易时段刷新快照；异常时保留旧快照并写入可观测错误。"""
 
-    evaluated = now or datetime.now(CN_TZ)
+    evaluated = now if now is not None else (await observation_now())[0]
     if evaluated.tzinfo is None:
         evaluated = evaluated.replace(tzinfo=CN_TZ)
     else:
@@ -97,6 +100,7 @@ async def refresh_quant_live_job(
     service = QuantLiveService()
     async with job_lock:
         try:
+            await service.catch_up_completed_days(before_date=evaluated.date())
             result = await service.process(now=evaluated)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -122,12 +126,7 @@ async def refresh_quant_live_job(
 async def resume_quant_live_job() -> dict[str, Any]:
     """调度器重启时恢复当天开盘状态，并在需要时补算最新快照。"""
 
-    now = datetime.now(CN_TZ)
-    job_lock = _get_quant_job_lock()
-    async with job_lock:
-        caught_up = await QuantLiveService().catch_up_completed_days(before_date=now.date())
-    if caught_up:
-        logger.info("quant live recovered historical market dates=%s", caught_up)
+    now, _ = await observation_now()
     if now.time() < time(9, 20):
         return {"status": "skipped", "reason": "before_prepare_window"}
     prepared = await prepare_quant_live_job()
@@ -135,7 +134,6 @@ async def resume_quant_live_job() -> dict[str, Any]:
         return prepared
     if now.time() >= time(9, 30):
         return await refresh_quant_live_job(
-            now=now,
             allow_outside_window=True,
         )
     return {"status": "prepared"}
@@ -208,3 +206,12 @@ def register_quant_live_jobs(scheduler: AsyncIOScheduler) -> None:
         misfire_grace_time=60,
     )
     logger.info("registered job id=%s", startup_job.id)
+    recovery_job = scheduler.add_job(
+        resume_quant_live_job,
+        trigger=CronTrigger(day_of_week="mon-fri", hour="16-18", minute=15,
+                            timezone="Asia/Shanghai"),
+        id=QUANT_LIVE_RECOVERY_JOB_ID,
+        name="日线补数后恢复量化账本",
+        replace_existing=True, max_instances=1, coalesce=True, misfire_grace_time=600,
+    )
+    logger.info("registered job id=%s", recovery_job.id)

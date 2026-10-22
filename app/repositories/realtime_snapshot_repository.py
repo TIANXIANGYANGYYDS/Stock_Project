@@ -1,14 +1,16 @@
 """Durable compressed quote batches, with local write-ahead spooling.
 
 One document per poll avoids millions of per-symbol index entries per day.
-There is no TTL. A pending file is removed only after Mongo acknowledges the
-same immutable batch ID; retries cannot duplicate a batch or lose its receipt time.
+Raw batches retain five trading sessions using a calibrated-clock job, not
+MongoDB's host-clock TTL. Unexpired pending files are removed only after Mongo
+acknowledges their immutable batch IDs.
 """
 from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict
 from datetime import datetime
+from functools import lru_cache
 import gzip
 import hashlib
 import json
@@ -25,12 +27,36 @@ from pymongo.errors import PyMongoError
 from app.core.config import PROJECT_ROOT
 from app.crawlers.realtime_market_crawler import CN_TZ, quote_issue, quote_phase
 from app.repositories.base import BaseMongoRepository
+from app.services.trading_calendar_service import get_a_share_calendar
 
 logger = logging.getLogger(__name__)
 SNAPSHOT_COLLECTION = 'stock_realtime_quote_batches'
 AUCTION_COLLECTION = 'stock_realtime_auction_batches'
 SPOOL_ROOT = PROJECT_ROOT / '.local' / 'realtime_quote_spool'
 PARTITIONED_CODEC = 'json-gzip-partitioned-v2'
+QUALITY_INDEX_NAME = 'idx_quote_quality_metadata'
+QUALITY_INDEX_FIELDS = ('trade_date', 'session', 'observed_at', 'requested',
+                        'returned', 'usable', 'quality_issue_count', 'compressed_bytes')
+SNAPSHOT_RETENTION_SESSIONS = 5
+SOURCE_CURSOR_INDEX = 'idx_short_sentiment_source_cursor'
+
+
+@lru_cache(maxsize=8)
+def snapshot_retained_sessions(latest_trade_date):
+    calendar = get_a_share_calendar()
+    if not calendar.is_session(latest_trade_date):
+        raise ValueError('snapshot retention anchor must be a trading session')
+    session = calendar.date_to_session(latest_trade_date)
+    sessions = [session.strftime('%Y-%m-%d')]
+    for _ in range(SNAPSHOT_RETENTION_SESSIONS - 1):
+        session = calendar.previous_session(session)
+        sessions.append(session.strftime('%Y-%m-%d'))
+    return tuple(reversed(sessions))
+
+
+def snapshot_retention_cutoff(latest_trade_date):
+    oldest = snapshot_retained_sessions(latest_trade_date)[0]
+    return datetime.fromisoformat(oldest).replace(tzinfo=CN_TZ)
 
 
 def snapshot_kind(observed_at: datetime) -> str:
@@ -150,6 +176,7 @@ class RealtimeSnapshotRepository(BaseMongoRepository):
     def __init__(self, database=None, *, spool_root=SPOOL_ROOT):
         super().__init__(database)
         self.spool_root = Path(spool_root)
+        self._pending_cleanup_cutoff = None
 
     async def create_indexes(self):
         for name in (SNAPSHOT_COLLECTION, AUCTION_COLLECTION):
@@ -158,6 +185,73 @@ class RealtimeSnapshotRepository(BaseMongoRepository):
                                            name='idx_quote_day_observed')
             await collection.create_index([('trade_date', 1), ('phases', 1), ('observed_at', 1)],
                                            name='idx_quote_day_phase_observed')
+            await collection.create_index([(field, 1) for field in QUALITY_INDEX_FIELDS],
+                                           name=QUALITY_INDEX_NAME)
+            await collection.create_index([('trade_date', 1), ('observed_at', 1), ('_id', 1)],
+                                           name=SOURCE_CURSOR_INDEX)
+
+    async def retention_window(self, calibrated_now):
+        if calibrated_now.tzinfo is None or calibrated_now.utcoffset() is None:
+            raise ValueError('snapshot retention requires a timezone-aware calibrated time')
+        today = calibrated_now.astimezone(CN_TZ).date().isoformat()
+        # Validate calendar coverage before reading or deleting anything.
+        get_a_share_calendar().date_to_session(today, direction='previous')
+        rows = await asyncio.gather(*[
+            self.database[name].find_one(
+                {'trade_date': {'$lte': today}, 'observed_at': {'$lte': calibrated_now}},
+                {'trade_date': 1}, sort=[('trade_date', -1), ('observed_at', -1)])
+            for name in (SNAPSHOT_COLLECTION, AUCTION_COLLECTION)])
+        dates = [row['trade_date'] for row in rows if row]
+        if not dates:
+            return None
+        latest = max(dates)
+        return {'latest_trade_date': latest, 'retained_trade_dates': list(snapshot_retained_sessions(latest)),
+                'cutoff': snapshot_retention_cutoff(latest)}
+
+    async def delete_expired(self, *, calibrated_now):
+        """Keep five whole trading sessions ending at the latest captured day."""
+        window = await self.retention_window(calibrated_now)
+        if window is None:
+            return {'status': 'skipped', 'reason': 'no_observations'}
+        cutoff = window['cutoff']
+        pending = await asyncio.to_thread(self._delete_expired_pending, cutoff)
+        counts = {}
+        # This allowlist deliberately excludes minute bars and all derived data.
+        query = {'trade_date': {'$lt': window['retained_trade_dates'][0]},
+                 'observed_at': {'$lt': cutoff}}
+        for name in (SNAPSHOT_COLLECTION, AUCTION_COLLECTION):
+            collection = self.database[name]
+            counts[name] = 0
+            while True:
+                rows = await collection.find(query, {'_id': 1}).hint(SOURCE_CURSOR_INDEX).limit(100).to_list(length=100)
+                if not rows:
+                    break
+                result = await collection.delete_many({**query, '_id': {'$in': [r['_id'] for r in rows]}})
+                counts[name] += result.deleted_count
+                # Yield between bounded batches so collectors/readers can run.
+                await asyncio.sleep(0.05)
+            logger.info('realtime_snapshot_retention collection=%s cutoff=%s deleted=%s',
+                        name, cutoff.isoformat(), counts[name])
+        return {**window, 'status': 'success', 'cutoff': cutoff.isoformat(),
+                'retention_trading_days': SNAPSHOT_RETENTION_SESSIONS,
+                'deleted': counts, 'pending_files_deleted': pending}
+
+    def _delete_expired_pending(self, cutoff):
+        count = 0
+        for path in self.spool_root.glob('*.json.gz'):
+            try:
+                envelope = json.loads(gzip.decompress(path.read_bytes()))
+                observed = datetime.fromisoformat(envelope['observed_at'])
+                if observed.tzinfo is None:
+                    raise ValueError('missing observation timezone')
+                if observed < cutoff:
+                    path.unlink()
+                    count += 1
+            except FileNotFoundError:
+                pass  # The collector acknowledged/replayed the same file.
+            except (OSError, EOFError, ValueError, KeyError, TypeError):
+                logger.exception('realtime_snapshot_retention_invalid_pending file=%s', path.name)
+        return count
 
     def _spool(self, envelope):
         self.spool_root.mkdir(parents=True, exist_ok=True)
@@ -202,27 +296,41 @@ class RealtimeSnapshotRepository(BaseMongoRepository):
             'metrics': envelope['metrics'], **encode_batch(envelope),
         }
 
-    async def _persist(self, path):
+    async def _persist(self, path, *, cutoff=None):
         document = await asyncio.to_thread(self._load, path)
+        if cutoff is not None and document['observed_at'] < cutoff:
+            await asyncio.to_thread(path.unlink, missing_ok=True)
+            logger.info('realtime_snapshot_pending_expired batch=%s', path.name)
+            return 0
         async with asyncio.timeout(3):
             collection = self.database[snapshot_collection(document['data_kind'])]
             await collection.update_one({'_id': document['_id']}, {'$setOnInsert': document}, upsert=True)
-        await asyncio.to_thread(path.unlink)
+        await asyncio.to_thread(path.unlink, missing_ok=True)
         return document['compressed_bytes']
 
-    async def replay_pending(self, *, limit=3):
+    async def replay_pending(self, *, limit=3, cutoff=None, calibrated_now=None):
+        if calibrated_now is not None:
+            try:
+                window = await self.retention_window(calibrated_now)
+                cutoff = window['cutoff'] if window else None
+            except ValueError:
+                # Retention must not stop capture when the calendar is stale.
+                logger.exception('realtime_snapshot_retention_calendar_unavailable')
         paths = await asyncio.to_thread(lambda: sorted(self.spool_root.glob('*.json.gz'))[:limit])
         count = 0
         for path in paths:
             try:
-                await self._persist(path)
+                await self._persist(path, cutoff=cutoff)
                 count += 1
+            except FileNotFoundError:
+                continue  # Concurrent retention can remove expired pending data.
             except (PyMongoError, TimeoutError) as exc:
                 logger.error('realtime_snapshot_replay_deferred error=%s', type(exc).__name__)
                 break
         return count
 
-    async def save_cycle(self, quotes, *, expected_codes, session, observed_at, received_at, metrics):
+    async def save_cycle(self, quotes, *, expected_codes, session, observed_at, received_at, metrics,
+                         clock_verified=False):
         envelope = {
             'version': 2, 'data_kind': snapshot_kind(observed_at),
             'batch_id': received_at.strftime('%Y%m%dT%H%M%S%f') + '-' + uuid.uuid4().hex,
@@ -232,9 +340,27 @@ class RealtimeSnapshotRepository(BaseMongoRepository):
             'quotes': [snapshot_row(q) for q in quotes],
         }
         path = await asyncio.to_thread(self._spool, envelope)
+        cutoff = None
+        if clock_verified:
+            # The durable local batch proves capture even when Mongo is down.
+            # Prune independently of database acknowledgement, once per window,
+            # so an extended outage cannot retain expired quote files forever.
+            try:
+                cutoff = snapshot_retention_cutoff(observed_at.astimezone(CN_TZ).date().isoformat())
+            except ValueError:
+                logger.exception('realtime_snapshot_retention_calendar_unavailable')
+            if cutoff is not None and (self._pending_cleanup_cutoff is None or cutoff > self._pending_cleanup_cutoff):
+                try:
+                    deleted = await asyncio.to_thread(self._delete_expired_pending, cutoff)
+                    self._pending_cleanup_cutoff = cutoff
+                    logger.info('realtime_snapshot_pending_retention cutoff=%s deleted=%s', cutoff.isoformat(), deleted)
+                except OSError:
+                    # A local scan failure must not block today's Mongo write.
+                    # Leave the marker unchanged so the next capture retries.
+                    logger.exception('realtime_snapshot_pending_retention_failed')
         try:
             size = await self._persist(path)
-            await self.replay_pending(limit=2)
+            await self.replay_pending(limit=2, cutoff=cutoff)
             return {'persisted': True, 'compressed_bytes': size}
         except (PyMongoError, TimeoutError) as exc:
             logger.error('realtime_snapshot_spooled batch=%s error=%s', path.name, type(exc).__name__)

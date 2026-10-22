@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 from datetime import datetime
 
@@ -49,6 +50,9 @@ def configure_logging() -> None:
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # Business jobs log their own results. Suppress the two routine executor
+    # messages on every five-second tick while retaining skips and failures.
+    logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)
 
 
 def build_scheduler() -> AsyncIOScheduler:
@@ -138,7 +142,7 @@ async def run_scheduler() -> None:
         install_signal_handlers(stop_event)
         scheduler.start()
         scheduler_started = True
-        logger.info("scheduler started")
+        logger.info("scheduler started launch_id=%s", os.environ.get('STOCK_PROCESS_LAUNCH_ID', 'manual'))
         await stop_event.wait()
     finally:
         logger.info("scheduler stopping")

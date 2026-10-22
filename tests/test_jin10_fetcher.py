@@ -1,4 +1,6 @@
 from app.crawlers import Jin10NewsCrawler
+import json
+import pytest
 
 
 def test_parse_flash_list_supports_server_rendered_flash_containers() -> None:
@@ -77,3 +79,31 @@ def test_normalize_item_keeps_different_flash_ids_distinct() -> None:
     assert first is not None
     assert second is not None
     assert first.event_id != second.event_id
+
+
+def test_public_feed_preserves_full_date_stable_id_and_body():
+    crawler = Jin10NewsCrawler()
+    item = {"id": "20261015235900123456", "time": "2026-10-15 23:59:00", "type": 0,
+            "data": {"content": "<b>【测试标题】</b>公告公布完整的测试正文。"}}
+    card = {"type": 1, "data": {"name": "经济数据卡"}}
+    text = "var newest = " + json.dumps([item, item, card]) + ";"
+    rows = crawler.parse_feed(text)
+    assert len(rows) == 1
+    assert rows[0].publish_time == "2026-10-15 23:59:00"
+    assert "<b>" not in rows[0].content and "测试正文" in rows[0].content
+    assert rows[0].event_id == crawler.build_event_id(
+        "jin10:https://flash.jin10.com/detail/20261015235900123456")
+
+
+@pytest.mark.parametrize("payload", ["<html></html>", "var newest = [];", "var newest = []; alert(1)",
+                                     'var newest = [{"type":1,"data":{}}];'])
+def test_public_feed_empty_or_changed_format_is_a_failure(payload):
+    with pytest.raises(ValueError):
+        Jin10NewsCrawler().parse_feed(payload)
+
+
+def test_no_feed_and_empty_html_does_not_silently_succeed(monkeypatch):
+    crawler = Jin10NewsCrawler()
+    monkeypatch.setattr(crawler, "request_text_with_local_first", lambda *a, **k: "<html>shell</html>")
+    with pytest.raises(ValueError, match="all_sources_empty"):
+        crawler.fetch_latest_telegraphs()

@@ -77,6 +77,7 @@ class Database:
             "quant_daily_results": Collection(),
             "stock_daily_detail": Collection(),
             "stock_realtime_minute_bars": Collection(minute_rows),
+            "stock_daily_detail_sync_runs": Collection(),
         }
 
     def __getitem__(self, name):
@@ -131,6 +132,59 @@ def test_tracked_code_guard_fails_before_querying_mongodb() -> None:
         )
 
     assert not database.collections["stock_realtime_minute_bars"].find_called
+
+
+@pytest.mark.parametrize("stock_count", [2086, 6000])
+def test_large_pool_prepares_and_replays_every_stock(stock_count, monkeypatch):
+    """A valid market-wide pool must not be truncated to the old 2,000 cap."""
+    from app.quant.runtime.daily_flow import IndependentAccount
+    from app.quant.runtime.live import LiveObservationSpec
+
+    monkeypatch.setattr(quant_live_module, "LIVE_RECORDING_START", TRADE_DATE)
+    codes = [f"{index:06d}" for index in range(stock_count)]
+    rows = [row for code in codes for row in minute_rows(code, 30, 3)]
+    service = QuantLiveService(Database(rows))
+
+    class Results:
+        document = None
+
+        async def create_indexes(self): pass
+
+        async def get(self, *args): return self.document
+
+        async def save_document(self, document): self.document = document
+
+    async def dates(target):
+        return SimpleNamespace(is_current_trade_day=True, analysis_date=TRADE_DATE,
+                               prev_trade_date="2026-09-02")
+
+    async def previous(*args, **kwargs): return [], [], [], {}
+
+    async def pool(**kwargs):
+        return (
+            [PreselectionItem(code, code, "观察", 10.) for code in codes], [],
+            [LiveObservationSpec(code, code, "buy", "2026-09-01", "2026-09-02",
+                                 10., -1., None) for code in codes], {},
+            [IndependentAccount(code, code) for code in codes],
+        )
+
+    service.results = Results()
+    service._resolve_trade_dates = dates
+    service._load_previous_state = previous
+    service._build_observation_pool = pool
+
+    async def run():
+        prepared = await service.prepare(datetime.fromisoformat(TRADE_DATE).date())
+        assert prepared["runtime"]["tracked_code_count"] == stock_count
+        assert prepared["observation_pool"]["count"] == stock_count
+        result = await service.process(now=datetime.fromisoformat(f"{TRADE_DATE}T09:33:20+08:00"))
+        assert result["runtime"]["data_status"] == "fresh"
+        assert result["runtime"]["complete_observation_count"] == stock_count
+        assert result["runtime"]["incomplete_code_count"] == 0
+        assert {item["code"] for item in result["observation_pool"]["items"]} == set(codes)
+        assert len(result["_runtime_state"]["accounts"]) == stock_count
+
+    asyncio.run(run())
 
 
 def test_memory_limits_are_finite_and_above_one_normal_trade_day() -> None:
@@ -446,22 +500,23 @@ def test_build_pool_freezes_market_adx_endpoints_and_observes_non_sell_holdings(
     assert specs[0].previous_state is not None
 
 
-def test_catchup_records_missing_days_in_order_and_skips_closed_days():
+def test_catchup_records_missing_days_in_order_and_skips_closed_days(monkeypatch):
     from datetime import date
+    monkeypatch.setattr(quant_live_module, 'LIVE_RECORDING_START', '2026-09-03')
 
     class Daily:
-        async def distinct(self, *args):
-            return ['2026-09-04','2026-09-03']
+        async def find_one(self, *args):
+            return {'_id': 'daily'}
 
     class Minutes:
         async def find_one(self, *args):
             return {'_id':'observed'}
 
     class Results:
-        async def get(self, day):
+        async def get(self, day, *args):
             return None
 
-    service = QuantLiveService.__new__(QuantLiveService)
+    service = QuantLiveService(Database())
     service.daily_collection, service.minute_collection, service.results = Daily(), Minutes(), Results()
     processed = []
 
@@ -493,9 +548,10 @@ def test_rebased_accounts_cannot_continue_from_old_recording_origin():
 @pytest.mark.parametrize("extra", [{}, {"strategy": {"id": quant_live_module.STRATEGY_ID, "version": "1.0.0"}},
                                   {"_runtime_state": {"accounts": [{"cash": 100000}]}},
                                   {"recording": {"start_date": "2026-08-20"}}])
-def test_catchup_retries_only_error_placeholders_and_preserves_old_ledgers(extra):
+def test_catchup_retries_only_error_placeholders_and_preserves_old_ledgers(extra, monkeypatch):
     from datetime import date
     from copy import deepcopy
+    monkeypatch.setattr(quant_live_module, 'LIVE_RECORDING_START', TRADE_DATE)
 
     document = {"trade_date": TRADE_DATE, "strategy_id": quant_live_module.STRATEGY_ID,
                 "strategy": {"id": quant_live_module.STRATEGY_ID}, "schema_version": "2.0",
@@ -504,11 +560,11 @@ def test_catchup_retries_only_error_placeholders_and_preserves_old_ledgers(extra
     original = deepcopy(document)
 
     class Daily:
-        async def distinct(self, *args):
-            return [TRADE_DATE]
+        async def find_one(self, *args):
+            return {'_id': 'daily'}
 
     class Results:
-        async def get(self, day):
+        async def get(self, day, *args):
             return document
 
     service = QuantLiveService(Database([{"_id": "observed"}]))
@@ -528,3 +584,43 @@ def test_catchup_retries_only_error_placeholders_and_preserves_old_ledgers(extra
         assert asyncio.run(service.catch_up_completed_days(before_date=date(2026, 9, 4))) == [TRADE_DATE]
         assert processed == [TRADE_DATE]
     assert document == original
+
+
+def test_catchup_stops_at_trading_day_with_no_daily_rows(monkeypatch):
+    from datetime import date
+    monkeypatch.setattr(quant_live_module, 'LIVE_RECORDING_START', '2026-10-09')
+    service = QuantLiveService(Database([{'_id': 'minute'}]))
+
+    class Results:
+        async def get(self, day, *args):
+            if day == '2026-10-09':
+                return {'status': 'closed', 'strategy': {'version': '2.0.0'},
+                        'recording': {'start_date': '2026-10-09'}}
+
+    service.results = Results()
+    with pytest.raises(RuntimeError, match='2026-10-12缺少日线行情'):
+        asyncio.run(service.catch_up_completed_days(before_date=date(2026, 10, 13)))
+
+
+def test_catchup_waits_for_partial_daily_sync(monkeypatch):
+    from datetime import date
+    monkeypatch.setattr(quant_live_module, 'LIVE_RECORDING_START', '2026-10-12')
+    database = Database([{'_id': 'minute'}])
+    database.collections['stock_daily_detail'] = Collection([{'_id': 'partial_daily'}])
+    database.collections['stock_daily_detail_sync_runs'] = Collection([{'status': 'running'}])
+    service = QuantLiveService(database)
+    with pytest.raises(RuntimeError, match='日线同步尚未成功'):
+        asyncio.run(service.catch_up_completed_days(before_date=date(2026, 10, 13)))
+
+
+def test_error_placeholder_is_not_reported_as_strategy_migration():
+    class Results:
+        async def latest_before(self, day):
+            return {'trade_date': '2026-10-09', 'strategy_id': quant_live_module.STRATEGY_ID,
+                    'strategy': {'id': quant_live_module.STRATEGY_ID}, 'schema_version': '2.0',
+                    'status': 'error', 'runtime': {'data_status': 'error', 'last_error': '行情缺失'}}
+
+    service = QuantLiveService(Database())
+    service.results = Results()
+    with pytest.raises(RuntimeError, match='2026-10-09建账失败.*行情缺失'):
+        asyncio.run(service._load_previous_state('2026-10-12', expected_previous_date='2026-10-09'))
