@@ -38,6 +38,10 @@ with MongoClient(settings.mongo_uri) as client:
 
 `page_size` 范围是 1 到 200。详情接口返回 `{"data": {...}}`。MongoDB `_id` 不会返回，`ObjectId`、日期和时间会递归转换为 JSON 字符串。
 
+资讯页使用 `GET /api/v1/news?view=feed`。首次读取返回入库截止秒 `snapshot`，翻页时传回此值，新入库的快讯会留在下一次刷新。使用相同条件请求 `view=updates&snapshot=…` 可读取新增条数。发布时间范围仍由 `start_ts`、`end_ts` 控制。
+
+`keyword` 同时匹配标题、正文、结构化板块和公司。可选 `a_share_only=true` 只保留具名板块。服务器在分页前按 `sentiment=positive|neutral|negative` 筛选，按 `sort_by=time|score`、`sort_order=asc|desc` 排序。影响分取绝对值最大的有效板块分，绝对值相同保留原顺序。中性包含 −20 至 20。缺评分的快讯保留在全部列表，按分数排序时排在有分数的稿件之后。
+
 ## 接口
 
 | 路径 | MongoDB 集合/来源 | 说明 |
@@ -46,6 +50,7 @@ with MongoClient(settings.mongo_uri) as client:
 | `GET /api/v1/news` | `news_data` | 新闻分页；支持 `source`、`status`、`start_ts`、`end_ts`、`sector_name`、`company`、`keyword` |
 | `GET /api/v1/news/{event_id}` | `news_data` | 新闻完整详情 |
 | `GET /api/v1/news-rankings` | `news_ranking_snapshots` | 快照列表；支持 `biz_date` |
+| `GET /api/v1/news-rankings/history?end_date=YYYY-MM-DD` | `news_ranking_snapshots` | 返回观察期内真实的精简历史点和最近一份含新闻依据的快照。时间轴使用 `window_end_ts` 转北京时间 |
 | `GET /api/v1/news-rankings/latest` | `news_ranking_snapshots` | 最新完成快照 |
 | `GET /api/v1/news-rankings/{snapshot_id}` | `news_ranking_snapshots` | 快照完整详情 |
 | `GET /api/v1/morning-analyses` | `daily_market_analysis` | 报告列表；支持 `start_date`、`end_date`、`data_quality` |

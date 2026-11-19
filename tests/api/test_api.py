@@ -94,6 +94,17 @@ def test_news_filters_pagination_detail_and_404():
         assert client.get("/api/v1/news/missing").status_code == 404
 
 
+def test_news_search_structured_fields_and_update_boundary():
+    db = sample_database()
+    db["news_data"].rows[0]["sector_llm_analysis"][0]["sector_name"] = "通信设备"
+    with make_client(db) as client:
+        for keyword in ("通信设备", "甲公司"):
+            result = client.get("/api/v1/news", params={"keyword": keyword}).json()
+            assert [row["event_id"] for row in result["items"]] == ["e1"]
+        assert client.get("/api/v1/news?view=updates").status_code == 422
+        assert client.get("/api/v1/news?view=feed&snapshot=4294967295").status_code == 422
+
+
 def test_rankings_and_morning_analysis():
     with make_client() as client:
         assert client.get("/api/v1/news-rankings/latest").json()["data"]["snapshot_id"] == "s1"

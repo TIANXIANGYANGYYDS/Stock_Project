@@ -8,9 +8,10 @@ from typing import Any
 
 def _value(document: dict[str, Any], path: str) -> Any:
     current: Any = document
-    for part in path.split("."):
+    parts = path.split(".")
+    for index, part in enumerate(parts):
         if isinstance(current, list):
-            return [_value(item, ".".join(path.split(".")[path.split(".").index(part):])) for item in current]
+            return [_value(item, ".".join(parts[index:])) for item in current]
         if not isinstance(current, dict):
             return None
         current = current.get(part)
