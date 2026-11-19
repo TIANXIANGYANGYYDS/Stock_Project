@@ -152,7 +152,7 @@ class NewsSectorJudgeService:
 
         await self.news_repository.create_indexes()
 
-    async def process_once(self) -> NewsSectorJudgeProcessResult:
+    async def process_once(self, *, oldest_first: bool = False) -> NewsSectorJudgeProcessResult:
         """
         处理一条新闻的完整板块判断闭环。
 
@@ -167,17 +167,20 @@ class NewsSectorJudgeService:
         因单条新闻失败而退出。
         """
 
-        news = await self.news_repository.claim_next_sector_judge_news()
+        news = await self.news_repository.claim_next_sector_judge_news(oldest_first=oldest_first)
 
         if news is None:
             return NewsSectorJudgeProcessResult()
 
         try:
             analysis = await self._analyze_news(news)
-            await self.news_repository.mark_sector_judge_success(
+            updated = await self.news_repository.mark_sector_judge_success(
                 news.event_id,
                 analysis,
+                claim_id=news.status.claim_id,
             )
+            if not updated.matched_count:
+                raise RuntimeError("新闻已被重新领取，旧领取结果已丢弃")
 
             return NewsSectorJudgeProcessResult(
                 event_id=news.event_id,
@@ -194,6 +197,7 @@ class NewsSectorJudgeService:
             await self.news_repository.mark_sector_judge_failed(
                 news.event_id,
                 error_message,
+                claim_id=news.status.claim_id,
             )
 
             return NewsSectorJudgeProcessResult(
@@ -216,8 +220,9 @@ class NewsSectorJudgeService:
 
         results: list[NewsSectorJudgeProcessResult] = []
 
-        for _ in range(batch_size):
-            result = await self.process_once()
+        # 每处理五条就给最早的一条留一个名额，避免旧新闻长期排在新稿后面。
+        for index in range(batch_size):
+            result = await self.process_once(oldest_first=(index + 1) % 5 == 0)
 
             if not result.processed:
                 break

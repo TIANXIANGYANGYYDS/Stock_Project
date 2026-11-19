@@ -105,6 +105,31 @@ def test_deferred_exit_survives_roundtrip_and_expires_without_new_sell(monkeypat
     assert result['flow'].accounts[0].cash == pytest.approx(100000 + summary['realized_pnl'])
 
 
+def test_research_buy_gate_preserves_default_and_never_vetoes_exit(monkeypatch):
+    fixed_macd(monkeypatch)
+    flow = create_daily_flow(trade_date=D2, selection_date=D1, generated_at=D2+'T09:20:00+08:00',
+        candidates=[PreselectionItem(CODE, '测试', 'MACD', 11.)], accounts=[IndependentAccount(CODE, '测试')])
+    default = run(flow, spec(action='buy'), bars())
+    allowed = run(flow, spec(action='buy'), bars(), research_buy_gate=lambda code, day: (True, '允许'))
+    assert default == allowed
+    denied = run(flow, spec(action='buy'), bars(), research_buy_gate=lambda code, day: (False, '波动率排名不足'))
+    assert denied['signals'][0]['status'] == 'rejected_research_filter'
+    assert not denied['flow'].executions and not denied['pending_signals']
+    assert denied['flow'].accounts[0].cash == 100000
+    # A pending buy already passed its signal-date gate. Do not re-test it using
+    # the execution date's changed factor. Sell decisions are unaffected too.
+    pending = dict(default['signals'][0], status='pending_execution', signal_at=D1+'T15:00:00+08:00')
+    calls = []
+    def unexpected(code, day):
+        calls.append((code, day))
+        return False, '禁止新买入'
+    filled = run(flow, spec(action='buy'), bars(), pending=[pending], research_buy_gate=unexpected)
+    assert filled['flow'].executions[0].action == 'buy'
+    sold = run(carry(bought(), D2), spec(adx=19.), bars(), research_buy_gate=unexpected)
+    assert sold['flow'].executions[0].action == 'sell'
+    assert calls == []
+
+
 @pytest.mark.parametrize('kind', ['nonpositive_dif', 'missing_adx', 'nonpositive_profit'])
 def test_delay_ends_when_any_permission_fails(monkeypatch, kind):
     fixed_macd(monkeypatch, positive=kind != 'nonpositive_dif')

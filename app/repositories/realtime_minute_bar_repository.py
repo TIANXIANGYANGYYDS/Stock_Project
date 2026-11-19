@@ -75,6 +75,11 @@ class RealtimeMinuteBarRepository(BaseMongoRepository):
         """Bounded exact-key reads for an interrupted collector's restart."""
         if not keys:
             return []
-        return await self.collection.find({"$or": keys}, {"_id": 0}).hint(
+        grouped: dict[tuple[str, str], set[str]] = {}
+        for key in keys:
+            grouped.setdefault((key['interval'], key['timestamp']), set()).add(key['code'])
+        clauses = [{'interval': interval, 'timestamp': timestamp, 'code': {'$in': sorted(codes)}}
+                   for (interval, timestamp), codes in grouped.items()]
+        return await self.collection.find({"$or": clauses}, {"_id": 0}).hint(
             "uniq_realtime_code_interval_timestamp"
         ).to_list(length=len(keys))

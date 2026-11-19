@@ -21,7 +21,9 @@ import time
 import requests
 from pymongo import MongoClient, UpdateOne
 
-from app.core.config import get_settings
+from app.core.config import PROJECT_ROOT, get_settings
+from app.quant.data.sentiment_source_snapshot import load_snapshot
+from app.services.trading_calendar_service import get_a_share_calendar
 from app.manually_execute_script.stock_history_common import CN_TZ, StockTarget, market_for_code
 from app.manually_execute_script.sync_ths_2026_shadow import discover_ths_market_id
 from app.manually_execute_script.validate_stock_history_against_ths import (
@@ -131,9 +133,41 @@ def prior_universe(collection, start):
     return names
 
 
+def delisting_evidence(day, candidates):
+    """依据当日证券档案和交易所公告，核实整日缺失代码的退市日期。"""
+    evidence = {}
+    # BaoStock 证券档案不覆盖北交所，用已披露的摘牌公告补充证据。
+    if '920305' in candidates and day >= '2026-07-30':
+        evidence['920305'] = {
+            'out_date': '2026-07-30',
+            'source': 'https://www.bse.cn/disclosure/2026/2026-07-29/8a64d7d9ca1641609307b4f2aa5fecaf.pdf'}
+    archives = PROJECT_ROOT / '.local/market_sentiment/sources'
+    # 下午首次审计通常早于当天的盘后档案，优先用当日，否则取最近一周已有档案。
+    earliest = (datetime.fromisoformat(day) - timedelta(days=7)).strftime('%Y%m%d')
+    latest = day.replace('-', '')
+    folders = (p for p in archives.glob('*/basic') if earliest <= p.parent.name[:8] <= latest)
+    for folder in sorted(folders, reverse=True):
+        try:
+            snapshot = load_snapshot(folder, {'method': 'query_stock_basic', 'params': {}})
+        except (FileNotFoundError, ValueError, KeyError):
+            continue
+        for values in snapshot['rows']:
+            row = dict(zip(snapshot['fields'], values))
+            market, _, code = row['code'].partition('.')
+            if (code in candidates and row['type'] == '1' and row['status'] == '0'
+                    and row['outDate'] and row['outDate'] < day
+                    and market == market_for_code(code).lower()):
+                evidence[code] = {'out_date': row['outDate'], 'source': str(folder)}
+        break
+    return evidence
+
+
 def inventory(db, root, start, end):
     date_filter = {'trade_date': {'$gte': start, '$lte': end}}
-    days = sorted(set(db.stock_daily_detail.distinct('trade_date', date_filter)) |
+    # A completely missed session has no rows in either collection. It still
+    # needs repair; deriving the calendar only from stored data skipped it.
+    sessions = {day.strftime('%Y-%m-%d') for day in get_a_share_calendar().sessions_in_range(start, end)}
+    days = sorted(sessions | set(db.stock_daily_detail.distinct('trade_date', date_filter)) |
                   set(db[COLLECTION].distinct('trade_date', dict(date_filter, interval='1m'))))
     names = prior_universe(db.stock_daily_detail, start)
     tasks, summaries = [], []
@@ -149,18 +183,28 @@ def inventory(db, root, start, end):
         ], hint=INDEX, allowDiskUse=True)}
         expected = minute_starts(day)
         gaps = []
-        for code in sorted(set(names) | set(observed)):
+        candidates = set(names) | set(observed)
+        excluded = delisting_evidence(day, candidates - daily_names.keys() - observed.keys())
+        # 摘牌后若再次出现正式日线，则旧证券档案不能解释本次缺口。
+        for code, record in list(excluded.items()):
+            later = db.stock_daily_detail.find_one(
+                {'code': code, 'trade_date': {'$gt': record['out_date'], '$lte': day}},
+                {'_id': 1}, hint='uniq_code_trade_date_adjust')
+            if later:
+                del excluded[code]
+        for code in sorted(candidates - excluded.keys()):
             missing = sorted(expected - set(observed.get(code, [])))
             if missing:
                 gaps.append(dict(code=code, name=names.get(code), day=day, missing=missing))
-        summary = dict(day=day, symbols=len(set(names) | set(observed)),
+        summary = dict(day=day, symbols=len(candidates) - len(excluded), candidate_symbols=len(candidates),
+                       verified_delisted_count=len(excluded),
                        daily_symbols=len(daily_names),
                        daily_symbols_with_gaps=sum(g['code'] in daily_names for g in gaps),
                        daily_missing_minutes=sum(len(g['missing']) for g in gaps if g['code'] in daily_names),
                        stock_days_with_gaps=len(gaps), missing=sum(len(g['missing']) for g in gaps),
                        whole_day=sum(len(g['missing']) == 240 for g in gaps),
                        observed=sum(len(set(ts) & expected) for ts in observed.values()))
-        data = dict(summary=summary, gaps=gaps)
+        data = dict(summary=summary, gaps=gaps, excluded_delisted=excluded)
         write_json(path, data)
         summaries.append(data['summary']); tasks.extend(data['gaps'])
         print('inventory', data['summary'], flush=True)
@@ -245,16 +289,17 @@ def run(*, start, end, output, apply=False, workers=6):
     client, db = connect()
     try:
         tasks = inventory(db, root, start, end)
-        with requests.Session() as session:
-            headers, evidence = discover_ths_direct_headers(session, code='601086')
-        write_json(root / 'discovery.json', evidence)
-        worker = Downloader(root, headers, db, apply)
         results = []
-        with ThreadPoolExecutor(max_workers=max(1, min(workers, 8))) as executor:
-            for result in executor.map(worker, tasks):
-                results.append(result)
-                if len(results) % 100 == 0:
-                    print('progress', len(results), '/', len(tasks), 'inserted', sum(x['inserted'] for x in results), flush=True)
+        if tasks:
+            with requests.Session() as session:
+                headers, evidence = discover_ths_direct_headers(session, code='601086')
+            write_json(root / 'discovery.json', evidence)
+            worker = Downloader(root, headers, db, apply)
+            with ThreadPoolExecutor(max_workers=max(1, min(workers, 8))) as executor:
+                for result in executor.map(worker, tasks):
+                    results.append(result)
+                    if len(results) % 100 == 0:
+                        print('progress', len(results), '/', len(tasks), 'inserted', sum(x['inserted'] for x in results), flush=True)
         summary = dict(tasks=len(tasks), original_missing=sum(len(t['missing']) for t in tasks),
                        inserted=sum(x['inserted'] for x in results),
                        aggregate_inserted=sum(x.get('aggregate_inserted', 0) for x in results),

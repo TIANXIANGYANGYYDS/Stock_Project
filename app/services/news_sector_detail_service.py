@@ -139,7 +139,7 @@ class NewsSectorDetailService:
 
         await self.news_repository.create_indexes()
 
-    async def process_once(self) -> NewsSectorDetailProcessResult:
+    async def process_once(self, *, oldest_first: bool = False) -> NewsSectorDetailProcessResult:
         """
         处理一条新闻的完整详情分析闭环。
 
@@ -152,17 +152,20 @@ class NewsSectorDetailService:
         6. 失败则记录错误并标记 sector_detail_failed。
         """
 
-        news = await self.news_repository.claim_next_sector_detail_news()
+        news = await self.news_repository.claim_next_sector_detail_news(oldest_first=oldest_first)
 
         if news is None:
             return NewsSectorDetailProcessResult()
 
         try:
             analysis = await self._analyze_news(news)
-            await self.news_repository.mark_sector_detail_success(
+            updated = await self.news_repository.mark_sector_detail_success(
                 news.event_id,
                 analysis,
+                claim_id=news.status.claim_id,
             )
+            if not updated.matched_count:
+                raise RuntimeError("新闻已被重新领取，旧领取结果已丢弃")
 
             return NewsSectorDetailProcessResult(
                 event_id=news.event_id,
@@ -179,6 +182,7 @@ class NewsSectorDetailService:
             await self.news_repository.mark_sector_detail_failed(
                 news.event_id,
                 error_message,
+                claim_id=news.status.claim_id,
             )
 
             return NewsSectorDetailProcessResult(
@@ -204,8 +208,9 @@ class NewsSectorDetailService:
 
         results: list[NewsSectorDetailProcessResult] = []
 
-        for _ in range(batch_size):
-            result = await self.process_once()
+        # 每处理五条就给最早的一条留一个名额，避免旧新闻长期排在新稿后面。
+        for index in range(batch_size):
+            result = await self.process_once(oldest_first=(index + 1) % 5 == 0)
 
             if not result.processed:
                 break

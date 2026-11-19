@@ -418,6 +418,23 @@ def test_sse_initial_resync_update_removal_and_heartbeat():
     asyncio.run(run())
 
 
+def test_sse_dashboard_reuse_only_for_the_confirmed_initial_version():
+    async def run():
+        service = SentimentQueryService(WriteDatabase())
+        snapshot = engine().process(envelope())
+        identity = snapshot["meta"]["snapshot_id"]
+        for dashboard_id, resume, compact in ((identity, None, True), ("旧版本", None, False),
+                                             (identity, "旧版本", False), (None, None, False)):
+            frames = stream_frames(None, service, snapshot, resume, dashboard_id=dashboard_id)
+            frame = await anext(frames)
+            payload = json.loads(frame.split("data: ")[1])
+            assert ("event: stocks_snapshot" in frame) == compact
+            assert ("dashboard" in payload["data"]) != compact
+            assert payload["data"]["replace_all"] and len(payload["data"]["stocks_upsert"]) == 2
+            await frames.aclose()
+    asyncio.run(run())
+
+
 def test_sse_delivers_intermediate_events_between_display_refreshes():
     async def run():
         db = WriteDatabase()

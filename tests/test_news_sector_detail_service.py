@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 
+from pymongo.results import UpdateResult
+
 from app.models import News, NewsLLMAnalysis, NewsSectorLLMAnalysis, NewsStatus
 from app.services import NewsSectorDetailService
 
@@ -40,25 +42,29 @@ class FakeNewsRepository:
     async def create_indexes(self) -> None:
         return None
 
-    async def claim_next_sector_detail_news(self) -> News | None:
+    async def claim_next_sector_detail_news(self, *, oldest_first: bool = False) -> News | None:
         if not self.rows:
             return None
 
-        return self.rows.pop(0)
+        return self.rows.pop(-1 if oldest_first else 0)
 
     async def mark_sector_detail_success(
         self,
         event_id: str,
         analysis: Sequence[NewsSectorLLMAnalysis],
-    ) -> None:
+        *, claim_id: str | None = None,
+    ) -> UpdateResult:
         self.success_updates.append((event_id, list(analysis)))
+        return UpdateResult({"n": 1}, acknowledged=True)
 
     async def mark_sector_detail_failed(
         self,
         event_id: str,
         reason: str,
-    ) -> None:
+        *, claim_id: str | None = None,
+    ) -> UpdateResult:
         self.failed_updates.append((event_id, reason))
+        return UpdateResult({"n": 1}, acknowledged=True)
 
 
 class FakeAnalyzer:

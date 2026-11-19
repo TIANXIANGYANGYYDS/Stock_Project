@@ -178,12 +178,13 @@ def test_twenty_day_amount_window_resumes_without_model_checkpoint():
     assert len(resumed.history) == 20
 
 
-def test_recording_lock_excludes_other_process_and_releases():
+def test_recording_lock_excludes_other_process_and_releases(tmp_path):
     import subprocess
     import sys
     from app.quant.cli.record_market_sentiment import recording_lock
-    script = 'from app.quant.cli.record_market_sentiment import recording_lock\nwith recording_lock(): pass'
-    with recording_lock():
+    path = tmp_path / 'record.lock'
+    script = f'from app.quant.cli.record_market_sentiment import recording_lock\nwith recording_lock({str(path)!r}): pass'
+    with recording_lock(path):
         blocked = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=15)
         assert blocked.returncode != 0 and "已有情绪记录任务" in blocked.stderr
     released = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=15)

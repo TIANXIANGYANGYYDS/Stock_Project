@@ -1,0 +1,10 @@
+[Unit]
+Description=Refresh Stock Project quote chart index
+
+[Timer]
+OnStartupSec=15
+OnUnitInactiveSec=20
+AccuracySec=2
+
+[Install]
+WantedBy=timers.target

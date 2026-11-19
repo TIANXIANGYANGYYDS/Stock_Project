@@ -56,6 +56,10 @@ with MongoClient(settings.mongo_uri) as client:
 | `GET /api/v1/stocks/realtime?codes=600519,000001` | 现有腾讯/Sina 实时抓取器 | 批量获取个股当前最新价格，不设置分钟缓存 |
 | `GET /api/v1/stocks/{code}/realtime` | 现有腾讯/Sina 实时抓取器 | 获取单只个股当前最新价格 |
 | `GET /api/v1/stocks/{code}/intraday` | `stock_realtime_minute_bars` | 返回指定交易日全部分时 K 线；默认今天和 `interval=1m` |
+| `GET /api/v1/stocks/{code}/snapshots`、`/api/v1/stocks/{code}/auctions` | 原始采集批次、`stock_quote_chart_blocks_v1` | `trade_date`、`start_time`、`end_time` 指定上海时间左闭右开区间。默认 `view=full` 返回原始报价，`view=chart` 返回绘图所用的价格、量额、盘口和质量字段，两者最多 15 分钟、1000 批；`view=series` 返回涨幅曲线和事件定位所需的时间、来源、阶段、质量、价格及昨收，最多 60 分钟、4000 批。三种视图都按原始批次计数并保留多来源报价。 |
+| `GET /api/v1/stocks/{code}/fund-flows` | `stock_fund_flow_snapshots` | 必填 `trade_date=YYYY-MM-DD`；固定 5 秒采样、保留 5 个交易日，按实际采集时间倒序分页；五档当日累计净额（元）与占比（%）。`total` 为采集批次总数，某批 `records=[]` 表示该股票缺失；最多每页 200 批 |
+| `GET /api/v1/stocks/{code}/fund-flows/daily` | `stock_fund_flow_daily` | 独立长期日档；支持 `start_date`、`end_date` 与分页。保存盘后累计值，不对秒级快照求和；`finality=post_close_observation`，并非交易所最终结算数据 |
+| `GET /api/v1/market/fund-flow-quality/{trade_date}` | `stock_fund_flow_snapshots`、`stock_fund_flow_daily`、`market_observation_runs` | 该日最新快照的覆盖数量、缺失代码、失败批次，最近采集任务状态，该日日档状态与数量，以及原始/日档保留规则 |
 | `GET /api/v1/stocks` | `stock_daily_detail` | 聚合每只股票最新一条日线；支持 `keyword`（代码或最新名称）、`adjust` |
 | `GET /api/v1/stocks/{code}/daily` | `stock_daily_detail` | 单只股票日线分页；支持日期范围和 `adjust` |
 | `GET /api/v1/stocks/{code}/daily/{trade_date}` | `stock_daily_detail` | 单只股票单日完整详情 |

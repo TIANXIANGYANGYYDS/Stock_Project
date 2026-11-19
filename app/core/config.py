@@ -39,10 +39,16 @@ class Settings(BaseSettings):
     # 代理池服务地址；留空时不使用外部代理池。
     proxy_51_api_url: str = Field(default="", alias="PROXY_51_API_URL")
 
-    # 抖音近期作品列表所需的合规授权会话；详情页仍可使用公开协议读取。
+    # 抖音列表及详情所需的授权会话，需包含 UIFID 供 SecSDK 动态签名。
     douyin_session_cookie: SecretStr = Field(
         default=SecretStr(""),
         alias="DOUYIN_SESSION_COOKIE",
+    )
+
+    # 微博分页所需的授权会话；留空时只尝试公开访客接口。
+    weibo_session_cookie: SecretStr = Field(
+        default=SecretStr(""),
+        alias="WEIBO_SESSION_COOKIE",
     )
 
     # 应用日志级别，例如 INFO、WARNING 或 DEBUG。

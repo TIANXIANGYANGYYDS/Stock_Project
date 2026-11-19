@@ -18,6 +18,7 @@ from app.crawlers.creator_platforms.douyin import (
     parse_douyin_session_cookie_expiry,
 )
 from app.crawlers.creator_platforms.douyin_abogus import DouyinABogusSigner
+from app.crawlers.creator_platforms.douyin_websign import sign_web_query
 
 
 SEC_UID = "creator-sec-uid"
@@ -323,7 +324,7 @@ def test_protocol_list_request_completes_authorized_session_and_signs(
     candidates = asyncio.run(
         _DouyinPublicClient(
             account=douyin_account(),
-            session_cookie="sessionid=secret",
+            session_cookie="sessionid=secret; UIFID=test-fingerprint",
         ).fetch_candidates(
             cutoff_ts=cutoff,
             lookback_hours=24,
@@ -352,8 +353,11 @@ def test_protocol_list_request_completes_authorized_session_and_signs(
     assert query["count"] == ["2"]
     assert len(query["msToken"][0]) == 164
     assert len(query["a_bogus"][0]) > 100
+    assert query["uifid"] == ["test-fingerprint"]
+    assert len(query["x-secsdk-web-signature"][0]) == 32
+    assert request_kwargs["headers"]["uifid"] == "test-fingerprint"
     assert request_kwargs["headers"]["Cookie"].startswith(
-        "sessionid=secret; ttwid=anonymous-ttwid; msToken="
+        "sessionid=secret; UIFID=test-fingerprint; ttwid=anonymous-ttwid; msToken="
     )
     month_query = parse_qs(urlparse(session.get_calls[1][0]).query)
     assert month_query["time_list_query"] == ["1"]
@@ -415,7 +419,7 @@ def test_protocol_list_uses_configured_authorized_session_without_registration(
     candidates = asyncio.run(
         _DouyinPublicClient(
             account=douyin_account(),
-            session_cookie="ttwid=authorized; sessionid=secret; msToken=bound-token",
+            session_cookie="ttwid=authorized; sessionid=secret; msToken=bound-token; UIFID=test-fingerprint",
         ).fetch_candidates(cutoff_ts=cutoff, lookback_hours=24, limit=1)
     )
 
@@ -424,7 +428,7 @@ def test_protocol_list_uses_configured_authorized_session_without_registration(
     assert len(session.get_calls) == 2
     for _, request_kwargs in session.get_calls:
         assert request_kwargs["headers"]["Cookie"] == (
-            "ttwid=authorized; sessionid=secret; msToken=bound-token"
+            "ttwid=authorized; sessionid=secret; msToken=bound-token; UIFID=test-fingerprint"
         )
     assert parse_qs(urlparse(session.get_calls[0][0]).query)["msToken"] == [
         "bound-token"
@@ -449,7 +453,7 @@ def test_protocol_list_rejects_missing_anonymous_ttwid(
         asyncio.run(
             _DouyinPublicClient(
                 account=douyin_account(),
-                session_cookie="sessionid=secret",
+                session_cookie="sessionid=secret; UIFID=test-fingerprint",
             ).fetch_candidates(
                 cutoff_ts=1784872800,
                 lookback_hours=24,
@@ -474,7 +478,7 @@ def test_protocol_list_rejects_empty_success_response(
         asyncio.run(
             _DouyinPublicClient(
                 account=douyin_account(),
-                session_cookie="sessionid=secret",
+                session_cookie="sessionid=secret; UIFID=test-fingerprint",
             ).fetch_candidates(
                 cutoff_ts=1784872800,
                 lookback_hours=24,
@@ -496,7 +500,7 @@ def test_protocol_list_marks_explicit_platform_rejection_as_blocked(
         asyncio.run(
             _DouyinPublicClient(
                 account=douyin_account(),
-                session_cookie="sessionid=secret",
+                session_cookie="sessionid=secret; UIFID=test-fingerprint",
             ).fetch_candidates(
                 cutoff_ts=1784872800,
                 lookback_hours=24,
@@ -528,7 +532,7 @@ def test_protocol_list_rejects_not_login_degraded_response(
         asyncio.run(
             _DouyinPublicClient(
                 account=douyin_account(),
-                session_cookie="sessionid=expired",
+                session_cookie="sessionid=expired; UIFID=test-fingerprint",
             ).fetch_candidates(
                 cutoff_ts=1784872800,
                 lookback_hours=24,
@@ -577,7 +581,7 @@ def test_protocol_detail_request_uses_curl_redirect_option(
 
     work = asyncio.run(
         _DouyinPublicClient(
-            account=douyin_account(), session_cookie="sessionid=secret"
+            account=douyin_account(), session_cookie="sessionid=secret; UIFID=test-fingerprint"
         ).fetch_work("7665718789363309172")
     )
 
@@ -587,6 +591,31 @@ def test_protocol_detail_request_uses_curl_redirect_option(
     query = parse_qs(urlparse(session.get_calls[0][0]).query)
     assert query["aweme_id"] == ["7665718789363309172"]
     assert len(query["a_bogus"][0]) > 100
+    assert query["uifid"] == ["test-fingerprint"]
+    assert len(query["x-secsdk-web-signature"][0]) == 32
+
+
+def test_protocol_signing_preserves_abogus_special_characters(monkeypatch) -> None:
+    client = _DouyinPublicClient(account=douyin_account(), session_cookie="")
+    monkeypatch.setattr(client._signer, "sign", lambda query: "A+B/C==")
+    query, uifid = client._signed_query(
+        {"aid": "6383"}, "UIFID=test-fingerprint; s_v_web_id=verify_test"
+    )
+    params = parse_qs(query)
+    assert params["a_bogus"] == ["A+B/C=="]
+    assert params["verifyFp"] == params["fp"] == ["verify_test"]
+    assert params["uifid"] == [uifid]
+    unsigned = query.split("&timestamp=", 1)[0]
+    assert query == sign_web_query(unsigned, timestamp=int(params["timestamp"][0]))
+
+
+def test_protocol_signing_requires_session_fingerprint() -> None:
+    client = _DouyinPublicClient(account=douyin_account(), session_cookie="")
+    with pytest.raises(DouyinBlockedError, match="缺少 UIFID"):
+        client._signed_query({"aid": "6383"}, "sessionid=secret")
+    query, uifid = client._signed_query({"aid": "6383"}, "UIFID_TEMP=temp-fingerprint")
+    assert uifid == "temp-fingerprint"
+    assert "x-secsdk-web-signature=" in query
 
 
 def test_work_detail_payload_parser_validates_identity_and_extracts_media() -> None:

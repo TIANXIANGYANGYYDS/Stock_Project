@@ -114,6 +114,24 @@ def test_long_suspension_stays_in_universe_without_introducing_future_listing():
     assert set(prior_universe(Collection(),'2026-08-20'))=={'002084','000001'}
 
 
+def test_delisting_evidence_checks_market_type_and_effective_date(tmp_path, monkeypatch):
+    from app.manually_execute_script import repair_realtime_minutes_ths as module
+    monkeypatch.setattr(module, 'PROJECT_ROOT', tmp_path)
+    folder = tmp_path / '.local/market_sentiment/sources/20261117T183000/basic'
+    folder.mkdir(parents=True)
+    monkeypatch.setattr(module, 'load_snapshot', lambda *_: {
+        'fields': ['code', 'type', 'status', 'outDate'],
+        'rows': [['sh.000004', '2', '0', '2026-07-01'],
+                 ['sz.000004', '1', '0', '2026-07-14'],
+                 ['sh.000016', '1', '0', '2026-07-01'],
+                 ['sz.000020', '1', '0', '2026-11-18'],
+                 ['sz.000021', '1', '1', '']]})
+    evidence = module.delisting_evidence('2026-11-18', {'000004', '000016', '000020', '000021', '920305'})
+    assert set(evidence) == {'000004', '920305'}
+    assert evidence['000004']['out_date'] == '2026-07-14'
+    assert not module.delisting_evidence('2026-07-29', {'920305'})
+
+
 def test_rollup_requires_all_constituents_and_preserves_existing(monkeypatch):
     from app.manually_execute_script import repair_realtime_minutes_ths as module
     rows = [normalized(row(f'09:{minute:02}:00')) for minute in range(31, 36)]
@@ -149,3 +167,80 @@ def test_inventory_refresh_includes_newly_arrived_daily_codes(tmp_path, monkeypa
     tasks = module.inventory(DB(), tmp_path, day, day)
     assert tasks[0]['code'] == '301716'
     assert len(tasks[0]['missing']) == 240
+
+
+def test_inventory_includes_session_with_no_daily_or_minute_rows(tmp_path, monkeypatch):
+    from app.manually_execute_script import repair_realtime_minutes_ths as module
+    class Cursor(list):
+        def hint(self, *args): return self
+    class Daily:
+        def distinct(self, *args): return []
+        def find(self, *args): return Cursor()
+    class Minutes:
+        def distinct(self, *args): return []
+        def aggregate(self, *args, **kwargs): return []
+    class DB:
+        stock_daily_detail = Daily()
+        def __getitem__(self, key): return Minutes()
+    monkeypatch.setattr(module, 'prior_universe', lambda *args: {'000001': '平安银行'})
+    tasks = module.inventory(DB(), tmp_path, '2026-10-30', '2026-11-02')
+    assert [t['day'] for t in tasks] == ['2026-10-30', '2026-11-02']
+    assert all(len(t['missing']) == 240 for t in tasks)
+
+
+def test_scheduled_repair_surfaces_child_failure_and_isolates_process(monkeypatch):
+    from app.scheduler import crawler_jobs
+    from app.services import stock_daily_detail_service
+    calls = []
+    async def resolve(*args):
+        return SimpleNamespace(target_trade_date='2026-11-02')
+    class Process:
+        returncode = 7
+        async def communicate(self): return b'', b'repair failed'
+    async def spawn(*args, **kwargs):
+        calls.append(args)
+        return Process()
+    monkeypatch.setattr(stock_daily_detail_service, 'resolve_a_stock_target_trade_date', resolve)
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', spawn)
+    with pytest.raises(RuntimeError, match='status 7'):
+        asyncio.run(crawler_jobs.repair_realtime_minutes_job())
+    assert 'app.manually_execute_script.repair_realtime_minutes_ths' in calls[0]
+    assert '--apply' in calls[0]
+
+
+def test_cancelled_scheduled_repair_terminates_child(monkeypatch):
+    from app.scheduler import crawler_jobs
+    from app.services import stock_daily_detail_service
+    actions = []
+    async def resolve(*args):
+        return SimpleNamespace(target_trade_date='2026-11-02')
+    class Process:
+        returncode = None
+        async def communicate(self): raise asyncio.CancelledError()
+        def terminate(self): actions.append('terminate')
+        async def wait(self): actions.append('wait'); self.returncode = -15
+    async def spawn(*args, **kwargs): return Process()
+    monkeypatch.setattr(stock_daily_detail_service, 'resolve_a_stock_target_trade_date', resolve)
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', spawn)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(crawler_jobs.repair_realtime_minutes_job())
+    assert actions == ['terminate', 'wait']
+
+
+def test_completed_minute_repair_triggers_quant_partial_recovery(monkeypatch):
+    from app.scheduler import crawler_jobs, quant_jobs
+    from app.services import stock_daily_detail_service
+    actions = []
+    async def resolve(*args): return SimpleNamespace(target_trade_date='2026-11-05')
+    class Process:
+        returncode = 0
+        async def communicate(self):
+            actions.append('minutes_repaired')
+            return b'{"status":"completed"}', b''
+    async def spawn(*args, **kwargs): return Process()
+    async def recover(): actions.append('quant_recovered')
+    monkeypatch.setattr(stock_daily_detail_service, 'resolve_a_stock_target_trade_date', resolve)
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', spawn)
+    monkeypatch.setattr(quant_jobs, 'recover_completed_quant_job', recover)
+    asyncio.run(crawler_jobs.repair_realtime_minutes_job())
+    assert actions == ['minutes_repaired', 'quant_recovered']

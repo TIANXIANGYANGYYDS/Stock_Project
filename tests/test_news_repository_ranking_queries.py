@@ -75,3 +75,35 @@ def test_save_rows_recognizes_legacy_jin10_identity() -> None:
     assert written_rows == []
     assert result.inserted_count == 0
     assert result.existing_count == 1
+
+
+def test_expired_claims_get_a_new_token_and_all_writes_require_it():
+    from unittest.mock import AsyncMock
+
+    async def run():
+        repo = object.__new__(NewsRepository)
+        repo.collection = AsyncMock()
+        for stage, pending, working in (("judge", "crawled", "sector_judging"),
+                                        ("detail", "sector_judged", "sector_detail_analyzing")):
+            def claim(filters, update, **options):
+                new_status = update["$set"]["status"]
+                assert filters["$or"][0] == {"status.status": pending}
+                expired = filters["$or"][1]
+                assert expired["status.status"] == working
+                assert expired["status.claim_expires_at"]["$lte"] < new_status["claim_expires_at"]
+                return {"event_id": "test", "publish_ts": 1, "content": "正文", "source": "cls",
+                        "status": new_status}
+
+            repo.collection.find_one_and_update.side_effect = claim
+            acquire = getattr(repo, f"claim_next_sector_{stage}_news")
+            first, next_claim = await acquire(), await acquire()
+            assert first.status.claim_id and first.status.claim_id != next_claim.status.claim_id
+            for result, value in (("success", []), ("failed", "超时")):
+                save = getattr(repo, f"mark_sector_{stage}_{result}")
+                await save(first.event_id, value, claim_id=first.status.claim_id)
+                filters, change = repo.collection.update_one.await_args.args
+                assert filters["status.claim_id"] == first.status.claim_id
+                assert filters["status.status"] == working
+                assert "claim_id" not in change["$set"]["status"]
+
+    asyncio.run(run())

@@ -41,6 +41,48 @@ def test_health_and_unavailable():
         assert response.json() == {"detail": "MongoDB 不可用"}
 
 
+def test_readiness_checks_scheduler_and_completed_business_data(monkeypatch):
+    from app.api.routers import health
+    from tests.api.conftest import FakeCollection
+    from app.quant.strategies.provisional_daily_macd_3m import STRATEGY_ID
+    database = sample_database()
+    day = '2026-08-05'
+    database.collections['stock_daily_detail_sync_runs'] = FakeCollection([
+        {'target_trade_date': day, 'adjust': 'qfq', 'scope_key': 'all', 'status': 'success'}])
+    database.collections['quant_daily_results'] = FakeCollection([
+        {'strategy_id': STRATEGY_ID, 'trade_date': day, 'status': 'closed',
+         'runtime': {'data_status': 'closed', 'incomplete_code_count': 0}}])
+    database.collections['short_sentiment_snapshots'] = FakeCollection([
+        {'scope': 'all_a', 'trade_date': day, 'meta': {'is_final': True}}])
+    monkeypatch.setattr(health, 'expected_completed_date', lambda: day)
+    monkeypatch.setattr(health, 'heartbeat_status', lambda: {'status': 'ok'})
+    with make_client(database) as client:
+        assert client.get('/api/v1/health/ready').status_code == 200
+        monkeypatch.setattr(health, 'heartbeat_status', lambda: {'status': 'stale'})
+        assert client.get('/api/v1/health/ready').status_code == 503
+        monkeypatch.setattr(health, 'heartbeat_status', lambda: {'status': 'ok'})
+        database.collections['stock_daily_detail_sync_runs'].rows[0]['status'] = 'partial_failed'
+        assert client.get('/api/v1/health/ready').status_code == 503
+        database.collections['stock_daily_detail_sync_runs'].rows[0]['status'] = 'success'
+        database.collections['quant_daily_results'].rows[0]['runtime']['data_status'] = 'closed_partial'
+        assert client.get('/api/v1/health/ready').status_code == 503
+        runtime = database.collections['quant_daily_results'].rows[0]['runtime']
+        runtime.update(incomplete_codes=['000001'], incomplete_code_count=1)
+        assert client.get('/api/v1/health/ready').status_code == 503
+        database.collections['market_sentiment_raw_daily'] = FakeCollection([
+            {'scope': 'hs_mainboard', 'trade_date': day, 'market': {'stocks': [{
+                'code': '000001', 'is_suspended': True, 'status_source': 'baostock.daily_observation',
+                'volume_shares': 0, 'amount_yuan': 0}]}}])
+        response = client.get('/api/v1/health/ready')
+        assert response.status_code == 200
+        assert response.json()['data']['quant']['verified_suspended_codes'] == ['000001']
+        database.collections['market_sentiment_raw_daily'].rows[0]['market']['stocks'][0]['volume_shares'] = 100
+        assert client.get('/api/v1/health/ready').status_code == 503
+        database.collections['quant_daily_results'].rows = [
+            {'strategy_id': STRATEGY_ID, 'trade_date': '2026-08-06', 'status': 'waiting_open'}]
+        assert client.get('/api/v1/health/ready').status_code == 503
+
+
 def test_news_filters_pagination_detail_and_404():
     with make_client() as client:
         response = client.get("/api/v1/news?page=1&page_size=1&source=cls&sector_name=半导体&company=甲公司")

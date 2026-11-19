@@ -1,0 +1,6 @@
+# Optional offline factor research and Excel reporting.
+# Install after requirements.txt; these are not needed by the production service.
+numpy
+pyarrow
+openpyxl
+matplotlib>=3.9,<4

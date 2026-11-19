@@ -14,20 +14,40 @@ from app.services.stock_daily_detail_service import resolve_a_stock_target_trade
 logger = logging.getLogger(__name__)
 _offset = None
 _checked = 0.0
+_checked_wall = None
+_verification = None
+
+
+async def _verify_clock():
+    """同一轮校时只采一次，两路校时源均通过后才发布新偏移。"""
+    global _offset, _checked, _checked_wall
+    clock = RealtimeMarketCrawler()
+    try:
+        value = await clock.clock_offset()
+    finally:
+        await clock.close()
+    if value is None:
+        raise RuntimeError("market_observation_clock_unverified")
+    _offset, _checked = value, time.monotonic()
+    _checked_wall = datetime.now(CN_TZ)
 
 
 async def observation_now():
-    """Reuse the quote collector's two-source clock check; fail visibly if unknown."""
-    global _offset, _checked
-    if _offset is None or time.monotonic() - _checked >= 300:
-        clock = RealtimeMarketCrawler()
-        try:
-            value = await clock.clock_offset()
-        finally:
-            await clock.close()
-        if value is None:
+    """复用双来源校时结果，缓存过期或系统时间跳变时重新验证。"""
+    global _offset, _verification
+    wall = datetime.now(CN_TZ)
+    elapsed = time.monotonic() - _checked
+    clock_changed = (_checked_wall is not None
+                     and abs((wall - _checked_wall).total_seconds() - elapsed) > 1)
+    if _offset is None or elapsed >= 300 or clock_changed:
+        # 系统时间跳变后旧偏移立即失效，重新校验失败时保留未知状态。
+        _offset = None
+        if _verification is None or _verification.done():
+            _verification = asyncio.create_task(_verify_clock())
+        await asyncio.shield(_verification)
+        # 等待期间另一个任务可能检测到新的系统校时跳变。
+        if _offset is None:
             raise RuntimeError("market_observation_clock_unverified")
-        _offset, _checked = value, time.monotonic()
     return datetime.now(CN_TZ) + timedelta(seconds=_offset), _offset
 
 
@@ -69,18 +89,24 @@ class MarketObservationService:
             return {"status": "skipped", "reason": "already_collected", "id": identity}
         for attempt in range(3):
             try:
-                data = await (self.crawler.fetch_hot_rank() if kind == "hot"
-                              else self.crawler.fetch_billboard(day))
+                if kind == "hot":
+                    data = await self.crawler.fetch_hot_rank()
+                else:
+                    data = await self.crawler.fetch_billboard(day)
                 observed = data["fetched_at"] + timedelta(seconds=clock_offset)
-                if kind == "hot" and not manual and hot_slot(observed) != slot:
-                    raise ValueError("hot_rank_fetch_crossed_slot")
+                if kind == "hot":
+                    if observed.astimezone(CN_TZ).date().isoformat() != day:
+                        raise ValueError("observation_fetch_crossed_day")
+                    if not manual and hot_slot(observed) != slot:
+                        raise ValueError("hot_rank_fetch_crossed_slot")
                 data.update(trade_date=day, observed_at=observed,
                             clock_offset_seconds=clock_offset, run_mode="manual" if manual else "scheduled")
                 if kind == "hot":
                     data["scheduled_slot"] = None if manual else slot
                 await self.repo.save(kind, identity, data)
-                await self.repo.record_run(kind, identity, status="success")
-                return {"status": "success", "id": identity,
+                status = data.get("collection_status", "success")
+                await self.repo.record_run(kind, identity, status=status)
+                return {"status": status, "id": identity,
                         "count": len(data["stocks"] if kind == "hot" else data["records"])}
             except Exception as exc:
                 await self.repo.record_run(kind, identity, status="failed", error=str(exc)[:300])

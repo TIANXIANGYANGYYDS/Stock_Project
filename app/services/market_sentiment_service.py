@@ -126,8 +126,15 @@ def normalize_daily(day, daily_rows, universe_rows, basic_rows, calendar):
 
 def sync_daily(repo: MarketSentimentRepository, *, now=None, archive_root=ARCHIVES):
     now = now or datetime.now(CN)
+    if now.tzinfo is None:
+        raise ValueError("必须传入带时区的当前时间")
     history = repo.history()
     last = history[-1]["trade_date"] if history else None
+    local = now.astimezone(CN)
+    cutoff = local.date() if (local.hour, local.minute) >= (15, 30) else local.date() - timedelta(days=1)
+    if last == cutoff.isoformat():
+        # 正式汇总是最后提交的记录，同日补偿无需再次登录行情源。
+        return {"saved": 0, "latest": last}
     start = last or (now.date() - timedelta(days=75)).isoformat()
     run_folder = archive_root / now.astimezone(CN).strftime("%Y%m%dT%H%M%S%f")
     with BaoStockSource(timeout_seconds=60) as source:

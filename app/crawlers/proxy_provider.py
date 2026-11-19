@@ -677,7 +677,15 @@ class AsyncDailiProxyPool(DailiProxyProvider):
                     await self._condition.wait()
                     continue
 
-            endpoints = await self._fetch_proxy_endpoints_async(fetch_count)
+            try:
+                endpoints = await self._fetch_proxy_endpoints_async(fetch_count)
+            except asyncio.CancelledError:
+                # A bounded sampling cycle can cancel pool acquisition. Do not
+                # leave the next cycle waiting forever for a vanished fetcher.
+                async with self._condition:
+                    self._fetching = False
+                    self._condition.notify_all()
+                raise
             async with self._condition:
                 existing = {
                     (slot.endpoint.host, slot.endpoint.port) for slot in self._slots
@@ -718,6 +726,13 @@ class AsyncDailiProxyPool(DailiProxyProvider):
         proxies: Optional[Dict[str, str]],
     ) -> None:
         """归还一个成功租约，减少在途数并唤醒等待分配的协程。"""
+        await self._release(proxies, succeeded=True)
+
+    async def release_cancelled(self, proxies: Dict[str, str]) -> None:
+        """调用方到达整轮截止时间时归还租约，保留端点原有的健康状态。"""
+        await self._release(proxies, succeeded=False)
+
+    async def _release(self, proxies, *, succeeded):
         if proxies is None:
             return
         async with self._condition:
@@ -725,7 +740,8 @@ class AsyncDailiProxyPool(DailiProxyProvider):
             if slot is None:
                 return
             slot.in_flight = max(0, slot.in_flight - 1)
-            self.stats.success_count += 1
+            if succeeded:
+                self.stats.success_count += 1
             self._mark_expired_and_cleanup()
             self._condition.notify_all()
 

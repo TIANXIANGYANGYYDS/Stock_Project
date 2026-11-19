@@ -265,6 +265,47 @@ def test_clock_calibration_requires_two_agreeing_independent_sources():
     asyncio.run(run())
 
 
+@pytest.mark.parametrize('backup_status', [200, 503])
+def test_clock_fallback_still_requires_two_sources(backup_status):
+    from email.utils import format_datetime
+    async def run():
+        crawler = RealtimeMarketCrawler()
+        await crawler.close()
+        class Client:
+            async def get(self, url, **kwargs):
+                status = 503 if 'sse.com' in url else backup_status if 'szse.cn' in url else 200
+                return SimpleNamespace(status_code=status, headers={'date': format_datetime(datetime.now(CN_TZ))})
+        crawler.primary = SimpleNamespace(client=Client())
+        offset = await crawler.clock_offset()
+        assert (offset is not None) == (backup_status == 200)
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('step', [-300, 300])
+def test_clock_calibration_rejects_system_time_step_during_request(monkeypatch, step):
+    from email.utils import format_datetime
+    from app.crawlers import realtime_market_crawler as module
+
+    wall = [datetime(2026, 11, 9, 10, tzinfo=CN_TZ)]
+    class Clock:
+        @staticmethod
+        def now(tz): return wall[0]
+
+    async def run():
+        crawler = RealtimeMarketCrawler()
+        await crawler.close()
+        class Client:
+            async def get(self, url, **kwargs):
+                wall[0] += timedelta(seconds=step)
+                return SimpleNamespace(status_code=200, headers={'date': format_datetime(wall[0])})
+        crawler.primary = SimpleNamespace(client=Client())
+        monkeypatch.setattr(module, 'datetime', Clock)
+        assert await crawler.clock_offset() is None
+        assert crawler.reference_clock_offset is None
+
+    asyncio.run(run())
+
+
 def test_unavailable_symbol_during_fallback_cooldown_does_not_abort_market():
     async def run():
         crawler = RealtimeMarketCrawler()
@@ -334,7 +375,7 @@ def test_session_archives_auction_but_only_aggregates_continuous_trades(monkeypa
                 current = at if self.calls < 5 else at.replace(hour=11, minute=36)
                 return [q],dict(requested=1,returned=1,requests=1,fallback_batches=0,failed_batches=0,elapsed_ms=1)
             async def close(self):pass
-        async def universe(_):return [{'code':'000001','name':'test'}]
+        async def universe(_, **kwargs):return [{'code':'000001','name':'test'}]
         service.crawler=Crawler();service.snapshots=Snapshots();service._load_universe=universe
         try:
             await service.run_session('morning')

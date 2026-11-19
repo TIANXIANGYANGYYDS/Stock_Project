@@ -99,6 +99,8 @@ async def probe_account(
         "pagination_attempted": False,
         "pagination_ok": None,
         "pagination_overlap_count": None,
+        "pagination_coverage": None,
+        "pagination_coverage_reason": None,
         "detail_identity_ok": None,
         "detail_content_ok": None,
         "media_resolve_ok": None,
@@ -137,6 +139,8 @@ async def probe_account(
         result["coverage_reason"] = page.coverage_reason
         result["item_count"] = len(page.items)
         result["list_ok"] = page.coverage in {"complete", "partial"}
+        if not result["list_ok"]:
+            result["error"] = _safe_error(RuntimeError(page.coverage_reason))
 
         if check_pagination and page.has_more and page.next_cursor:
             result["pagination_attempted"] = True
@@ -153,10 +157,16 @@ async def probe_account(
                 first_ids = {item.platform_work_id for item in page.items}
                 next_ids = {item.platform_work_id for item in next_page.items}
                 result["pagination_overlap_count"] = len(first_ids & next_ids)
+                result["pagination_coverage"] = next_page.coverage
+                result["pagination_coverage_reason"] = next_page.coverage_reason
                 result["pagination_ok"] = (
                     next_page.cursor == page.next_cursor
                     and next_page.coverage in {"complete", "partial"}
                 )
+                if not result["pagination_ok"]:
+                    result["error"] = _safe_error(RuntimeError(
+                        next_page.coverage_reason or "pagination cursor mismatch"
+                    ))
             except Exception as exc:
                 result["pagination_ok"] = False
                 result["error"] = _safe_error(exc)
@@ -229,6 +239,7 @@ async def probe_account(
                 )
                 result["pipeline_ready_ok"] = bool(
                     detail_source == "list" and result["detail_ready_ok"]
+                    and result["pagination_ok"] is not False
                 )
                 result["detail_text_length"] = len(detail.text.strip())
                 result["media_url_count"] = len(media_urls)
@@ -276,6 +287,8 @@ async def probe_account(
             (time.perf_counter() - probe_started) * 1000,
             2,
         )
+        if result["media_download_ok"] is False:
+            result["pipeline_ready_ok"] = False
     return result
 
 

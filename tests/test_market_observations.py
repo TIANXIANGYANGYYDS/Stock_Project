@@ -5,12 +5,101 @@ from types import SimpleNamespace
 
 import pytest
 
+
 from app.crawlers.market_observation_crawler import parse_hot_rank, assemble_billboard, MarketObservationCrawler
 from app.crawlers.realtime_market_crawler import CN_TZ
 from app.services.market_observation_service import MarketObservationService, hot_slot
 from app.services import market_observation_service as service_module
 from app.scheduler.market_observation_jobs import register_market_observation_jobs
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+
+def test_concurrent_ticks_share_one_clock_verification(monkeypatch):
+    started, release = asyncio.Event(), asyncio.Event()
+    calls = []
+    class Clock:
+        async def clock_offset(self):
+            calls.append(1)
+            started.set()
+            await release.wait()
+            return 0.25
+        async def close(self): pass
+    monkeypatch.setattr(service_module, '_offset', None)
+    monkeypatch.setattr(service_module, '_verification', None)
+    monkeypatch.setattr(service_module, '_checked', 0.)
+    monkeypatch.setattr(service_module, '_checked_wall', None)
+    monkeypatch.setattr(service_module, 'RealtimeMarketCrawler', Clock)
+    async def run():
+        tasks = [asyncio.create_task(service_module.observation_now()) for _ in range(4)]
+        await started.wait()
+        tasks[0].cancel()
+        release.set()
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        assert isinstance(results[0], asyncio.CancelledError)
+        assert [x[1] for x in results[1:]] == [0.25] * 3
+        assert len(calls) == 1
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("step", [-305, 305])
+def test_observation_clock_refreshes_immediately_after_host_clock_step(monkeypatch, step):
+    wall = [datetime(2026, 11, 9, 10, 5, tzinfo=CN_TZ)]
+    monotonic = [100.0]
+    offsets = iter([float(step), 0.0])
+    calls = []
+
+    class Clock:
+        @staticmethod
+        def now(tz): return wall[0]
+
+    class Crawler:
+        async def clock_offset(self):
+            calls.append(True)
+            return next(offsets)
+        async def close(self): pass
+
+    monkeypatch.setattr(service_module, "datetime", Clock)
+    monkeypatch.setattr(service_module, "time", SimpleNamespace(monotonic=lambda: monotonic[0]))
+    monkeypatch.setattr(service_module, "RealtimeMarketCrawler", Crawler)
+    monkeypatch.setattr(service_module, "_offset", None)
+    monkeypatch.setattr(service_module, "_checked_wall", None, raising=False)
+    monkeypatch.setattr(service_module, "_checked", 0.0)
+
+    async def run():
+        assert (await service_module.observation_now())[1] == step
+        wall[0] += timedelta(seconds=5)
+        monotonic[0] += 5
+        assert (await service_module.observation_now())[1] == step
+        assert len(calls) == 1
+        wall[0] += timedelta(seconds=step + 5)
+        monotonic[0] += 5
+        assert await service_module.observation_now() == (wall[0], 0.0)
+        assert len(calls) == 2
+
+    asyncio.run(run())
+
+
+def test_observation_clock_never_reuses_invalid_offset_after_failed_refresh(monkeypatch):
+    wall = datetime(2026, 11, 9, 10, tzinfo=CN_TZ)
+    class Clock:
+        @staticmethod
+        def now(tz): return wall
+    values = iter([None, 0.0])
+    class Crawler:
+        async def clock_offset(self): return next(values)
+        async def close(self): pass
+    monkeypatch.setattr(service_module, 'datetime', Clock)
+    monkeypatch.setattr(service_module, 'time', SimpleNamespace(monotonic=lambda: 110.0))
+    monkeypatch.setattr(service_module, 'RealtimeMarketCrawler', Crawler)
+    monkeypatch.setattr(service_module, '_offset', -300.0)
+    monkeypatch.setattr(service_module, '_checked', 100.0)
+    monkeypatch.setattr(service_module, '_checked_wall', wall + timedelta(seconds=290))
+    async def run():
+        with pytest.raises(RuntimeError, match='clock_unverified'):
+            await service_module.observation_now()
+        assert service_module._offset is None
+        assert await service_module.observation_now() == (wall, 0.0)
+    asyncio.run(run())
 
 
 def hot_payload():

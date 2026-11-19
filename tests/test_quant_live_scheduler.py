@@ -180,3 +180,58 @@ def test_startup_before_calibrated_prepare_time_skips(monkeypatch):
     monkeypatch.setattr(quant_jobs, 'observation_now', clock)
     monkeypatch.setattr(quant_jobs, 'prepare_quant_live_job', prepare)
     assert asyncio.run(quant_jobs.resume_quant_live_job())['reason'] == 'before_prepare_window'
+
+
+def test_partial_recovery_uses_previous_completed_day_before_open(monkeypatch):
+    calls = []
+    async def clock(): return datetime.fromisoformat('2026-11-06T08:00:00+08:00'), -348
+    async def resume():
+        assert not quant_jobs._get_quant_job_lock().locked()
+        calls.append('resume')
+        return {'status': 'skipped'}
+    class Process:
+        returncode = 0
+        async def communicate(self): return b'{"status":"unchanged"}', b''
+    async def spawn(*args, **kwargs):
+        assert quant_jobs._get_quant_job_lock().locked()
+        calls.append(args)
+        return Process()
+    monkeypatch.setattr(quant_jobs, 'observation_now', clock)
+    monkeypatch.setattr(quant_jobs, 'resume_quant_live_job', resume)
+    monkeypatch.setattr(quant_jobs.asyncio, 'create_subprocess_exec', spawn)
+    asyncio.run(quant_jobs.recover_completed_quant_job())
+    assert 'app.quant.cli.recover_partial_days' in calls[0]
+    assert calls[0][-3:] == ('--end-date', '2026-11-05', '--apply')
+    assert calls[1] == 'resume'
+
+
+def test_partial_recovery_cannot_rewrite_during_live_session(monkeypatch):
+    async def clock(): return datetime.fromisoformat('2026-11-06T14:00:00+08:00'), -348
+    async def resume(): return {'status': 'monitoring'}
+    async def spawn(*args, **kwargs): raise AssertionError('must not rewrite accounts during trading')
+    monkeypatch.setattr(quant_jobs, 'observation_now', clock)
+    monkeypatch.setattr(quant_jobs, 'resume_quant_live_job', resume)
+    monkeypatch.setattr(quant_jobs.asyncio, 'create_subprocess_exec', spawn)
+    assert asyncio.run(quant_jobs.recover_completed_quant_job()) == {'status': 'monitoring'}
+
+
+@pytest.mark.parametrize('failure', ['exit', 'cancel'])
+def test_partial_recovery_subprocess_failure_releases_lock(monkeypatch, failure):
+    actions = []
+    async def clock(): return datetime.fromisoformat('2026-11-05T18:00:00+08:00'), -348
+    class Process:
+        returncode = 7 if failure == 'exit' else None
+        async def communicate(self):
+            if failure == 'cancel': raise asyncio.CancelledError()
+            return b'', b'injected recovery failure'
+        def terminate(self): actions.append('terminate')
+        async def wait(self): self.returncode = -15; actions.append('wait')
+    async def spawn(*args, **kwargs): return Process()
+    monkeypatch.setattr(quant_jobs, 'observation_now', clock)
+    monkeypatch.setattr(quant_jobs.asyncio, 'create_subprocess_exec', spawn)
+    async def run():
+        with pytest.raises(RuntimeError if failure == 'exit' else asyncio.CancelledError):
+            await quant_jobs.recover_completed_quant_job()
+        assert not quant_jobs._get_quant_job_lock().locked()
+    asyncio.run(run())
+    assert actions == ([] if failure == 'exit' else ['terminate', 'wait'])

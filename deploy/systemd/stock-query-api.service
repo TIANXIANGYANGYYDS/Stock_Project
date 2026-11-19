@@ -1,0 +1,19 @@
+[Unit]
+Description=Stock Project query API
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Agent_first/Stock_Project
+ExecStart=%h/miniconda3/envs/MyAgent/bin/python -m app.manually_execute_script.run_logged --log .local/logs/query_api.log -- %h/miniconda3/envs/MyAgent/bin/python -m uvicorn app.api.app:create_app --factory --host 0.0.0.0 --port 8100 --timeout-graceful-shutdown 15
+Environment=MALLOC_ARENA_MAX=2
+MemoryHigh=infinity
+MemoryMax=2G
+MemorySwapMax=256M
+OOMPolicy=kill
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

@@ -565,22 +565,33 @@ class RealtimeMarketCrawler:
         return q
 
     async def clock_offset(self) -> Optional[float]:
-        """Use two HTTPS response clocks, never a halted stock's quote clock."""
+        """用两个独立 HTTPS 响应的服务器时间校时。"""
         async def sample(url):
             try:
                 before = datetime.now(CN_TZ)
+                started = time.monotonic()
                 response = await self.primary.client.get(url, timeout=5,
                     params={'_clock': str(time.time_ns())}, headers={'Cache-Control': 'no-cache'})
+                elapsed = time.monotonic() - started
                 after = datetime.now(CN_TZ)
+                # 往返耗时用单调时钟计量，同时检查请求期间系统时间是否跳变。
+                if not 0 <= elapsed < 3 or abs((after-before).total_seconds() - elapsed) > 1:
+                    return None
                 value = parsedate_to_datetime(response.headers['date'])
                 offset = (value - (before + (after-before)/2)).total_seconds()
-                if response.status_code == 200 and abs(offset) <= 600 and (after-before).total_seconds() < 3:
+                if response.status_code == 200 and abs(offset) <= 600:
                     return offset
             except (httpx.HTTPError, KeyError, ValueError, TypeError):
                 return None
+        before, started = datetime.now(CN_TZ), time.monotonic()
         offsets = [v for v in await asyncio.gather(sample('https://qt.gtimg.cn/q=sh600519'),
                     sample('https://www.sse.com.cn/')) if v is not None]
-        if len(offsets) == 2 and max(offsets) - min(offsets) < 3:
+        if len(offsets) == 1:
+            backup = await sample('https://www.szse.cn/index/index.html')
+            if backup is not None:
+                offsets.append(backup)
+        clock_jump = abs((datetime.now(CN_TZ) - before).total_seconds() - (time.monotonic() - started))
+        if len(offsets) == 2 and max(offsets) - min(offsets) < 3 and clock_jump <= 1:
             self.reference_clock_offset = sum(offsets) / 2
             return self.reference_clock_offset
         return None

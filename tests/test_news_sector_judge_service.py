@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+from pymongo.results import UpdateResult
+
 from app.models import News, NewsSectorLLMAnalysis
 from app.services import NewsSectorJudgeService
 
@@ -26,25 +28,29 @@ class FakeNewsRepository:
     async def create_indexes(self) -> None:
         return None
 
-    async def claim_next_sector_judge_news(self) -> News | None:
+    async def claim_next_sector_judge_news(self, *, oldest_first: bool = False) -> News | None:
         if not self.rows:
             return None
 
-        return self.rows.pop(0)
+        return self.rows.pop(-1 if oldest_first else 0)
 
     async def mark_sector_judge_success(
         self,
         event_id: str,
         analysis: list[NewsSectorLLMAnalysis],
-    ) -> None:
+        *, claim_id: str | None = None,
+    ) -> UpdateResult:
         self.success_updates.append((event_id, analysis))
+        return UpdateResult({"n": 1}, acknowledged=True)
 
     async def mark_sector_judge_failed(
         self,
         event_id: str,
         reason: str,
-    ) -> None:
+        *, claim_id: str | None = None,
+    ) -> UpdateResult:
         self.failed_updates.append((event_id, reason))
+        return UpdateResult({"n": 1}, acknowledged=True)
 
 
 class FakeAnalyzer:
@@ -134,3 +140,10 @@ def test_news_sector_judge_service_process_batch_stops_when_no_pending() -> None
     assert result.success_count == 2
     assert result.failed_count == 0
     assert [item[0] for item in repo.success_updates] == ["news-1", "news-2"]
+
+
+def test_fifth_claim_serves_oldest_waiting_news():
+    repo = FakeNewsRepository([build_news(str(n)) for n in range(8)])
+    service = NewsSectorJudgeService(news_repository=repo, analyzer=FakeAnalyzer())
+    asyncio.run(service.process_batch(batch_size=5))
+    assert [item[0] for item in repo.success_updates] == ['0', '1', '2', '3', '7']

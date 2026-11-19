@@ -118,10 +118,11 @@ async def resume_realtime_minute_job() -> None:
 async def repair_realtime_minutes_job() -> None:
     """Repair completed-day missing keys using native THS actual-price bars.
 
-    HTTP and synchronous Mongo work run off the scheduler event loop. An
-    interrupted run resumes its checkpoints; unresolved source gaps remain.
+    A separate process releases inventory/HTTP allocations after each run. An
+    interrupted run resumes from the remaining Mongo gaps.
     """
-    from app.manually_execute_script.repair_realtime_minutes_ths import run
+    import sys
+    from pathlib import Path
     from app.services.stock_daily_detail_service import resolve_a_stock_target_trade_date
 
     now = datetime.now(CN_TZ)
@@ -131,11 +132,28 @@ async def repair_realtime_minutes_job() -> None:
     # run. Late-arriving daily universes must enter a new inventory as well.
     end = reference.target_trade_date
     start = (datetime.fromisoformat(end).date() - timedelta(days=14)).isoformat()
-    result = await asyncio.to_thread(
-        run, start=start, end=end,
-        output=f".local/realtime_minute_repair/rolling_{day}", apply=True, workers=4,
-    )
-    logger.info("realtime_minute_repair_finished %s", result)
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, '-u', '-m', 'app.manually_execute_script.repair_realtime_minutes_ths',
+        '--start', start, '--end', end, '--output', f'.local/realtime_minute_repair/rolling_{day}',
+        '--apply', '--workers', '4', cwd=str(Path(__file__).resolve().parents[2]),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=7200)
+    except (TimeoutError, asyncio.CancelledError):
+        if process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=10)
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+        raise
+    if process.returncode:
+        logger.error('realtime_minute_repair_failed %s', stderr.decode(errors='replace')[-2000:])
+        raise RuntimeError(f'minute repair exited with status {process.returncode}')
+    logger.info("realtime_minute_repair_finished %s", stdout.decode(errors='replace')[-2000:])
+    from app.scheduler.quant_jobs import recover_completed_quant_job
+    await recover_completed_quant_job()
 
 
 async def ensure_news_indexes() -> None:
@@ -736,5 +754,7 @@ def register_crawler_jobs(
     register_realtime_minute_jobs(scheduler)
     from app.scheduler.market_observation_jobs import register_market_observation_jobs
     register_market_observation_jobs(scheduler)
+    from app.scheduler.fund_flow_jobs import register_fund_flow_jobs
+    register_fund_flow_jobs(scheduler)
     from app.scheduler.realtime_snapshot_retention_jobs import register_realtime_snapshot_retention_job
     register_realtime_snapshot_retention_job(scheduler)

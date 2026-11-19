@@ -1,4 +1,4 @@
-"""Atomic complete snapshots. Failed fetches never replace a successful result."""
+"""Atomic observations with explicit coverage; failed fetches never replace data."""
 from datetime import datetime
 
 from app.crawlers.realtime_market_crawler import CN_TZ
@@ -6,7 +6,9 @@ from app.repositories.base import BaseMongoRepository
 
 HOT_COLLECTION = "stock_ths_hot_rank_snapshots"
 BILLBOARD_COLLECTION = "stock_billboard_daily"
+FUND_FLOW_COLLECTION = "stock_fund_flow_snapshots"
 RUN_COLLECTION = "market_observation_runs"
+COLLECTIONS = {"hot": HOT_COLLECTION, "billboard": BILLBOARD_COLLECTION}
 
 
 class MarketObservationRepository(BaseMongoRepository):
@@ -20,11 +22,11 @@ class MarketObservationRepository(BaseMongoRepository):
         await self.database[RUN_COLLECTION].create_index([("kind", 1), ("finished_at", -1)])
 
     async def exists_snapshot(self, kind, identity):
-        name = HOT_COLLECTION if kind == "hot" else BILLBOARD_COLLECTION
+        name = COLLECTIONS[kind]
         return await self.database[name].find_one({"_id": identity}, {"_id": 1}) is not None
 
     async def save(self, kind, identity, document):
-        name = HOT_COLLECTION if kind == "hot" else BILLBOARD_COLLECTION
+        name = COLLECTIONS[kind]
         # One immutable snapshot per five-minute slot / daily collection.
         await self.database[name].update_one({"_id": identity}, {"$setOnInsert": document}, upsert=True)
 

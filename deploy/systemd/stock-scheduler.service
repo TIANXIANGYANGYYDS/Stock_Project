@@ -1,0 +1,29 @@
+[Unit]
+Description=Stock Project scheduler
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=forking
+WorkingDirectory=%h/Agent_first/Stock_Project
+PIDFile=%h/Agent_first/Stock_Project/.local/run/scheduler.pid
+ExecStart=%h/Agent_first/Stock_Project/.local/bin/start_scheduler.sh
+Environment=MALLOC_ARENA_MAX=2
+Environment=STOCK_SYSTEMD_LAUNCH=1
+MemoryAccounting=yes
+# A low MemoryHigh throttled the event loop for days without killing it.
+# Keep a hard bound and restart on OOM instead of entering reclaim starvation.
+MemoryHigh=infinity
+MemoryMax=4G
+MemorySwapMax=256M
+OOMPolicy=kill
+Restart=on-failure
+RestartSec=30
+NotifyAccess=all
+WatchdogSec=120
+TimeoutStartSec=90
+TimeoutStopSec=40
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

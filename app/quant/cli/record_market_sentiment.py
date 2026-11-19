@@ -15,9 +15,9 @@ from app.services.market_sentiment_service import backfill, sync_daily
 
 
 @contextmanager
-def recording_lock():
+def recording_lock(path=None):
     """当前单机调度用文件锁串行写入；进程退出即释放，无租约或状态表。"""
-    path = Path(__file__).resolve().parents[3] / ".local/market_sentiment/record.lock"
+    path = Path(path) if path is not None else Path(__file__).resolve().parents[3] / ".local/market_sentiment/record.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as stream:
         try:

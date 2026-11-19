@@ -214,3 +214,113 @@ curl http://127.0.0.1:8100/openapi.json
 ```
 
 完整查询路径和参数见 [docs/API.md](docs/API.md)。
+
+## 13. 持久服务、心跳与故障恢复
+
+2026-11-02 起，本机 scheduler 与查询 API 使用用户级 systemd 服务，模板位于
+`deploy/systemd/`。安装到 `~/.config/systemd/user/` 后执行 `systemctl --user daemon-reload`
+及 `systemctl --user enable --now stock-scheduler stock-query-api stock-quote-chart.timer`。模板使用本机
+`~/Agent_first/Stock_Project` 和 `~/miniconda3/envs/MyAgent/bin/python`；其他机器先调整路径。
+需要开机且未登录时运行，应确认该用户已开启 linger。
+
+日常管理：
+
+```bash
+systemctl --user status stock-scheduler stock-query-api
+systemctl --user restart stock-scheduler
+systemctl --user restart stock-query-api
+curl -fsS http://127.0.0.1:8100/api/v1/health/ready
+```
+
+个股图表索引由 `stock-quote-chart.timer` 调用独立的低优先级任务生成。每个五分钟区间结束后按股票生成图表块，初次部署先处理最新交易日，再补齐原始数据保留期。用 `journalctl --user -u stock-quote-chart.service` 查看进度。查询会逐批核对原始索引，尚未生成的区间和迟到补写的批次可直接读取原报价。
+
+本机 `.local/bin/{start,stop,restart}_scheduler.sh` 已转交 systemd，避免手工启动绕过
+监督机制。非交互环境若找不到用户总线，设置 `XDG_RUNTIME_DIR=/run/user/$(id -u)` 和
+`DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus`。服务子进程通过
+`STOCK_SYSTEMD_LAUNCH=1` 调用底层启动脚本，防止递归调用 systemd。
+
+服务器校时后，重启 `stock-scheduler` 与 `stock-query-api`，清除进程内旧时间偏移并
+按当前时间重新注册任务。调度器明确使用 `Asia/Shanghai`，不依赖启动环境的本地时区。
+应用的双来源 HTTP 时间校验继续保留：共用的五分钟偏移缓存同时比较系统时间与单调
+时钟，检测到超过一秒的跳变立即失效并重新校验；校验请求期间若发生时间跳变则拒绝
+该样本。分钟采集在每个交易时段开始时重新校验，盘中主动校时后仍须重启调度器以
+清除该时段的偏移。历史记录中的 `clock_offset_seconds` 是当时的采集证据，不能清零。
+启动时先暂停执行、移除已被五秒采集替代的旧 `stock_fund_flow_5m` 任务，再恢复调度，
+避免 MongoDB job store 中的旧定义在重启后继续报错。
+
+Scheduler 的事件循环每 5 秒原子更新 `.local/run/scheduler_heartbeat.json` 并通知
+systemd。120 秒未收到心跳时，由 systemd 终止整个服务进程组并按失败策略重启。
+分钟历史修复改为独立子进程，取消或超时会终止子进程，完成后释放全市场清单占用的内存。
+短线情绪引擎在建立归一化历史后释放原始日线输入，并在恢复当前日检查点后释放前日快照。
+
+本次故障中 `MemoryHigh=2.5G` 导致进程持续回收和限流，进程没有退出，`Restart=on-failure`
+无法起效。现在不使用软限流，保留 scheduler 4 GiB、API 2 GiB 的硬限制和各自
+256 MiB 的 swap 限制；OOM 或无心跳触发恢复。`MALLOC_ARENA_MAX=2` 限制线程分配器的
+内存保留。调整上限前应测量峰值并检查主机可用内存，不能取消硬上限来掩盖增长。
+
+`/api/v1/health` 保留原有 API/Mongo 连通性契约；新增 `/api/v1/health/ready` 检查
+调度器心跳以及最近应完成交易日的日线、量化收盘状态和全 A 股情绪定稿。北京时间
+19:00 前检查前一交易日，之后检查当日（休市日取最近交易日）。数据或心跳未就绪返回
+HTTP 503 和具体检查结果，不能只用旧健康接口判断业务恢复。
+日线须有最近全市场同步成功记录。量化记录保留 `closed_partial` 的真实状态；只有缺口
+全部得到当日原始来源明确停牌、且无成交量额的证据支持时，健康检查才将这些代码列为
+`verified_suspended_codes` 并允许就绪，未知缺口仍返回 503。
+
+分钟缺口修复按交易日历枚举日期，因此整天没有日线和分钟记录的交易日也会进入检查。
+历史补录只插入真实来源的缺失行情，保留实际取回时间；缺少北交所历史收盘报价的全 A 股
+情绪日不能凭分钟收盘价伪造限价或证券状态，仍须保留缺口。事后重建的盘前报告须标记
+`historical_reconstruction`、实际计算时间及输入不足，不作为当时实时生成的报告。
+
+午后分钟采集允许在校准后的开盘时间前 10 分钟准备，优先读取数据库中的股票清单，
+公开清单在后台更新，避免慢请求占用开盘首分钟。断点恢复查询按时间和周期分组；
+查询超时保留已归档行情，恢复成功后按原始行情时间聚合，避免丢掉 13:00 的观测。
+暂存队列有内存上限，持续数据库故障造成的溢出会记录错误，仍须依靠真实历史分钟补齐。
+
+已关闭的量化日保持实时计算入口幂等。分钟补数成功后、调度器启动时，以及交易日
+16:15–22:15 每小时，独立进程检查最近 5 个交易日中是否有可恢复的 `closed_partial`。
+发现真实分钟和昨收参考价补齐后，从最早受影响日连续重算所有后续已保存交易日；
+有盘中账本或日线同步未成功时暂缓。首日保留冻结的开盘输入，后续日期基于修正后的
+资金、持仓、退出状态和待执行信号重新建账，不会只替换某一天造成账户断链。
+重算结果标记 `historical_replay`、实际计算时间和 `minute_backfill` 恢复原因。
+逐日重复重放、账户连续性和资金核对通过后，校验正式数据没有并发变化，再原子替换结果集合。
+停牌或仍缺少真实来源的代码继续保留不完整标记，不合成价格。
+
+手工恢复已结束交易日（省略 `--apply` 只生成暂存结果和校验报告）：
+
+```bash
+python -m app.quant.cli.recover_partial_days \
+  --start-date 2026-11-03 --end-date 2026-11-05 --apply
+```
+
+默认审计目录为 `.local/quant_recovery/<运行时间及标识>/`，包含受影响日期原始结果备份、
+恢复后结果、前序账本、源数据摘要和 `report.json`。恢复进程采用文件锁，避免重复执行。
+
+## 14. 固定五秒资金流向与独立日档
+
+资金采集由 `stock_fund_flow_5s` 每 5 秒调度，使用校准时间与 A 股交易日历，
+覆盖 09:30–11:30 和 13:00–15:00（收尾容许 5 秒）。09:25、12:55 起预热股票清单，
+盘中每小时后台刷新清单，避免辅助查询阻塞采集。使用现有代理配置建立 2 个 IP 的池，
+每个 IP 最多 2 个在途请求、全局最多 4 并发和每秒 4 个请求，每批最多 500 只。
+秒级轮次的网络预算为 4 秒，不在同一轮重试；保留完成批次并标记超时缺口。
+
+某轮超时后，下一轮按已返回的批次数轮换起始股票。排查覆盖率时，先看
+`missing_count`（未收到报价的股票数），再看 `unusable_count`（已收到但质量检查未通过的股票数）。
+`response_complete` 表示已收到全部请求代码，`complete` 还要求每只股票的报价均可用。
+定时采样返回 `spooled: true` 表示本地暂存文件已持久化，后台写库成功后才移除文件。
+
+频率固定，不自动降到分钟级；同一任务不重叠、不积压补跑。主机可用内存低于
+总量 15% 或 2 GiB（取较大值）、一分钟负载达到 CPU 数的 80% 时，当前轮明确记为
+`missed`，下一个调度点仍为 5 秒。这是资源紧急保护，不能把漏采视为完整数据。
+`market_observation_runs` 按日累计失败/部分成功/漏采次数并保存最近异常原因。
+
+`stock_fund_flow_snapshots` 按股票代码尾数分块压缩，单股查询只读取相应分块。
+写入前在 `.local/fund_flow_spool/` 持久暂存，数据库恢复后幂等回放；原始库与暂存
+均沿用股票快照的 5 个交易日保留规则。`fund_flow_retention` 每小时分批清理原始库，
+保留窗口截至最近实际采到的交易日，不会删除 `stock_fund_flow_daily`。
+
+`stock_fund_flow_daily` 从 15:05:20 开始独立采集，每 15 分钟重试至 23:50:20，
+已有完整日档时跳过。每股每天每来源唯一，缺失时仅补缺口；保存当天收盘后累计净额，
+不累加盘中值。启动时也检查日档；跨日恢复只可使用该日实际盘后快照，不使用今日数据
+冒充历史。来源没有独立资金统计时间，日档明确为盘后观察值。
+
+手工采集和诊断见 [资金流向接入记录](docs/资金流向与DDE数据接入_20261106.md)。

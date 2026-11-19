@@ -1,7 +1,7 @@
 """Recovery from partial Mongo writes must preserve real observations exactly once."""
 import asyncio
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -57,6 +57,171 @@ class PartialRepository:
 def quote(minute=30, second=5, volume=1000, price=10.):
     return service_quote(price=price, volume=volume, amount=volume*price,
                          received_at=datetime(2026, 9, 16, 9, minute, second, tzinfo=CN_TZ))
+
+
+def test_bounded_minute_flush_resumes_all_unwritten_symbols(monkeypatch):
+    monkeypatch.setattr(module, 'REALTIME_PERSIST_STOCK_BATCH_SIZE', 1)
+    async def run():
+        service = RealtimeMinuteService()
+        service.repository = PartialRepository()
+        try:
+            for minute in (30, 31):
+                for i in range(6):
+                    service._ingest_quote(replace(quote(minute=minute), code=f'{i:06d}'))
+            cutoff = '2026-09-16T09:31:00+08:00'
+            await service._flush_before(cutoff, per_symbol=True, next_poll=0.)
+            assert sum(k[1] < cutoff for k in service._bars) == 3
+            await service._flush_before(cutoff, per_symbol=True, next_poll=0.)
+            assert all(k[1] == cutoff for k in service._bars)
+            await service._flush_before(None, force=True)
+            assert len([k for k in service.repository.rows if k[1] == '1m']) == 12
+        finally:
+            await service.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('error', [TimeoutError, AutoReconnect])
+def test_resume_failure_preserves_afternoon_first_minute_and_volume(error):
+    async def run():
+        service = RealtimeMinuteService()
+        repo = PartialRepository()
+        service.repository = repo
+        original = repo.find_bar_keys
+        requests = []
+
+        async def interrupted(keys):
+            requests.append(keys)
+            if len(requests) == 1:
+                raise error('temporary read failure')
+            return await original(keys)
+
+        repo.find_bar_keys = interrupted
+        first_at = datetime(2026, 9, 16, 13, 0, 5, tzinfo=CN_TZ)
+        first = service_quote(price=10, volume=1000, amount=10000, received_at=first_at)
+        later = replace(first, market_data_time=first_at + timedelta(minutes=1),
+                        received_at=first_at + timedelta(minutes=1), volume=1400, amount=14000)
+        try:
+            assert await service._quotes_after_resume([first], first_at, time(13), time(15)) == []
+            ready = await service._quotes_after_resume([later], later.received_at, time(13), time(15))
+            assert ready == [first, later]
+            assert requests[1] == requests[0]  # Restore the earliest deferred minute.
+            for item in ready:
+                service._ingest_quote(item)
+            await service._flush_before(None, force=True)
+            bars = sorted((r for r in repo.rows.values() if r['interval'] == '1m'),
+                          key=lambda r: r['timestamp'])
+            assert [b['timestamp'][11:16] for b in bars] == ['13:00', '13:01']
+            assert bars[0]['first_seen_at'] == first_at
+            assert sum(b['volume'] for b in bars) == 400
+            assert not service._deferred_resume_quotes
+        finally:
+            await service.close()
+    asyncio.run(run())
+
+
+def test_resume_partial_success_does_not_delay_or_repeat_restored_symbols(monkeypatch):
+    monkeypatch.setattr(module, 'REALTIME_PERSIST_STOCK_BATCH_SIZE', 1)
+
+    async def run():
+        service = RealtimeMinuteService()
+        repo = PartialRepository()
+        service.repository = repo
+        calls = []
+
+        async def read(keys):
+            calls.append(keys[0]['code'])
+            if len(calls) == 2:
+                raise TimeoutError()
+            return []
+
+        repo.find_bar_keys = read
+        first, second = quote(), replace(quote(), code='000002')
+        try:
+            assert await service._quotes_after_resume([first, second], first.received_at,
+                                                      time(9, 30), time(11, 30)) == [first]
+            assert await service._quotes_after_resume([], first.received_at,
+                                                      time(9, 30), time(11, 30)) == [second]
+            assert calls == ['000001', '000002', '000002']
+        finally:
+            await service.close()
+    asyncio.run(run())
+
+
+def test_grouped_resume_query_preserves_exact_key_membership():
+    from app.repositories.realtime_minute_bar_repository import RealtimeMinuteBarRepository
+    from tests.api.conftest import matches
+    keys = [dict(code='000001', interval='1m', timestamp='13:00'),
+            dict(code='000002', interval='1m', timestamp='13:00'),
+            dict(code='000003', interval='1m', timestamp='13:01')]
+    rows = keys + [dict(code='000003', interval='1m', timestamp='13:00'),
+                   dict(code='000001', interval='5m', timestamp='13:00')]
+
+    class Collection:
+        def find(self, query, projection):
+            assert len(query['$or']) == 2
+            selected = [row for row in rows if matches(row, query)]
+            async def to_list(length): return selected[:length]
+            return SimpleNamespace(hint=lambda _: SimpleNamespace(to_list=to_list))
+
+    repo = RealtimeMinuteBarRepository.__new__(RealtimeMinuteBarRepository)
+    repo.collection = Collection()
+    assert asyncio.run(repo.find_bar_keys(keys)) == keys
+
+
+def test_afternoon_preparation_accepts_fast_host_clock_and_slow_universe(monkeypatch):
+    current = datetime(2026, 9, 16, 13, 0, tzinfo=CN_TZ)
+    offset = timedelta(seconds=347)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None): return current
+
+    async def trade_day(_):
+        return SimpleNamespace(is_reference_trade_day=True, reference_trade_date='2026-09-16')
+
+    async def sleep(seconds):
+        nonlocal current
+        current += timedelta(seconds=seconds)
+
+    monkeypatch.setattr(module, 'datetime', Clock)
+    monkeypatch.setattr(module, 'resolve_a_stock_target_trade_date', trade_day)
+    monkeypatch.setattr(module.asyncio, 'sleep', sleep)
+
+    async def run():
+        service = RealtimeMinuteService()
+        repo = PartialRepository()
+        service.repository = repo
+        calls = []
+        async def noop(*args, **kwargs): pass
+        service.snapshots = SimpleNamespace(create_indexes=noop, replay_pending=noop, save_cycle=noop)
+        await service.crawler.close()
+
+        class Crawler:
+            async def clock_offset(self): return -347
+            async def close(self): pass
+            async def fetch_quotes(self, codes):
+                nonlocal current
+                at = current - offset
+                calls.append(at)
+                item = service_quote(price=10, volume=1000, amount=10000, received_at=at)
+                current = current.replace(hour=15, minute=12)
+                return [item], dict(requested=1, returned=1, requests=1, fallback_batches=0,
+                                    failed_batches=0, elapsed_ms=1)
+
+        service.crawler = Crawler()
+        async def universe(_, *, refresh_public=True):
+            if refresh_public:
+                await asyncio.Event().wait()  # Public API can hang without delaying capture.
+            return [{'code': '000001', 'name': 'test'}]
+        service._load_universe = universe
+        try:
+            result = await service.run_session('afternoon')
+            assert result['status'] == 'completed'
+            assert calls[0].strftime('%H:%M:%S') == '13:00:00'
+            assert ('000001', '1m', '2026-09-16T13:00:00+08:00') in repo.rows
+        finally:
+            await service.close()
+    asyncio.run(run())
 
 
 def test_partial_write_retries_identical_payload_without_double_aggregation(monkeypatch):
@@ -196,7 +361,7 @@ def test_session_continues_polling_after_transient_write_retries_exhaust(monkeyp
                 return [q],dict(requested=1,returned=1,requests=1,fallback_batches=0,failed_batches=0,elapsed_ms=1)
             async def close(self):pass
         service.crawler=Crawler()
-        async def universe(_):return [{'code':'000001','name':'test'}]
+        async def universe(_, **kwargs):return [{'code':'000001','name':'test'}]
         service._load_universe=universe
         try:
             result=await service.run_session('morning')

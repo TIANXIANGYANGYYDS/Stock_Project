@@ -1,0 +1,970 @@
+[
+  {
+    "key": "ret_1",
+    "label": "前1日涨跌幅(%)",
+    "family": "涨跌与趋势",
+    "formula": "100 × (近1条日线(1+pct_chg/100)连乘 - 1)",
+    "role": "cross_section",
+    "notes": "当前滚动按股票记录行；停牌/缺行时未必等于连续市场交易日，新区间须统一窗口政策"
+  },
+  {
+    "key": "ret_3",
+    "label": "前3日涨跌幅(%)",
+    "family": "涨跌与趋势",
+    "formula": "100 × (近3条日线(1+pct_chg/100)连乘 - 1)",
+    "role": "cross_section",
+    "notes": "当前滚动按股票记录行；停牌/缺行时未必等于连续市场交易日，新区间须统一窗口政策"
+  },
+  {
+    "key": "ret_5",
+    "label": "前5日涨跌幅(%)",
+    "family": "涨跌与趋势",
+    "formula": "100 × (近5条日线(1+pct_chg/100)连乘 - 1)",
+    "role": "cross_section",
+    "notes": "当前滚动按股票记录行；停牌/缺行时未必等于连续市场交易日，新区间须统一窗口政策"
+  },
+  {
+    "key": "ret_10",
+    "label": "前10日涨跌幅(%)",
+    "family": "涨跌与趋势",
+    "formula": "100 × (近10条日线(1+pct_chg/100)连乘 - 1)",
+    "role": "cross_section",
+    "notes": "当前滚动按股票记录行；停牌/缺行时未必等于连续市场交易日，新区间须统一窗口政策"
+  },
+  {
+    "key": "ret_20",
+    "label": "前20日涨跌幅(%)",
+    "family": "涨跌与趋势",
+    "formula": "100 × (近20条日线(1+pct_chg/100)连乘 - 1)",
+    "role": "cross_section",
+    "notes": "当前滚动按股票记录行；停牌/缺行时未必等于连续市场交易日，新区间须统一窗口政策"
+  },
+  {
+    "key": "ret_60",
+    "label": "前60日涨跌幅(%)",
+    "family": "涨跌与趋势",
+    "formula": "100 × (近60条日线(1+pct_chg/100)连乘 - 1)",
+    "role": "cross_section",
+    "notes": "当前滚动按股票记录行；停牌/缺行时未必等于连续市场交易日，新区间须统一窗口政策"
+  },
+  {
+    "key": "ma_distance_5",
+    "label": "距MA5(%)",
+    "family": "涨跌与趋势",
+    "formula": "100 × (收盘/MA5 - 1)",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "ma_distance_10",
+    "label": "距MA10(%)",
+    "family": "涨跌与趋势",
+    "formula": "100 × (收盘/MA10 - 1)",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "ma_distance_20",
+    "label": "距MA20(%)",
+    "family": "涨跌与趋势",
+    "formula": "100 × (收盘/MA20 - 1)",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "ma_distance_60",
+    "label": "距MA60(%)",
+    "family": "涨跌与趋势",
+    "formula": "100 × (收盘/MA60 - 1)",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "ma_distance_120",
+    "label": "距MA120（收益链重算，%）",
+    "family": "涨跌与趋势",
+    "formula": "100 × (收益链价格/其120条日线均值 - 1)；固定预热起点2025-11-05",
+    "role": "cross_section",
+    "notes": "源字段为空，上轮研究另算；ATR初始化与老引擎natr_14不同，不能直接互换"
+  },
+  {
+    "key": "volatility_5",
+    "label": "5日涨跌波动(百分点)",
+    "family": "波动与风险",
+    "formula": "近5条日线涨跌幅百分数的样本标准差(ddof=1)，单位百分点",
+    "role": "cross_section",
+    "notes": "当前滚动按股票记录行；停牌/缺行时未必等于连续市场交易日，新区间须统一窗口政策"
+  },
+  {
+    "key": "volatility_20",
+    "label": "20日涨跌波动(百分点)",
+    "family": "波动与风险",
+    "formula": "近20条日线涨跌幅百分数的样本标准差(ddof=1)，单位百分点",
+    "role": "cross_section",
+    "notes": "当前滚动按股票记录行；停牌/缺行时未必等于连续市场交易日，新区间须统一窗口政策"
+  },
+  {
+    "key": "volatility_60",
+    "label": "60日涨跌波动(百分点)",
+    "family": "波动与风险",
+    "formula": "近60条日线涨跌幅百分数的样本标准差(ddof=1)，单位百分点",
+    "role": "cross_section",
+    "notes": "当前滚动按股票记录行；停牌/缺行时未必等于连续市场交易日，新区间须统一窗口政策"
+  },
+  {
+    "key": "turnover_1",
+    "label": "1日平均换手率(%)",
+    "family": "成交与流动性",
+    "formula": "近1条日线 turnover_pct 的算术均值，单位%",
+    "role": "cross_section",
+    "notes": "当前滚动按股票记录行；停牌/缺行时未必等于连续市场交易日，新区间须统一窗口政策"
+  },
+  {
+    "key": "turnover_5",
+    "label": "5日平均换手率(%)",
+    "family": "成交与流动性",
+    "formula": "近5条日线 turnover_pct 的算术均值，单位%",
+    "role": "cross_section",
+    "notes": "当前滚动按股票记录行；停牌/缺行时未必等于连续市场交易日，新区间须统一窗口政策"
+  },
+  {
+    "key": "turnover_20",
+    "label": "20日平均换手率(%)",
+    "family": "成交与流动性",
+    "formula": "近20条日线 turnover_pct 的算术均值，单位%",
+    "role": "cross_section",
+    "notes": "当前滚动按股票记录行；停牌/缺行时未必等于连续市场交易日，新区间须统一窗口政策"
+  },
+  {
+    "key": "amount20_log",
+    "label": "20日均成交额对数",
+    "family": "成交与流动性",
+    "formula": "ln(1 + 最近20条日线成交额均值)，成交额单位元",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "amount_log",
+    "label": "当日成交额对数",
+    "family": "成交与流动性",
+    "formula": "ln(1 + 当日成交额)，成交额单位元",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "volume_ratio",
+    "label": "5/20日均量比",
+    "family": "成交与流动性",
+    "formula": "近5条日线成交量均值 / 近20条日线成交量均值",
+    "role": "cross_section",
+    "notes": "当前滚动按股票记录行；停牌/缺行时未必等于连续市场交易日，新区间须统一窗口政策"
+  },
+  {
+    "key": "turnover_ratio",
+    "label": "1/20日换手比",
+    "family": "成交与流动性",
+    "formula": "当日换手率 / 包含当日在内的近20条日线平均换手率",
+    "role": "cross_section",
+    "notes": "当前滚动按股票记录行；停牌/缺行时未必等于连续市场交易日，新区间须统一窗口政策"
+  },
+  {
+    "key": "positive_days5",
+    "label": "近5日上涨天数",
+    "family": "涨跌与趋势",
+    "formula": "近5条日线涨跌幅>0的天数",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "drawdown20",
+    "label": "距20日最高收盘回撤(%)",
+    "family": "波动与风险",
+    "formula": "100 × (收益链价格 / 近20条日线最高收益链收盘价 - 1)",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "gap_pct",
+    "label": "前日跳空幅度(%)",
+    "family": "蜡烛形态",
+    "formula": "100 × (开盘 / 当日参考前收盘 - 1)；参考前收盘=收盘/(1+涨跌幅/100)",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "candle_return",
+    "label": "前日开收涨跌(%)",
+    "family": "蜡烛形态",
+    "formula": "100 × (收盘/开盘 - 1)",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "close_position",
+    "label": "前日收盘在日内区间的位置",
+    "family": "蜡烛形态",
+    "formula": "(收盘-最低)/(最高-最低)；零振幅记缺失",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "upper_shadow",
+    "label": "前日上影线(%)",
+    "family": "蜡烛形态",
+    "formula": "100 × (最高-max(开盘,收盘))/当日参考前收盘",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "lower_shadow",
+    "label": "前日下影线(%)",
+    "family": "蜡烛形态",
+    "formula": "100 × (min(开盘,收盘)-最低)/当日参考前收盘",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "amplitude",
+    "label": "前日振幅(%)",
+    "family": "蜡烛形态",
+    "formula": "来源日线 amplitude_pct，单位%",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "macd_dif_pct",
+    "label": "日线DIF/价格(%)",
+    "family": "MACD与振荡指标",
+    "formula": "100 × 来源日线DIF/收盘；来源MACD参数12/26/9",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "macd_hist_pct",
+    "label": "日线MACD柱/价格(%)",
+    "family": "MACD与振荡指标",
+    "formula": "100 × 来源日线MACD柱/收盘；来源MACD参数12/26/9",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "macd_hist_delta",
+    "label": "日线MACD柱变化/价格(%)",
+    "family": "MACD与振荡指标",
+    "formula": "100 × (当前日线MACD柱-上一条日线MACD柱)/当前收盘",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "boll_position",
+    "label": "布林带区间位置",
+    "family": "MACD与振荡指标",
+    "formula": "(收盘-布林下轨)/(布林上轨-布林下轨)",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "boll_width",
+    "label": "布林带宽度(%)",
+    "family": "波动与风险",
+    "formula": "100 × (布林上轨-下轨)/中轨",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "atr_pct",
+    "label": "ATR14重算/价格(%)",
+    "family": "波动与风险",
+    "formula": "收益链标准化OHLC计算Wilder ATR14 / 标准化收盘 ×100；首14条TR均值初始化",
+    "role": "cross_section",
+    "notes": "源字段为空，上轮研究另算；ATR初始化与老引擎natr_14不同，不能直接互换"
+  },
+  {
+    "key": "chip_profit",
+    "label": "获利筹码比例(%)",
+    "family": "筹码分布",
+    "formula": "来源 chip.profit_ratio ×100",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "chip_cost_distance",
+    "label": "价格距平均筹码成本(%)",
+    "family": "筹码分布",
+    "formula": "100 × (收盘/平均筹码成本 - 1)",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "chip_concentration90",
+    "label": "90%筹码集中度(%)",
+    "family": "筹码分布",
+    "formula": "来源90%筹码集中度 ×100",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "chip_concentration70",
+    "label": "70%筹码集中度(%)",
+    "family": "筹码分布",
+    "formula": "来源70%筹码集中度 ×100",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "relative_return20",
+    "label": "20日相对同板块强弱(百分点)",
+    "family": "涨跌与趋势",
+    "formula": "本股20日涨跌幅 - 同日同交易板块其他股票20日涨跌幅均值",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "rsi_rsi6",
+    "label": "RSI6",
+    "family": "MACD与振荡指标",
+    "formula": "直接使用 stock_daily_detail.rsi.rsi6；0—100类数值按源口径保留",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "rsi_rsi12",
+    "label": "RSI12",
+    "family": "MACD与振荡指标",
+    "formula": "直接使用 stock_daily_detail.rsi.rsi12；0—100类数值按源口径保留",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "rsi_rsi24",
+    "label": "RSI24",
+    "family": "MACD与振荡指标",
+    "formula": "直接使用 stock_daily_detail.rsi.rsi24；0—100类数值按源口径保留",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "kdj_k",
+    "label": "KDJ-K",
+    "family": "MACD与振荡指标",
+    "formula": "直接使用 stock_daily_detail.kdj.k；0—100类数值按源口径保留",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "kdj_d",
+    "label": "KDJ-D",
+    "family": "MACD与振荡指标",
+    "formula": "直接使用 stock_daily_detail.kdj.d；0—100类数值按源口径保留",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "kdj_j",
+    "label": "KDJ-J",
+    "family": "MACD与振荡指标",
+    "formula": "直接使用 stock_daily_detail.kdj.j；0—100类数值按源口径保留",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "cci_cci14",
+    "label": "CCI14",
+    "family": "MACD与振荡指标",
+    "formula": "直接使用 stock_daily_detail.cci.cci14；0—100类数值按源口径保留",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "wr_wr6",
+    "label": "WR6",
+    "family": "MACD与振荡指标",
+    "formula": "直接使用 stock_daily_detail.wr.wr6；0—100类数值按源口径保留",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "wr_wr10",
+    "label": "WR10",
+    "family": "MACD与振荡指标",
+    "formula": "直接使用 stock_daily_detail.wr.wr10；0—100类数值按源口径保留",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "main_strength",
+    "label": "主力强度(%)",
+    "family": "资金流",
+    "formula": "100 × 主力净流入元 / 成交额元",
+    "role": "cross_section",
+    "notes": "资金源覆盖受上轮8月19日固定股票池限制；新研究需按6月30日历史池重核"
+  },
+  {
+    "key": "main_strength5",
+    "label": "近5日主力净流入/成交额(%)",
+    "family": "资金流",
+    "formula": "100 × 近5条有效日线主力净流入合计 / 同期成交额合计",
+    "role": "cross_section",
+    "notes": "资金源覆盖受上轮8月19日固定股票池限制；新研究需按6月30日历史池重核；当前滚动按股票记录行；停牌/缺行时未必等于连续市场交易日，新区间须统一窗口政策"
+  },
+  {
+    "key": "main_strength20",
+    "label": "近20日主力净流入/成交额(%)",
+    "family": "资金流",
+    "formula": "100 × 近20条有效日线主力净流入合计 / 同期成交额合计",
+    "role": "cross_section",
+    "notes": "资金源覆盖受上轮8月19日固定股票池限制；新研究需按6月30日历史池重核；当前滚动按股票记录行；停牌/缺行时未必等于连续市场交易日，新区间须统一窗口政策"
+  },
+  {
+    "key": "main_net_yi",
+    "label": "主力净流入(亿元)",
+    "family": "资金流",
+    "formula": "主力净流入元 / 1亿",
+    "role": "cross_section",
+    "notes": "资金源覆盖受上轮8月19日固定股票池限制；新研究需按6月30日历史池重核"
+  },
+  {
+    "key": "main_net5_yi",
+    "label": "近5日主力净流入(亿元)",
+    "family": "资金流",
+    "formula": "近5条有效日线主力净流入合计元 / 1亿",
+    "role": "cross_section",
+    "notes": "资金源覆盖受上轮8月19日固定股票池限制；新研究需按6月30日历史池重核"
+  },
+  {
+    "key": "main_positive_days5",
+    "label": "近5日主力净流入为正天数",
+    "family": "资金流",
+    "formula": "近5条资金记录主力净流入>0的天数；缺失不作0",
+    "role": "cross_section",
+    "notes": "资金源覆盖受上轮8月19日固定股票池限制；新研究需按6月30日历史池重核"
+  },
+  {
+    "key": "main_strength_delta5",
+    "label": "主力强度距5日均值(百分点)",
+    "family": "资金流",
+    "formula": "当日主力强度 - 包含当日在内的近5条有效日线主力强度均值",
+    "role": "cross_section",
+    "notes": "资金源覆盖受上轮8月19日固定股票池限制；新研究需按6月30日历史池重核；当前滚动按股票记录行；停牌/缺行时未必等于连续市场交易日，新区间须统一窗口政策"
+  },
+  {
+    "key": "super_large_strength",
+    "label": "超大单净流入/成交额(%)",
+    "family": "资金流",
+    "formula": "100 × 超大单净流入元 / 成交额元",
+    "role": "cross_section",
+    "notes": "资金源覆盖受上轮8月19日固定股票池限制；新研究需按6月30日历史池重核"
+  },
+  {
+    "key": "large_strength",
+    "label": "大单净流入/成交额(%)",
+    "family": "资金流",
+    "formula": "100 × 大单净流入元 / 成交额元",
+    "role": "cross_section",
+    "notes": "资金源覆盖受上轮8月19日固定股票池限制；新研究需按6月30日历史池重核"
+  },
+  {
+    "key": "small_strength",
+    "label": "小单净流入/成交额(%)",
+    "family": "资金流",
+    "formula": "100 × 小单净流入元 / 成交额元",
+    "role": "cross_section",
+    "notes": "资金源覆盖受上轮8月19日固定股票池限制；新研究需按6月30日历史池重核"
+  },
+  {
+    "key": "dark_strength",
+    "label": "暗盘强度（截图算例口径）",
+    "family": "暗盘强度",
+    "formula": "主力强度百分数 × 当日涨跌幅百分数 × 主力净流入亿元 ×100",
+    "role": "cross_section",
+    "notes": "资金源覆盖受上轮8月19日固定股票池限制；新研究需按6月30日历史池重核；截图两口径相差×100；原式N²消除净流方向；变体仅研究，尚无稳定增益证据"
+  },
+  {
+    "key": "dark_signed_log",
+    "label": "暗盘强度符号对数",
+    "family": "暗盘强度",
+    "formula": "sign(暗盘强度) × ln(1+abs(暗盘强度))",
+    "role": "cross_section",
+    "notes": "资金源覆盖受上轮8月19日固定股票池限制；新研究需按6月30日历史池重核；截图两口径相差×100；原式N²消除净流方向；变体仅研究，尚无稳定增益证据"
+  },
+  {
+    "key": "dark_abs_log",
+    "label": "暗盘强度绝对值对数",
+    "family": "暗盘强度",
+    "formula": "ln(1+abs(暗盘强度))",
+    "role": "cross_section",
+    "notes": "资金源覆盖受上轮8月19日固定股票池限制；新研究需按6月30日历史池重核；截图两口径相差×100；原式N²消除净流方向；变体仅研究，尚无稳定增益证据"
+  },
+  {
+    "key": "flow_up_price_down",
+    "label": "资金流入且股价下跌",
+    "family": "资金流",
+    "formula": "主力净流入>0且来源日线涨跌幅<0时为1，否则0，缺失保留",
+    "role": "cross_section",
+    "notes": "资金源覆盖受上轮8月19日固定股票池限制；新研究需按6月30日历史池重核"
+  },
+  {
+    "key": "dark_preserve_flow",
+    "label": "保留资金方向的暗盘变体（研究）",
+    "family": "暗盘强度",
+    "formula": "主力强度百分数 × 当日涨跌幅百分数 × abs(主力净流入亿元) ×100",
+    "role": "cross_section",
+    "notes": "资金源覆盖受上轮8月19日固定股票池限制；新研究需按6月30日历史池重核；截图两口径相差×100；原式N²消除净流方向；变体仅研究，尚无稳定增益证据"
+  },
+  {
+    "key": "dark_source_change",
+    "label": "暗盘强度（资金接口回溯涨幅敏感性）",
+    "family": "暗盘强度",
+    "formula": "暗盘强度公式中的涨跌幅改用资金历史接口的回溯涨幅",
+    "role": "cross_section",
+    "notes": "资金源覆盖受上轮8月19日固定股票池限制；新研究需按6月30日历史池重核；截图两口径相差×100；原式N²消除净流方向；变体仅研究，尚无稳定增益证据"
+  },
+  {
+    "key": "industry_relative20",
+    "label": "20日相对同行业强弱(百分点)",
+    "family": "行业相对强弱",
+    "formula": "本股20日涨跌幅 - 同日同行业其他股票20日涨跌幅均值；行业组至少5股；分类向后匹配",
+    "role": "cross_section",
+    "notes": "行业历史映射另行核验，不能拿今天分类直接回填7月"
+  },
+  {
+    "key": "adx",
+    "label": "策略ADX14",
+    "family": "策略信号",
+    "formula": "策略因子快照中上一完整日线的Wilder ADX14",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "adx_delta",
+    "label": "策略ADX14三日增幅",
+    "family": "策略信号",
+    "formula": "ADX14[t-1] - ADX14[t-4]，按市场交易日定位",
+    "role": "cross_section",
+    "notes": ""
+  },
+  {
+    "key": "dif_pct",
+    "label": "策略信号DIF/价格(%)",
+    "family": "策略信号",
+    "formula": "信号临时日线DIF/信号参考价格 ×100；策略MACD参数20/100/30",
+    "role": "signal_event",
+    "notes": ""
+  },
+  {
+    "key": "shrink_ratio",
+    "label": "三分钟MACD缩柱比例",
+    "family": "策略信号",
+    "formula": "买入时 (临时日线MACD柱-昨日柱)/abs(昨日柱)；不是另算一套3分钟MACD",
+    "role": "signal_event",
+    "notes": ""
+  },
+  {
+    "key": "market_limit_up",
+    "label": "前日市场涨停家数",
+    "family": "市场情绪",
+    "formula": "前一完整因子日沪深主板涨停家数",
+    "role": "market_context",
+    "notes": "沪深主板口径；上轮2906/3340笔有买入前已记录的情绪，其余为回溯描述；不能用同日多只股票放大独立日期数"
+  },
+  {
+    "key": "market_limit_down",
+    "label": "前日市场跌停家数",
+    "family": "市场情绪",
+    "formula": "前一完整因子日沪深主板跌停家数",
+    "role": "market_context",
+    "notes": "沪深主板口径；上轮2906/3340笔有买入前已记录的情绪，其余为回溯描述；不能用同日多只股票放大独立日期数"
+  },
+  {
+    "key": "market_seal_rate",
+    "label": "前日市场封板率",
+    "family": "市场情绪",
+    "formula": "前一完整因子日涨停家数/曾触及涨停家数，0至1",
+    "role": "market_context",
+    "notes": "沪深主板口径；上轮2906/3340笔有买入前已记录的情绪，其余为回溯描述；不能用同日多只股票放大独立日期数"
+  },
+  {
+    "key": "market_height",
+    "label": "前日市场连板高度",
+    "family": "市场情绪",
+    "formula": "前一完整因子日最高连板高度",
+    "role": "market_context",
+    "notes": "沪深主板口径；上轮2906/3340笔有买入前已记录的情绪，其余为回溯描述；不能用同日多只股票放大独立日期数"
+  },
+  {
+    "key": "market_amount_ratio",
+    "label": "前日市场市场成交额比",
+    "family": "市场情绪",
+    "formula": "前一完整因子日市场成交额/此前20个交易日市场成交额中位数，不含分子日",
+    "role": "market_context",
+    "notes": "沪深主板口径；上轮2906/3340笔有买入前已记录的情绪，其余为回溯描述；不能用同日多只股票放大独立日期数"
+  },
+  {
+    "key": "market_advancing",
+    "label": "前日市场上涨家数",
+    "family": "市场情绪",
+    "formula": "前一完整因子日上涨家数",
+    "role": "market_context",
+    "notes": "沪深主板口径；上轮2906/3340笔有买入前已记录的情绪，其余为回溯描述；不能用同日多只股票放大独立日期数"
+  },
+  {
+    "key": "market_declining",
+    "label": "前日市场下跌家数",
+    "family": "市场情绪",
+    "formula": "前一完整因子日下跌家数",
+    "role": "market_context",
+    "notes": "沪深主板口径；上轮2906/3340笔有买入前已记录的情绪，其余为回溯描述；不能用同日多只股票放大独立日期数"
+  },
+  {
+    "key": "market_up_over_5",
+    "label": "前日市场涨超5%家数",
+    "family": "市场情绪",
+    "formula": "前一完整因子日涨超5%且未涨停家数",
+    "role": "market_context",
+    "notes": "沪深主板口径；上轮2906/3340笔有买入前已记录的情绪，其余为回溯描述；不能用同日多只股票放大独立日期数"
+  },
+  {
+    "key": "market_down_over_5",
+    "label": "前日市场跌超5%家数",
+    "family": "市场情绪",
+    "formula": "前一完整因子日跌超5%且未跌停家数",
+    "role": "market_context",
+    "notes": "沪深主板口径；上轮2906/3340笔有买入前已记录的情绪，其余为回溯描述；不能用同日多只股票放大独立日期数"
+  },
+  {
+    "key": "market_promotion",
+    "label": "前日市场连板晋级率",
+    "family": "市场情绪",
+    "formula": "前一完整因子日收盘仍涨停的昨日涨停组占比，0至1",
+    "role": "market_context",
+    "notes": "沪深主板口径；上轮2906/3340笔有买入前已记录的情绪，其余为回溯描述；不能用同日多只股票放大独立日期数"
+  },
+  {
+    "key": "market_yesterday_up_return",
+    "label": "前日市场昨日涨停股表现",
+    "family": "市场情绪",
+    "formula": "前一完整因子日对其前一日涨停组的收盘涨幅中位数，小数比例",
+    "role": "market_context",
+    "notes": "沪深主板口径；上轮2906/3340笔有买入前已记录的情绪，其余为回溯描述；不能用同日多只股票放大独立日期数"
+  },
+  {
+    "key": "morning_risk_score",
+    "label": "盘前分析风险等级",
+    "family": "时点可验证辅助信息",
+    "formula": "盘前报告 low/medium/high 映射0/1/2",
+    "role": "market_context",
+    "notes": "仅有部分时段，不能假定覆盖7月1日起全区间"
+  },
+  {
+    "key": "morning_bias_score",
+    "label": "盘前分析市场方向",
+    "family": "时点可验证辅助信息",
+    "formula": "盘前报告 bearish/neutral/bullish 映射-1/0/1",
+    "role": "market_context",
+    "notes": "仅有部分时段，不能假定覆盖7月1日起全区间"
+  },
+  {
+    "key": "news_completion",
+    "label": "盘前新闻处理完成率",
+    "family": "时点可验证辅助信息",
+    "formula": "盘前报告 news_window.completion_ratio，0至1",
+    "role": "data_quality",
+    "notes": "仅有部分时段，不能假定覆盖7月1日起全区间"
+  },
+  {
+    "key": "hotrank_top100",
+    "label": "买入前进入热榜100",
+    "family": "时点可验证辅助信息",
+    "formula": "买入前最新完整前100榜单中有该股为1，榜外0；无合格榜单为缺失",
+    "role": "cross_section",
+    "notes": "仅有部分时段，不能假定覆盖7月1日起全区间"
+  },
+  {
+    "key": "hotrank_rank",
+    "label": "买入前热榜名次（榜外101）",
+    "family": "时点可验证辅助信息",
+    "formula": "买入前最新完整前100榜单名次；榜外用101；缺少榜单不能填101",
+    "role": "cross_section",
+    "notes": "仅有部分时段，不能假定覆盖7月1日起全区间"
+  },
+  {
+    "key": "billboard_count5",
+    "label": "前5日龙虎榜披露次数",
+    "family": "时点可验证辅助信息",
+    "formula": "买入前5个交易日已披露龙虎榜记录数；同股多原因可能多条，非上榜天数",
+    "role": "cross_section",
+    "notes": "仅有部分时段，不能假定覆盖7月1日起全区间"
+  },
+  {
+    "key": "billboard_net5_yi",
+    "label": "前5日龙虎榜净买额(亿元)",
+    "family": "时点可验证辅助信息",
+    "formula": "买入前5个交易日已披露该股龙虎榜记录净买额合计/1亿；须审计多原因重复",
+    "role": "cross_section",
+    "notes": "仅有部分时段，不能假定覆盖7月1日起全区间"
+  },
+  {
+    "key": "factor_age_sessions",
+    "label": "入场时因子滞后交易日数",
+    "family": "策略信号",
+    "formula": "入场日交易日序号 - 信号因子完成日交易日序号",
+    "role": "execution_diagnostic",
+    "notes": ""
+  },
+  {
+    "key": "execution_delay_sessions",
+    "label": "信号至入场跨交易日数",
+    "family": "策略信号",
+    "formula": "入场日交易日序号 - 信号日交易日序号",
+    "role": "execution_diagnostic",
+    "notes": ""
+  },
+  {
+    "key": "entry_session_minute",
+    "label": "入场交易时段分钟位置",
+    "family": "策略信号",
+    "formula": "已成交时间在当日交易时段中的分钟位置，午休扣除",
+    "role": "execution_diagnostic",
+    "notes": ""
+  },
+  {
+    "key": "rs_momentum_l20_s0",
+    "label": "RS动量L20/跳过0日",
+    "family": "既有研究引擎",
+    "formula": "Close[t-1]/Close[t-20]-1；t为信号日，市场交易日定位",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "rs_rank_l20_s0",
+    "label": "RS排名L20/跳过0日",
+    "family": "既有研究引擎",
+    "formula": "Close[t-1]/Close[t-20]-1；t为信号日，市场交易日定位；再做全A百分位排名，并列平均名次，0至1",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "rs_momentum_l20_s5",
+    "label": "RS动量L20/跳过5日",
+    "family": "既有研究引擎",
+    "formula": "Close[t-5]/Close[t-20]-1；t为信号日，市场交易日定位",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "rs_rank_l20_s5",
+    "label": "RS排名L20/跳过5日",
+    "family": "既有研究引擎",
+    "formula": "Close[t-5]/Close[t-20]-1；t为信号日，市场交易日定位；再做全A百分位排名，并列平均名次，0至1",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "rs_momentum_l60_s0",
+    "label": "RS动量L60/跳过0日",
+    "family": "既有研究引擎",
+    "formula": "Close[t-1]/Close[t-60]-1；t为信号日，市场交易日定位",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "rs_rank_l60_s0",
+    "label": "RS排名L60/跳过0日",
+    "family": "既有研究引擎",
+    "formula": "Close[t-1]/Close[t-60]-1；t为信号日，市场交易日定位；再做全A百分位排名，并列平均名次，0至1",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "rs_momentum_l60_s5",
+    "label": "RS动量L60/跳过5日",
+    "family": "既有研究引擎",
+    "formula": "Close[t-5]/Close[t-60]-1；t为信号日，市场交易日定位",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "rs_rank_l60_s5",
+    "label": "RS排名L60/跳过5日",
+    "family": "既有研究引擎",
+    "formula": "Close[t-5]/Close[t-60]-1；t为信号日，市场交易日定位；再做全A百分位排名，并列平均名次，0至1",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "rs_momentum_l120_s0",
+    "label": "RS动量L120/跳过0日",
+    "family": "既有研究引擎",
+    "formula": "Close[t-1]/Close[t-120]-1；t为信号日，市场交易日定位",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "rs_rank_l120_s0",
+    "label": "RS排名L120/跳过0日",
+    "family": "既有研究引擎",
+    "formula": "Close[t-1]/Close[t-120]-1；t为信号日，市场交易日定位；再做全A百分位排名，并列平均名次，0至1",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "rs_momentum_l120_s5",
+    "label": "RS动量L120/跳过5日",
+    "family": "既有研究引擎",
+    "formula": "Close[t-5]/Close[t-120]-1；t为信号日，市场交易日定位",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "rs_rank_l120_s5",
+    "label": "RS排名L120/跳过5日",
+    "family": "既有研究引擎",
+    "formula": "Close[t-5]/Close[t-120]-1；t为信号日，市场交易日定位；再做全A百分位排名，并列平均名次，0至1",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "rtov_10",
+    "label": "相对换手率RTOV10",
+    "family": "既有研究引擎",
+    "formula": "Turnover[t-1]/Median(Turnover[t-11:t-1])，分母不含t-1且必须有完整10日",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "rtov_20",
+    "label": "相对换手率RTOV20",
+    "family": "既有研究引擎",
+    "formula": "Turnover[t-1]/Median(Turnover[t-21:t-1])，分母不含t-1且必须有完整20日",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "rtov_40",
+    "label": "相对换手率RTOV40",
+    "family": "既有研究引擎",
+    "formula": "Turnover[t-1]/Median(Turnover[t-41:t-1])，分母不含t-1且必须有完整40日",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "adx_7",
+    "label": "ADX7",
+    "family": "既有研究引擎",
+    "formula": "独立量化日线Wilder ADX7[t-1]",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "adx_7_3_days_ago",
+    "label": "ADX7三交易日前值",
+    "family": "既有研究引擎",
+    "formula": "ADX7[t-4]；与t-1比较",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "adx_14",
+    "label": "ADX14",
+    "family": "既有研究引擎",
+    "formula": "独立量化日线Wilder ADX14[t-1]",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "adx_14_3_days_ago",
+    "label": "ADX14三交易日前值",
+    "family": "既有研究引擎",
+    "formula": "ADX14[t-4]；与t-1比较",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "adx_21",
+    "label": "ADX21",
+    "family": "既有研究引擎",
+    "formula": "独立量化日线Wilder ADX21[t-1]",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "adx_21_3_days_ago",
+    "label": "ADX21三交易日前值",
+    "family": "既有研究引擎",
+    "formula": "ADX21[t-4]；与t-1比较",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "natr_10",
+    "label": "NATR10",
+    "family": "既有研究引擎",
+    "formula": "独立量化日线ATR10/收盘×100；初始化跳过第一条TR",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "natr_rank_10",
+    "label": "NATR10全市场排名",
+    "family": "既有研究引擎",
+    "formula": "NATR10全A横截面百分位，0至1",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "natr_14",
+    "label": "NATR14",
+    "family": "既有研究引擎",
+    "formula": "独立量化日线ATR14/收盘×100；初始化跳过第一条TR",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "natr_rank_14",
+    "label": "NATR14全市场排名",
+    "family": "既有研究引擎",
+    "formula": "NATR14全A横截面百分位，0至1",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "natr_20",
+    "label": "NATR20",
+    "family": "既有研究引擎",
+    "formula": "独立量化日线ATR20/收盘×100；初始化跳过第一条TR",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "natr_rank_20",
+    "label": "NATR20全市场排名",
+    "family": "既有研究引擎",
+    "formula": "NATR20全A横截面百分位，0至1",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "rsi_9",
+    "label": "RSI9",
+    "family": "既有研究引擎",
+    "formula": "独立量化日线Wilder RSI9[t-1]",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "rsi_14",
+    "label": "RSI14",
+    "family": "既有研究引擎",
+    "formula": "独立量化日线Wilder RSI14[t-1]",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  },
+  {
+    "key": "rsi_21",
+    "label": "RSI21",
+    "family": "既有研究引擎",
+    "formula": "独立量化日线Wilder RSI21[t-1]",
+    "role": "cross_section",
+    "notes": "与上轮91项存在概念重叠，不是新增30个独立信息源；旧实验版本1.0.0不能拼接正式2.0.0收益"
+  }
+]

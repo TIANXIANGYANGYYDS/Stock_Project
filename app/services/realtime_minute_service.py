@@ -8,6 +8,7 @@ import time
 from collections import Counter, deque
 from dataclasses import dataclass, replace
 from datetime import datetime, time as dt_time, timedelta, timezone
+from functools import lru_cache
 from typing import Any, Optional
 
 from pymongo.errors import AutoReconnect
@@ -30,6 +31,7 @@ POLL_INTERVAL_SECONDS = 5.0
 REALTIME_BATCH_SIZE = 200
 AGGREGATE_INTERVAL_MINUTES = (5, 15, 30, 60, 120)
 SESSION_CLOCK_SKEW_GRACE_SECONDS = 5 * 60
+SESSION_PREPARATION_LEAD_SECONDS = 10 * 60
 SESSION_CLOSE_STABILITY_SECONDS = 5 * 60
 SESSION_HARD_STOP_GRACE_SECONDS = 10 * 60
 SOURCE_CLOCK_SAMPLE_LIMIT = 31
@@ -116,6 +118,7 @@ class RealtimeMinuteService:
         self._last_bar_minutes: dict[str, str] = {}
         self._resume_loaded: set[str] = set()
         self._resume_closed_minutes: dict[str, str] = {}
+        self._deferred_resume_quotes: deque[RealtimeQuote] = deque()
         self._source_clock_offsets: deque[float] = deque(maxlen=SOURCE_CLOCK_SAMPLE_LIMIT)
         self._quote_anomalies: Counter[str] = Counter()
 
@@ -123,7 +126,7 @@ class RealtimeMinuteService:
         await self.crawler.close()
         await self.universe_crawler.close()
 
-    async def _load_universe(self, target_trade_date: str) -> list[dict[str, str]]:
+    async def _load_universe(self, target_trade_date: str, *, refresh_public: bool = True) -> list[dict[str, str]]:
         """Merge the latest stored universe with today's publicly traded list."""
 
         daily_collection = self.repository.database["stock_daily_detail"]
@@ -147,6 +150,10 @@ class RealtimeMinuteService:
                         "name": str(item.get("name") or "").strip(),
                     }
         mongo_symbol_count = len(by_code)
+        # Begin sampling with the persisted universe; slow public-list requests
+        # must not consume the first minute of an otherwise healthy session.
+        if not refresh_public and MIN_UNIVERSE_SYMBOLS <= mongo_symbol_count <= MAX_UNIVERSE_SYMBOLS:
+            return [by_code[code] for code in sorted(by_code)]
         fresh_by_code: dict[str, dict[str, str]] = {}
         try:
             dataframe = await asyncio.wait_for(self.universe_crawler.fetch_stock_list(
@@ -216,6 +223,7 @@ class RealtimeMinuteService:
         return local.isoformat()
 
     @staticmethod
+    @lru_cache(maxsize=2048)
     def _period_bucket_start(value: datetime, minutes: int) -> str:
         """Return a session-aligned bucket start without crossing lunch."""
 
@@ -294,9 +302,12 @@ class RealtimeMinuteService:
         the first observed cumulative totals become the new delta baseline.
         Unobserved intervals remain unobserved, for historical repair later.
         """
-        pending = [(q, self._bar_time_in_session(q, now, start, end)) for q in quotes
-                   if q.code not in self._resume_loaded]
-        pending = [(q, at) for q, at in pending if at is not None]
+        pending_by_code = {}
+        for q in quotes:
+            at = self._bar_time_in_session(q, now, start, end)
+            if q.code not in self._resume_loaded and at is not None:
+                pending_by_code.setdefault(q.code, (q, at))
+        pending = list(pending_by_code.values())
         for offset in range(0, len(pending), REALTIME_PERSIST_STOCK_BATCH_SIZE):
             chunk = pending[offset:offset + REALTIME_PERSIST_STOCK_BATCH_SIZE]
             keys = []
@@ -317,6 +328,31 @@ class RealtimeMinuteService:
                         **{field: getattr(bar, field) for field in _MutableBar.__dataclass_fields__}
                     )
             self._resume_loaded.update(q.code for q, _ in chunk)
+
+    async def _quotes_after_resume(self, quotes, now, start, end):
+        """Retry restoration without losing the already archived first quotes."""
+        pending = [*self._deferred_resume_quotes, *quotes]
+        self._deferred_resume_quotes.clear()
+        try:
+            async with asyncio.timeout(5):
+                await self._restore_resume_buckets(pending, now, start, end)
+        except (AutoReconnect, TimeoutError) as exc:
+            logger.warning('realtime_resume_deferred snapshots_preserved=true error=%s', type(exc).__name__)
+        ready = []
+        for quote in pending:
+            at = self._bar_time_in_session(quote, now, start, end)
+            if at is None or quote.code in self._resume_loaded:
+                ready.append(quote)
+            else:
+                self._deferred_resume_quotes.append(quote)
+        # Persistent DB failure must not grow memory without bound. Older
+        # observations remain in the source archive for explicit recovery.
+        overflow = len(self._deferred_resume_quotes) - MAX_IN_MEMORY_MINUTE_BARS
+        if overflow > 0:
+            for _ in range(overflow):
+                self._deferred_resume_quotes.popleft()
+            logger.error('realtime_resume_buffer_overflow archived_quotes=%s', overflow)
+        return ready
 
     def _ingest_quote(
         self,
@@ -461,6 +497,7 @@ class RealtimeMinuteService:
 
     async def _flush_before(
         self, cutoff: Optional[str], *, force: bool = False, per_symbol: bool = False,
+        next_poll: Optional[float] = None,
     ) -> int:
         if force:
             selected = list(self._bars.values())
@@ -473,6 +510,7 @@ class RealtimeMinuteService:
         selected.sort(key=lambda bar: (bar.timestamp, bar.code))
         persisted_at = datetime.now(CN_TZ)
         written = 0
+        flushed = 0
         aggregate_update_count = 0
         for offset in range(0, len(selected), REALTIME_PERSIST_STOCK_BATCH_SIZE):
             minute_chunk = selected[
@@ -526,8 +564,14 @@ class RealtimeMinuteService:
                 raise
             for minute_bar in minute_chunk:
                 self._bars.pop((minute_bar.code, minute_bar.timestamp), None)
+            flushed += len(minute_chunk)
             aggregate_update_count += len(aggregate_updates)
             del documents
+            # 在整批得到确认后让出下一轮采样时间。积压超过一个全市场分钟时优先追平。
+            if (not force and per_symbol and next_poll is not None and time.perf_counter() >= next_poll
+                    and flushed >= 3 * REALTIME_PERSIST_STOCK_BATCH_SIZE
+                    and len(selected) - flushed <= MAX_UNIVERSE_SYMBOLS):
+                break
 
         if force:
             self._aggregate_bars.clear()
@@ -551,7 +595,7 @@ class RealtimeMinuteService:
                 self._aggregate_bars.pop(key, None)
         logger.info(
             "realtime_minute_bars_flushed minute_bars=%s aggregate_bars=%s written=%s",
-            len(selected),
+            flushed,
             aggregate_update_count,
             written,
         )
@@ -578,7 +622,7 @@ class RealtimeMinuteService:
             )
             return {"session": session, "status": "skipped", "reason": "non_trading_day"}
         if not (
-            session_start - timedelta(seconds=SESSION_CLOCK_SKEW_GRACE_SECONDS)
+            session_start - timedelta(seconds=SESSION_PREPARATION_LEAD_SECONDS)
             <= now
             < wall_deadline
         ):
@@ -593,14 +637,14 @@ class RealtimeMinuteService:
             logger.error('realtime_indexes_deferred error=%s', type(exc).__name__)
         await self.snapshots.replay_pending(limit=3,
             calibrated_now=now if self._http_clock_offset is not None else None)
-        rows = await self._load_universe(trade_date.reference_trade_date)
+        rows = await self._load_universe(trade_date.reference_trade_date, refresh_public=False)
         codes = [row["code"] for row in rows]
         name_by_code = {row["code"]: row["name"] for row in rows}
         started = time.perf_counter()
         cycles = 0
         fetched = 0
         written = 0
-        universe_refresh = None
+        universe_refresh = asyncio.create_task(self._load_universe(trade_date.reference_trade_date))
         last_cycle_at = None
         try:
             close_target = session_end + timedelta(seconds=SESSION_CLOSE_STABILITY_SECONDS)
@@ -647,12 +691,7 @@ class RealtimeMinuteService:
                     clock_verified=self._http_clock_offset is not None,
                 )
                 valid_quotes = [q for q in quotes if quote_issue(q) is None]
-                try:
-                    async with asyncio.timeout(5):
-                        await self._restore_resume_buckets(valid_quotes, cycle_now, start_time, end_time)
-                except (AutoReconnect, TimeoutError) as exc:
-                    logger.error('realtime_resume_deferred snapshots_preserved=true error=%s', type(exc).__name__)
-                    valid_quotes = []
+                valid_quotes = await self._quotes_after_resume(valid_quotes, cycle_now, start_time, end_time)
                 cycles += 1
                 self._quote_anomalies.clear()
                 latest_market_time: Optional[datetime] = None
@@ -684,6 +723,7 @@ class RealtimeMinuteService:
                     try:
                         written += await self._flush_before(
                             self._minute_key(latest_market_time), per_symbol=True,
+                            next_poll=cycle_started + self.poll_interval,
                         )
                     except AutoReconnect as exc:
                         logger.error(

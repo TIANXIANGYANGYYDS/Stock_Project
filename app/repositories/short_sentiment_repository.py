@@ -37,12 +37,15 @@ class ShortSentimentRepository:
         await self.db[EVENTS].create_index([("trade_date", 1), ("theme_ids", 1), ("event_id", 1)])
         await self.db[EVENTS].create_index([("trade_date", 1), ("code", 1), ("event_id", 1)])
         await self.db[TIMESERIES].create_index([("scope", 1), ("trade_date", 1), ("interval", 1), ("timestamp", 1)])
+        # 每次发布前只清理本序号的未提交记录，避免反复扫描当天所有事件和分钟点。
+        for name in (EVENTS, TIMESERIES):
+            await self.db[name].create_index([("scope", 1), ("trade_date", 1), ("sequence", 1)])
 
     async def latest(self, trade_date=None):
         query = {"scope": self.scope}
         if trade_date:
             query["trade_date"] = trade_date
-        document = await self.db[SNAPSHOTS].find_one(query, sort=[("trade_date", -1)])
+        document = await self.db[SNAPSHOTS].find_one(query, {"trade_date": 1, "payload": 1, "_id": 0}, sort=[("trade_date", -1)])
         return await asyncio.to_thread(unpack, document) if document else None
 
     async def checkpoint(self, day):

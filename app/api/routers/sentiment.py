@@ -134,16 +134,21 @@ def stream_stocks(snapshot):
             if stock["eligible"] and (stock["touched_up"] or stock["is_limit_down"])}
 
 
-async def stream_frames(request, service, initial, last_event_id, *, interval=5):
+async def stream_frames(request, service, initial, last_event_id, *, interval=5, dashboard_id=None):
     current = initial
     known = stream_stocks(current)
     identity = current["meta"]["snapshot_id"]
     event_cursor = identity + ":99999"
-    initial_dashboard = service.dashboard(current)
-    initial_dashboard["recent_events"] = await service.repo.recent_events(current)
-    event = "resync" if last_event_id and last_event_id != identity else "snapshot"
-    yield sse_frame(event, response(service, current, {"dashboard": initial_dashboard,
-                    "stocks_upsert": list(known.values()), "removed_codes": [], "replace_all": True}), identity)
+    initial_data = {"stocks_upsert": list(known.values()), "removed_codes": [], "replace_all": True}
+    if dashboard_id == identity and not last_event_id:
+        # 客户端已持有同一快照的总览，仍发送完整股票集合（包括仅跌停的股票）。
+        event = "stocks_snapshot"
+    else:
+        event = "resync" if last_event_id and last_event_id != identity else "snapshot"
+        initial_data["dashboard"] = service.dashboard(current)
+        initial_data["dashboard"]["recent_events"] = await service.repo.recent_events(current)
+    yield sse_frame(event, response(service, current, initial_data), identity)
+    has_more = False
     while not await request.is_disconnected():
         await asyncio.sleep(interval)
         try:
@@ -153,11 +158,13 @@ async def stream_frames(request, service, initial, last_event_id, *, interval=5)
             continue
         next_id = latest["meta"]["snapshot_id"]
         reset = latest["meta"]["trade_date"] != current["meta"]["trade_date"]
-        event_page = await service.repo.events(latest, after=None if reset else event_cursor, limit=200)
-        event_cursor = event_page["next_cursor"] if event_page["has_more"] else next_id + ":99999"
-        if next_id == identity and not event_page["items"]:
+        # 事件与快照按序号一起发布；同一序号只有上次尚未读完时才需继续分页。
+        if next_id == identity and not has_more:
             yield sse_frame("heartbeat", {"meta": service.meta(latest)})
             continue
+        event_page = await service.repo.events(latest, after=None if reset else event_cursor, limit=200)
+        has_more = event_page["has_more"]
+        event_cursor = event_page["next_cursor"] if has_more else next_id + ":99999"
         new = stream_stocks(latest)
         updates = list(new.values()) if reset else [s for c, s in new.items() if known.get(c) != s]
         removed = sorted(set(known) - set(new))
@@ -172,10 +179,10 @@ async def stream_frames(request, service, initial, last_event_id, *, interval=5)
 @router.get("/stream", response_class=StreamingResponse,
             responses={200: {"content": {"text/event-stream": {"schema": {"type": "string"}}}}})
 async def stream(request: Request, last_event_id: str | None = Header(None, max_length=80),
-                 service=Depends(get_sentiment_service)):
+                 service=Depends(get_sentiment_service), dashboard_id: str | None = Query(None, max_length=64)):
     try:
         initial = await service.snapshot()
     except LookupError as exc:
         raise HTTPException(503, str(exc)) from exc
-    return StreamingResponse(stream_frames(request, service, initial, last_event_id),
+    return StreamingResponse(stream_frames(request, service, initial, last_event_id, dashboard_id=dashboard_id),
                              media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

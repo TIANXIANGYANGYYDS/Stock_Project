@@ -7,6 +7,7 @@ exchange_calendars
 faster-whisper==1.2.1
 httpx
 motor
+orjson>=3.10,<4
 opencc-python-reimplemented==0.1.7
 pandas
 pydantic

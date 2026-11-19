@@ -720,6 +720,44 @@ def test_weibo_unsuccessful_protocol_payload_fails_without_browser_fallback() ->
     assert page.can_assert_no_new_works is False
 
 
+@pytest.mark.parametrize("code", [-100, "-100"])
+def test_weibo_login_required_is_blocked_without_leaking_payload(code) -> None:
+    target = account("weibo", "1249424622")
+    client = FakeClient(
+        FakeResponse(text="home"),
+        FakeResponse(payload={"ok": code, "msg": "secret-session-response"}),
+    )
+    page = asyncio.run(WeiboPlatformCrawler(client=client).list_works(target, cursor="2"))
+    assert page.coverage == "blocked"
+    assert "ok=-100" in page.coverage_reason
+    assert "WEIBO_SESSION_COOKIE" in page.coverage_reason
+    assert "secret-session-response" not in page.coverage_reason
+    assert page.cursor == "2"
+    assert not page.can_assert_no_new_works
+    assert len(client.calls) == 2
+
+
+def test_weibo_authorized_session_only_sent_to_business_api(monkeypatch) -> None:
+    from app.core.config import Settings
+
+    settings = Settings(_env_file=None, WEIBO_SESSION_COOKIE="SUB=private-session")
+    monkeypatch.setattr("app.crawlers.creator_platforms.weibo.get_settings", lambda: settings)
+    target = account("weibo", "1249424622")
+    client = FakeClient(
+        FakeResponse(text="home"),
+        FakeResponse(payload={"ok": 1, "data": {"cards": []}}),
+        FakeResponse(payload={"ok": 1}),
+    )
+    crawler = create_platform_crawler("weibo", client=client)
+    page = asyncio.run(crawler.list_works(target, cursor="2"))
+    asyncio.run(crawler._http_json(crawler.VISITOR_ENTRY_URL))
+    assert page.coverage == "partial"
+    assert client.calls[1][1]["headers"]["Cookie"] == "SUB=private-session"
+    assert client.calls[1][1]["params"]["page"] == 2
+    assert "Cookie" not in client.calls[0][1]["headers"]
+    assert "Cookie" not in client.calls[2][1]["headers"]
+
+
 def test_weibo_protocol_url_matches_only_exact_account_timeline() -> None:
     uid = "1249424622"
     valid = (

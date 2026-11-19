@@ -50,6 +50,9 @@ class NewsStatus(BaseModel):
         description="状态解释；失败时记录失败原因，非失败时可记录当前阶段说明",
     )
 
+    # 领取凭证只供当前新闻进程回写，接口和普通入库文档无需暴露。
+    claim_id: Optional[str] = Field(default=None, exclude=True)
+
     @model_validator(mode="after")
     def fill_default_reason(self) -> "NewsStatus":
         """在状态说明缺失或仅含空白时补全默认文案。

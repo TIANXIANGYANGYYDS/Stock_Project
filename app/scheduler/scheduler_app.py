@@ -5,6 +5,7 @@ import logging
 import os
 import signal
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from apscheduler.jobstores.mongodb import MongoDBJobStore
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -24,6 +25,7 @@ from app.scheduler.news_ranking_jobs import (
 )
 from app.scheduler.quant_jobs import register_quant_live_jobs
 from app.scheduler.sentiment_jobs import register_sentiment_job
+from app.scheduler.heartbeat import heartbeat
 
 
 logger = logging.getLogger(__name__)
@@ -31,6 +33,8 @@ logger = logging.getLogger(__name__)
 JOB_ID = "crawl_news_job"
 # APScheduler 任务定义与 next_run_time 的持久化集合；业务数据仍写入各自集合。
 SCHEDULER_JOBSTORE_COLLECTION = "apscheduler_jobs"
+# Replaced by the dedicated five-second collector and daily archive jobs.
+RETIRED_JOB_IDS = ("stock_fund_flow_5m", "stock_fund_flow_5m_startup")
 
 
 def configure_logging() -> None:
@@ -64,6 +68,7 @@ def build_scheduler() -> AsyncIOScheduler:
     """
     settings = get_settings()
     scheduler = AsyncIOScheduler(
+        timezone=ZoneInfo("Asia/Shanghai"),
         jobstores={
             "default": MongoDBJobStore(
                 host=settings.mongo_uri,
@@ -81,7 +86,7 @@ def build_scheduler() -> AsyncIOScheduler:
         max_instances=1,
         coalesce=True,
         misfire_grace_time=60,
-        next_run_time=datetime.now(),
+        next_run_time=datetime.now(scheduler.timezone),
     )
     logger.info("registered job id=%s", job.id)
     register_crawler_jobs(scheduler)
@@ -137,19 +142,32 @@ async def run_scheduler() -> None:
     scheduler = build_scheduler()
     stop_event = asyncio.Event()
     scheduler_started = False
+    heartbeat_task = None
 
     try:
         install_signal_handlers(stop_event)
-        scheduler.start()
+        # Load persisted jobs without executing obsolete definitions on restart.
+        scheduler.start(paused=True)
         scheduler_started = True
+        for job_id in RETIRED_JOB_IDS:
+            if scheduler.get_job(job_id) is not None:
+                scheduler.remove_job(job_id)
+                logger.info("removed retired scheduler job id=%s", job_id)
+        scheduler.resume()
+        heartbeat_task = asyncio.create_task(heartbeat(stop_event))
         logger.info("scheduler started launch_id=%s", os.environ.get('STOCK_PROCESS_LAUNCH_ID', 'manual'))
         await stop_event.wait()
     finally:
         logger.info("scheduler stopping")
+        stop_event.set()
+        if heartbeat_task is not None:
+            await heartbeat_task
         try:
             if scheduler_started and scheduler.running:
                 scheduler.shutdown(wait=True)
         finally:
+            from app.scheduler.fund_flow_jobs import close_fund_flow_service
+            await close_fund_flow_service()
             client.close()
             logger.info("scheduler stopped")
 

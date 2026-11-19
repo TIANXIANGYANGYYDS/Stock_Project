@@ -23,7 +23,8 @@ class FakeWallClock:
 
 
 class FakeProvider:
-    def __init__(self, name: str, *, fail: bool = False) -> None:
+    def __init__(self, name: str, *, fail: bool = False, clock=None) -> None:
+        self.clock = clock or (lambda: datetime.now(CN_TZ))
         self.name = name
         self.fail = fail
         self.calls = 0
@@ -32,7 +33,7 @@ class FakeProvider:
         self.calls += 1
         if self.fail:
             raise RuntimeError("test_failure")
-        source_time = datetime.now(CN_TZ)
+        source_time = self.clock()
         return tuple(
             IndexQuote(
                 code=definition.code,
@@ -59,7 +60,7 @@ class FakeProvider:
 def test_index_service_fetches_each_open_request_and_freezes_after_close() -> None:
     async def run() -> None:
         wall_clock = FakeWallClock(datetime(2026, 8, 10, 9, 30, tzinfo=CN_TZ))
-        primary = FakeProvider("TENCENT")
+        primary = FakeProvider("TENCENT", clock=wall_clock)
         service = RealtimeIndexService(
             primary=primary,
             backup=FakeProvider("SINA", fail=True),
@@ -71,13 +72,16 @@ def test_index_service_fetches_each_open_request_and_freezes_after_close() -> No
             second = await service.fetch_latest()
             wall_clock.value = datetime(2026, 8, 10, 15, 1, tzinfo=CN_TZ)
             closed = await service.fetch_latest()
+            wall_clock.value += timedelta(minutes=1)
+            assert (await service.fetch_latest())["updated_at"] == closed["updated_at"]
         finally:
             await service.close()
 
-        assert primary.calls == 2
+        assert primary.calls == 3
         assert first["items"][0]["symbol"] == INDEX_DEFINITIONS[0].symbol
         assert second["updated_at"] != first["updated_at"]
-        assert closed["updated_at"] == second["updated_at"]
+        assert closed["updated_at"] != second["updated_at"]
+        assert closed["items"][0]["source_time"] == "2026-08-10T15:01:00+08:00"
         assert closed["market_status"] == "closed"
 
     asyncio.run(run())
@@ -116,7 +120,7 @@ def test_index_service_reports_unavailable_without_cache() -> None:
 def test_index_service_initializes_once_after_close() -> None:
     async def run() -> None:
         wall_clock = FakeWallClock(datetime(2026, 8, 10, 16, 0, tzinfo=CN_TZ))
-        primary = FakeProvider("TENCENT")
+        primary = FakeProvider("TENCENT", clock=wall_clock)
         service = RealtimeIndexService(
             primary=primary,
             backup=FakeProvider("SINA", fail=True),
@@ -135,7 +139,7 @@ def test_index_service_initializes_once_after_close() -> None:
 def test_index_service_refreshes_closed_snapshot_on_next_calendar_day() -> None:
     async def run() -> None:
         wall_clock = FakeWallClock(datetime(2026, 8, 10, 16, 0, tzinfo=CN_TZ))
-        primary = FakeProvider("TENCENT")
+        primary = FakeProvider("TENCENT", clock=wall_clock)
         service = RealtimeIndexService(
             primary=primary,
             backup=FakeProvider("SINA", fail=True),

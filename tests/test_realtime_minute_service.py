@@ -108,6 +108,8 @@ def test_universe_refresh_merges_public_target_date_with_mongo(monkeypatch) -> N
         return [{'code': '920202', 'name': '新股'}]
     service.crawler.fetch_universe = independent_universe
     try:
+        cached = asyncio.run(service._load_universe("2026-08-07", refresh_public=False))
+        assert cached == [{'code': '000001', 'name': '旧名称'}]
         rows = asyncio.run(service._load_universe("2026-08-07"))
     finally:
         asyncio.run(service.close())

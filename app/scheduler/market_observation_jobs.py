@@ -51,7 +51,7 @@ def register_market_observation_jobs(scheduler):
     ):
         scheduler.add_job(market_observation_job, trigger=trigger, kwargs={"kind": kind},
                           id=identity, replace_existing=True, max_instances=1,
-                          coalesce=True, misfire_grace_time=60 if kind == "hot" else 1800)
+                          coalesce=True, misfire_grace_time=1800 if kind == "billboard" else 60)
         scheduler.add_job(market_observation_job,
                           trigger=DateTrigger(run_date=datetime.now(CN_TZ)),
                           kwargs={"kind": kind, "startup": True}, id=identity + "_startup",

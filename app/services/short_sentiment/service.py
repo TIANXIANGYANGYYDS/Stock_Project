@@ -10,7 +10,7 @@ import time
 
 from app.core.config import PROJECT_ROOT
 from app.repositories.realtime_snapshot_repository import AUCTION_COLLECTION, SNAPSHOT_COLLECTION, decode_batch
-from app.repositories.short_sentiment_repository import SNAPSHOTS, ShortSentimentRepository
+from app.repositories.short_sentiment_repository import RETAINED, SNAPSHOTS, ShortSentimentRepository
 from app.services.short_sentiment.engine import SentimentEngine, daily_envelope, public_stats
 from app.services.short_sentiment.facts import CN, STALE_SECONDS, instant
 from app.services.short_sentiment.metrics import MIN_COVERAGE
@@ -112,6 +112,10 @@ class SentimentWorker:
             if not dates:
                 return {"status": "no_sources", "processed": 0}
             day = max(dates)
+        identity = {"scope": self.scope, "trade_date": day}
+        final = await self.db[SNAPSHOTS].find_one({**identity, "meta.is_final": True}, {"_id": 1})
+        if final:
+            return {"status": "final", "processed": 0, "trade_date": day}
         checkpoint = await self.repo.checkpoint(day)
         if checkpoint and checkpoint["meta"]["is_final"]:
             return {"status": "final", "processed": 0, "trade_date": day}
@@ -131,8 +135,13 @@ class SentimentWorker:
             else:
                 raw_days = await self.db["market_sentiment_raw_daily"].find({"scope": self.scope, "trade_date": {"$in": sessions}}).to_list(length=20)
             self._engine = await asyncio.to_thread(SentimentEngine, self.catalog, raw_days, sessions, scope=self.scope)
+            # The engine keeps normalized history; release the full daily inputs
+            # before decoding batches and allocating the next checkpoint.
+            del raw_days
             self._engine_day = day
             self._prior_day_snapshot = await self.repo.checkpoint(sessions[-1]) if sessions else None
+        if checkpoint:
+            self._prior_day_snapshot = None
         query = {"trade_date": day}
         cursor = (checkpoint or {}).get("source_cursor")
         if cursor:
@@ -167,11 +176,18 @@ class SentimentWorker:
             self.db[name].find(query).sort([("observed_at", 1), ("_id", 1)]).limit(max_batches).to_list(length=max_batches)
             for name in (SNAPSHOT_COLLECTION, AUCTION_COLLECTION)])
         ordered = sorted(batches[0] + batches[1], key=lambda r: (instant(r["observed_at"]), r["_id"]))[:max_batches]
-        retained = await self.repo.retained(day)
-        if usable_observation(checkpoint) and (not retained or checkpoint["meta"]["as_of"] > retained["meta"]["as_of"]):
-            # Also closes a crash window between main publication and retention.
-            await self.repo.save_retained(checkpoint)
-            retained = checkpoint
+        if usable_observation(checkpoint):
+            header = await self.db[RETAINED].find_one(identity, {"meta.as_of": 1, "sequence": 1})
+            if not header or checkpoint["meta"]["as_of"] > header["meta"]["as_of"]:
+                # 上次可能在提交快照后、保存留存观察之前退出。
+                await self.repo.save_retained(checkpoint)
+                retained = checkpoint
+            elif header["sequence"] == checkpoint["sequence"]:
+                retained = checkpoint
+            else:
+                retained = await self.repo.retained(day)
+        else:
+            retained = await self.repo.retained(day)
         for document in ordered:
             envelope = await asyncio.to_thread(decode_batch, document)
             envelope["source_cursor"] = {"observed_at": instant(document["observed_at"]).isoformat(), "batch_id": document["_id"]}
@@ -223,6 +239,8 @@ class SentimentQueryService:
         self.cache_ttl = cache_ttl
         self._cache = {}
         self._read_lock = asyncio.Lock()
+        self._dashboard_id = None
+        self._dashboard_data = None
 
     async def snapshot(self, trade_date=None, snapshot_id=None):
         async with self._read_lock:
@@ -234,13 +252,14 @@ class SentimentQueryService:
                 query = {"scope": self.scope}
                 if trade_date:
                     query["trade_date"] = trade_date
-                header = await self.repo.db[SNAPSHOTS].find_one(query, {"snapshot_id": 1}, sort=[("trade_date", -1)])
-                if cached and header and header["snapshot_id"] == cached[1]["meta"]["snapshot_id"]:
-                    snapshot = cached[1]
-                else:
+                header = await self.repo.db[SNAPSHOTS].find_one(query, {"snapshot_id": 1, "trade_date": 1}, sort=[("trade_date", -1)])
+                # 最新页和指定日期的请求可能指向同一版本，复用已解压的快照。
+                snapshot = next((value for _, value in self._cache.values()
+                                 if header and value["meta"]["snapshot_id"] == header["snapshot_id"]), None)
+                if snapshot is None:
                     snapshot = await self.repo.latest(trade_date) if header else None
                 if snapshot:
-                    if len(self._cache) >= 8:
+                    if trade_date not in self._cache and len(self._cache) >= 8:
                         self._cache.pop(next(iter(self._cache)))
                     self._cache[trade_date] = (now, snapshot)
         if snapshot is None:
@@ -271,13 +290,19 @@ class SentimentQueryService:
         return result
 
     def dashboard(self, snapshot):
+        identity = snapshot["meta"]["snapshot_id"]
+        if self._dashboard_id == identity:
+            return dict(self._dashboard_data)
         themes = [public_stats(t) for t in snapshot["themes"]]
         for theme in themes:
             theme["top_stocks"] = self.theme_members(snapshot, theme["theme_id"], page_size=5)["items"]
         themes.sort(key=lambda t: (-(t["values"].get("limit_up") or 0), -(t["values"].get("limit_up_ratio") or 0), t["theme_id"]))
-        return {"market": public_stats(snapshot["market"]), "themes": themes,
+        # 缓存固定版本的统计，调用方可以独立填充最近事件，时效字段仍按请求计算。
+        self._dashboard_data = {"market": public_stats(snapshot["market"]), "themes": themes,
                 "boards": [public_stats(b) for b in snapshot.get("boards", [])],
                 "recent_events": snapshot["events"][-20:], "unique_stock_count": len(snapshot["stocks"])}
+        self._dashboard_id = identity
+        return dict(self._dashboard_data)
 
     @staticmethod
     def theme(snapshot, theme_id):

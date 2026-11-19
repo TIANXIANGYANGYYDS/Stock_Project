@@ -5,12 +5,14 @@ import asyncio
 from datetime import date
 from typing import Any, Literal
 
+from bson.codec_options import CodecOptions
 from fastapi import APIRouter, Depends, HTTPException, Query
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.api.dependencies import Pagination, get_db, get_pagination
 from app.api.query import aggregate_page, find_page
 from app.api.serializers import serialize_document
+from app.repositories.quote_chart_repository import read_chart_window
 from app.repositories.realtime_snapshot_repository import (
     decode_symbol_batches, symbol_projection, SNAPSHOT_COLLECTION, AUCTION_COLLECTION, PARTITIONED_CODEC,
     QUALITY_INDEX_NAME,
@@ -20,16 +22,83 @@ from app.repositories.realtime_snapshot_repository import (
 router = APIRouter(tags=["stocks"])
 
 
-async def _list_stock_batches(code, trade_date, start_time, end_time, limit, db, *, collection_name):
-    """Bound reads to fifteen minutes; source and receipt clocks remain distinct."""
+@router.get('/api/v1/stocks/{code}/fund-flows')
+async def list_stock_fund_flows(
+    code: str,
+    trade_date: date,
+    pagination: Pagination = Depends(get_pagination),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+) -> dict[str, Any]:
+    """Bounded pages of compressed seconds observations; five sessions retained."""
+    from app.repositories.market_observation_repository import FUND_FLOW_COLLECTION
+    from app.repositories.fund_flow_repository import fund_symbol_projection, decode_fund_snapshot
+    if not re.fullmatch(r'\d{6}', code):
+        raise HTTPException(422, '股票代码须为六位')
+    collection = db[FUND_FLOW_COLLECTION].with_options(codec_options=CodecOptions(tz_aware=True))
+    filters = {'trade_date': trade_date.isoformat()}
+    total = await collection.count_documents(filters)
+    documents = await collection.find(filters, fund_symbol_projection(code)).sort(
+        [('observed_at', -1), ('_id', -1)]).skip(pagination.skip).limit(pagination.page_size).to_list(
+            length=pagination.page_size)
+    items = await asyncio.to_thread(lambda: [serialize_document(decode_fund_snapshot(d, code)) for d in documents])
+    return {'items': items, 'total': total, 'page': pagination.page, 'page_size': pagination.page_size,
+            'total_basis': 'observation_batches_empty_records_mean_symbol_missing',
+            'sampling': 'fixed_5s_cumulative_flow_observations', 'retention_trading_days': 5}
+
+
+@router.get('/api/v1/stocks/{code}/fund-flows/daily')
+async def list_stock_daily_fund_flows(
+    code: str,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    pagination: Pagination = Depends(get_pagination),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+) -> dict[str, Any]:
+    from app.repositories.fund_flow_repository import DAILY_COLLECTION
+    if not re.fullmatch(r'\d{6}', code) or start_date and end_date and start_date > end_date:
+        raise HTTPException(422, '股票代码或日期范围无效')
+    filters = {'code': code}
+    if start_date or end_date:
+        filters['trade_date'] = {}
+        if start_date:
+            filters['trade_date']['$gte'] = start_date.isoformat()
+        if end_date:
+            filters['trade_date']['$lte'] = end_date.isoformat()
+    collection = db[DAILY_COLLECTION].with_options(codec_options=CodecOptions(tz_aware=True))
+    return await find_page(collection, filters, pagination, sort=[('trade_date', -1), ('code', 1)])
+
+
+@router.get('/api/v1/market/fund-flow-quality/{trade_date}')
+async def fund_flow_quality(trade_date: date, db: AsyncIOMotorDatabase = Depends(get_db)) -> dict[str, Any]:
+    from app.repositories.market_observation_repository import FUND_FLOW_COLLECTION, RUN_COLLECTION
+    from app.repositories.fund_flow_repository import DAILY_COLLECTION, DAILY_RUN_KIND
+    collection = db[FUND_FLOW_COLLECTION].with_options(codec_options=CodecOptions(tz_aware=True))
+    runs = db[RUN_COLLECTION].with_options(codec_options=CodecOptions(tz_aware=True))
+    latest = await collection.find_one(
+        {'trade_date': trade_date.isoformat()}, {'records': 0, 'payload': 0, 'quote_chunks': 0,
+                                              'chunk_sha256': 0}, sort=[('observed_at', -1)])
+    run = await runs.find_one({'_id': f'fund_flow:{trade_date.isoformat()}'})
+    daily_run = await runs.find_one({'_id': f'{DAILY_RUN_KIND}:{trade_date.isoformat()}'})
+    return {'latest_snapshot': serialize_document(latest) if latest else None,
+            'latest_run': serialize_document(run) if run else None,
+            'daily_run': serialize_document(daily_run) if daily_run else None,
+            'daily_count': await db[DAILY_COLLECTION].count_documents({'trade_date': trade_date.isoformat()}),
+            'raw_retention_trading_days': 5, 'daily_retention': 'permanent'}
+
+
+async def _list_stock_batches(code, trade_date, start_time, end_time, limit, db, *, collection_name, view="full"):
+    """按视图限制批次数和时间范围，保留行情时间与采集时间。"""
     from datetime import datetime
     try:
         start = datetime.fromisoformat(f'{trade_date}T{start_time}+08:00')
         end = datetime.fromisoformat(f'{trade_date}T{end_time}+08:00')
     except ValueError:
         raise HTTPException(422, '时间格式无效')
-    if not re.fullmatch(r'\d{6}', code) or not 0 < (end-start).total_seconds() <= 900:
-        raise HTTPException(422, '股票代码须为六位，查询窗口须大于零且不超过十五分钟')
+    max_seconds, max_batches = (3600, 4000) if view == 'series' else (900, 1000)
+    if not re.fullmatch(r'\d{6}', code) or not 0 < (end-start).total_seconds() <= max_seconds or limit > max_batches:
+        raise HTTPException(422, f'股票代码须为六位，窗口须在 1 至 {max_seconds} 秒之间，批次数不超过 {max_batches}')
+    if view != 'full':
+        return await read_chart_window(db, collection_name, trade_date.isoformat(), start, end, limit, code, view)
     rows = []
     filters = {'trade_date': trade_date.isoformat(), 'observed_at': {'$gte': start, '$lt': end}}
     batches = db[collection_name].find(filters, symbol_projection(code)).sort([('observed_at', 1)]).limit(limit)
@@ -59,12 +128,13 @@ async def list_stock_snapshots(
     trade_date: date,
     start_time: str = Query(default='09:30:00', pattern=r'^\d{2}:\d{2}:\d{2}$'),
     end_time: str = Query(default='09:45:00', pattern=r'^\d{2}:\d{2}:\d{2}$'),
-    limit: int = Query(default=200, ge=1, le=1000),
+    limit: int = Query(default=200, ge=1, le=4000),
     db: AsyncIOMotorDatabase = Depends(get_db),
+    view: Literal['full', 'chart', 'series'] = 'full',
 ) -> dict[str, Any]:
     """Read intraday quote batches; auction batches have their own endpoint."""
     return await _list_stock_batches(code, trade_date, start_time, end_time, limit, db,
-                                     collection_name=SNAPSHOT_COLLECTION)
+                                     collection_name=SNAPSHOT_COLLECTION, view=view)
 
 
 @router.get('/api/v1/stocks/{code}/auctions')
@@ -73,12 +143,13 @@ async def list_stock_auctions(
     trade_date: date,
     start_time: str = Query(default='09:15:00', pattern=r'^\d{2}:\d{2}:\d{2}$'),
     end_time: str = Query(default='09:30:00', pattern=r'^\d{2}:\d{2}:\d{2}$'),
-    limit: int = Query(default=1000, ge=1, le=1000),
+    limit: int = Query(default=1000, ge=1, le=4000),
     db: AsyncIOMotorDatabase = Depends(get_db),
+    view: Literal['full', 'chart', 'series'] = 'full',
 ) -> dict[str, Any]:
     """Read opening/closing auction observations from their separate collection."""
     return await _list_stock_batches(code, trade_date, start_time, end_time, limit, db,
-                                     collection_name=AUCTION_COLLECTION)
+                                     collection_name=AUCTION_COLLECTION, view=view)
 
 
 @router.get('/api/v1/market/realtime-quality/{trade_date}')

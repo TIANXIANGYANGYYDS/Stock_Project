@@ -8,7 +8,7 @@ acknowledges their immutable batch IDs.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
+from dataclasses import fields
 from datetime import datetime
 from functools import lru_cache
 import gzip
@@ -96,7 +96,8 @@ def _safe(value):
 
 
 def snapshot_row(quote):
-    row = _safe(asdict(quote))
+    # _safe 已新建各层容器，直接读字段可省去对时间戳和买卖盘的重复深拷贝。
+    row = {field.name: _safe(getattr(quote, field.name)) for field in fields(quote)}
     row['quality_issue'] = quote_issue(quote)
     row['phase'] = quote_phase(quote.market_data_time) if quote.market_data_time else 'unknown'
     # The public feed's auction encoding has to be verified against an actual
@@ -172,6 +173,7 @@ def decode_symbol_batches(documents, code):
 
 class RealtimeSnapshotRepository(BaseMongoRepository):
     collection_name = SNAPSHOT_COLLECTION
+    raw_collections = (SNAPSHOT_COLLECTION, AUCTION_COLLECTION)
 
     def __init__(self, database=None, *, spool_root=SPOOL_ROOT):
         super().__init__(database)
@@ -179,7 +181,7 @@ class RealtimeSnapshotRepository(BaseMongoRepository):
         self._pending_cleanup_cutoff = None
 
     async def create_indexes(self):
-        for name in (SNAPSHOT_COLLECTION, AUCTION_COLLECTION):
+        for name in self.raw_collections:
             collection = self.database[name]
             await collection.create_index([('trade_date', 1), ('observed_at', 1)],
                                            name='idx_quote_day_observed')
@@ -200,7 +202,7 @@ class RealtimeSnapshotRepository(BaseMongoRepository):
             self.database[name].find_one(
                 {'trade_date': {'$lte': today}, 'observed_at': {'$lte': calibrated_now}},
                 {'trade_date': 1}, sort=[('trade_date', -1), ('observed_at', -1)])
-            for name in (SNAPSHOT_COLLECTION, AUCTION_COLLECTION)])
+            for name in self.raw_collections])
         dates = [row['trade_date'] for row in rows if row]
         if not dates:
             return None
@@ -219,7 +221,7 @@ class RealtimeSnapshotRepository(BaseMongoRepository):
         # This allowlist deliberately excludes minute bars and all derived data.
         query = {'trade_date': {'$lt': window['retained_trade_dates'][0]},
                  'observed_at': {'$lt': cutoff}}
-        for name in (SNAPSHOT_COLLECTION, AUCTION_COLLECTION):
+        for name in self.raw_collections:
             collection = self.database[name]
             counts[name] = 0
             while True:
@@ -303,10 +305,13 @@ class RealtimeSnapshotRepository(BaseMongoRepository):
             logger.info('realtime_snapshot_pending_expired batch=%s', path.name)
             return 0
         async with asyncio.timeout(3):
-            collection = self.database[snapshot_collection(document['data_kind'])]
+            collection = self.database[self._target_collection(document)]
             await collection.update_one({'_id': document['_id']}, {'$setOnInsert': document}, upsert=True)
         await asyncio.to_thread(path.unlink, missing_ok=True)
         return document['compressed_bytes']
+
+    def _target_collection(self, document):
+        return snapshot_collection(document['data_kind'])
 
     async def replay_pending(self, *, limit=3, cutoff=None, calibrated_now=None):
         if calibrated_now is not None:
@@ -337,8 +342,12 @@ class RealtimeSnapshotRepository(BaseMongoRepository):
             'observed_at': observed_at.isoformat(), 'received_at': received_at.isoformat(),
             'clock_offset_seconds': (observed_at - received_at).total_seconds(), 'session': session,
             'expected_codes': expected_codes, 'metrics': metrics,
-            'quotes': [snapshot_row(q) for q in quotes],
+            'quotes': await asyncio.to_thread(lambda: [snapshot_row(q) for q in quotes]),
         }
+        return await self._save_envelope(envelope, clock_verified=clock_verified)
+
+    async def _stage_envelope(self, envelope, *, clock_verified=False):
+        observed_at = datetime.fromisoformat(envelope['observed_at'])
         path = await asyncio.to_thread(self._spool, envelope)
         cutoff = None
         if clock_verified:
@@ -358,6 +367,10 @@ class RealtimeSnapshotRepository(BaseMongoRepository):
                     # A local scan failure must not block today's Mongo write.
                     # Leave the marker unchanged so the next capture retries.
                     logger.exception('realtime_snapshot_pending_retention_failed')
+        return path, cutoff
+
+    async def _save_envelope(self, envelope, *, clock_verified=False):
+        path, cutoff = await self._stage_envelope(envelope, clock_verified=clock_verified)
         try:
             size = await self._persist(path)
             await self.replay_pending(limit=2, cutoff=cutoff)

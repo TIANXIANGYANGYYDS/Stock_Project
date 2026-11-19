@@ -10,6 +10,7 @@ from urllib.parse import parse_qs, urlparse
 
 from bs4 import BeautifulSoup
 
+from app.core.config import get_settings
 from app.crawlers.creator_platforms.base import (
     CrawlPage,
     HttpPlatformCrawler,
@@ -96,11 +97,16 @@ class WeiboPlatformCrawler(HttpPlatformCrawler):
         *,
         client: Any | None = None,
         timeout_seconds: float = WEIBO_PROTOCOL_TIMEOUT_SECONDS,
+        session_cookie: str | None = None,
     ) -> None:
         """创建低资源协议会话，并限制匿名访客初始化最多尝试一次。"""
 
         super().__init__(client=client, timeout_seconds=timeout_seconds)
         self._visitor_bootstrap_attempted = False
+        self._session_cookie = (
+            get_settings().weibo_session_cookie.get_secret_value()
+            if session_cookie is None else session_cookie
+        ).strip()
 
     async def list_works(
         self,
@@ -214,7 +220,13 @@ class WeiboPlatformCrawler(HttpPlatformCrawler):
     ) -> dict[str, Any]:
         """通过继承的 HTTP 客户端请求微博 API 并解析对象型 JSON。"""
 
-        return self._json(await self._get(url, params=params, headers=headers))
+        request_headers = dict(headers or {})
+        # 授权会话仅发往微博业务 API，不传给访客初始化服务或其他平台。
+        if self._session_cookie and url in {
+            self.TIMELINE_URL, self.STATUS_URL, self.EXTEND_URL,
+        }:
+            request_headers["Cookie"] = self._session_cookie
+        return self._json(await self._get(url, params=params, headers=request_headers))
 
     async def _http_json_with_visitor_retry(
         self,
@@ -500,10 +512,15 @@ class WeiboPlatformCrawler(HttpPlatformCrawler):
     def _payload_data(payload: dict[str, Any], source: str) -> dict[str, Any]:
         """验证微博业务成功码并返回对象型 ``data`` 节点。
 
-        ``ok`` 不为 1 或 ``data`` 不是字典时统一视为平台响应结构错误，并在异常中
-        保留来源名称以便诊断时间线、详情或长文接口。
+        ``ok=-100`` 是登录限制，不能归为解析失败或“没有新作品”。其他失败码和
+        结构异常仍保留来源名称，且不回显可能带凭据的上游错误正文。
         """
 
+        if payload.get("ok") in {-100, "-100"}:
+            raise PlatformBlockedError(
+                f"{source} requires an accepted login session (ok=-100); "
+                "configure or refresh WEIBO_SESSION_COOKIE in .local/env/.env"
+            )
         if payload.get("ok") != 1 or not isinstance(payload.get("data"), dict):
             raise PlatformParseError(f"{source} returned an unsuccessful payload")
         return payload["data"]

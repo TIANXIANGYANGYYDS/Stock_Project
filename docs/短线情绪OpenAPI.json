@@ -801,6 +801,16 @@
         "operationId": "stream_api_v1_sentiment_stream_get",
         "parameters": [
           {
+            "name": "dashboard_id",
+            "in": "query",
+            "required": false,
+            "description": "客户端已持有的总览快照编号，用于减少首帧重复传输",
+            "schema": {
+              "type": "string",
+              "maxLength": 64
+            }
+          },
+          {
             "name": "scope",
             "in": "query",
             "required": false,

@@ -215,3 +215,46 @@ def test_safe_error_removes_url_query_and_fragment() -> None:
 
     assert text == "request failed: https://feed.example/private.xml"
     assert "secret" not in text
+
+
+def test_probe_reports_blocked_pagination_even_if_detail_succeeds(monkeypatch) -> None:
+    crawler = FakeCrawler(media_urls=["https://media.example/work.mp4"])
+    original_list = crawler.list_works
+
+    async def list_works(target, *, cursor=None, limit=20):
+        if cursor is None:
+            return await original_list(target, cursor=cursor, limit=limit)
+        return CrawlPage(
+            account_key=target.account_key, platform=target.platform,
+            cursor=cursor, coverage="blocked", coverage_reason="login required (ok=-100)",
+        )
+
+    crawler.list_works = list_works
+    monkeypatch.setattr(probe_module, "create_platform_crawler", lambda _: crawler)
+    result = asyncio.run(probe_module.probe_account(
+        account(), limit=5, fetch_detail=True, check_media_download=False,
+        check_pagination=True, timeout_seconds=1,
+    ))
+    assert result["list_ok"] is True
+    assert result["pagination_ok"] is False
+    assert result["pagination_coverage"] == "blocked"
+    assert result["error"] == "login required (ok=-100)"
+    assert result["detail_ready_ok"] is True
+    assert result["pipeline_ready_ok"] is False
+
+
+def test_probe_does_not_claim_ready_when_media_download_fails(monkeypatch) -> None:
+    crawler = FakeCrawler(media_urls=["https://media.example/work.mp4"])
+    monkeypatch.setattr(probe_module, "create_platform_crawler", lambda _: crawler)
+
+    async def failed_download(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(probe_module, "_verify_media_download", failed_download)
+    result = asyncio.run(probe_module.probe_account(
+        account(), limit=5, fetch_detail=True, check_media_download=True,
+        check_pagination=False, timeout_seconds=1,
+    ))
+    assert result["detail_ready_ok"] is True
+    assert result["media_download_ok"] is False
+    assert result["pipeline_ready_ok"] is False

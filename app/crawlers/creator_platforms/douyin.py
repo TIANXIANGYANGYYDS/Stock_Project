@@ -26,6 +26,7 @@ from app.crawlers.creator_platforms.base import (
     failed_page,
 )
 from app.crawlers.creator_platforms.douyin_abogus import DouyinABogusSigner
+from app.crawlers.creator_platforms.douyin_websign import sign_web_query
 from app.crawlers.creator_platforms.douyin_mstoken import (
     MSTOKEN_STR_DATA,
     MSTOKEN_URL,
@@ -157,8 +158,8 @@ class _DouyinPublicClient:
     """通过无浏览器协议接口抓取一个已配置的抖音账号。
 
     近期作品列表需要部署环境提供有效登录会话；匿名主页会静默截断近期作品，不能
-    用来证明账号没有新作品。详情页仍可匿名读取。列表和详情都使用可复用的 Chrome
-    TLS 指纹请求，每条详情响应在进入统一博主作品集合前，都必须同时通过请求的作品
+    用来证明账号没有新作品。列表和详情均使用会话中的 UIFID 计算 SecSDK 签名，
+    并复用 Chrome TLS 指纹客户端。每条详情响应入库前，都必须同时通过请求的作品
     ID 和账号 ``sec_uid`` 校验。
     """
 
@@ -445,13 +446,17 @@ class _DouyinPublicClient:
     ) -> dict[str, Any]:
         """签名并请求一页作品列表，拒绝平台的静默空响应。"""
 
-        query = urlencode(params)
-        signature = self._signer.sign(query)
+        query, uifid = self._signed_query(params, cookie_header)
         response = await session.get(
-            f"{POST_LIST_URL}?{query}&a_bogus={signature}",
-            headers={"Cookie": cookie_header},
+            f"{POST_LIST_URL}?{query}",
+            headers={"Cookie": cookie_header, "uifid": uifid},
         )
         if response.status_code in {403, 412, 418, 429, 432}:
+            if "ArgusSecurityPlugin" in response.text:
+                raise DouyinBlockedError(
+                    "抖音 SecSDK 校验被 ArgusSecurityPlugin 阻断；"
+                    "需核验动态签名与会话，不能仅凭 HTTP 403 判断 Cookie 过期"
+                )
             raise DouyinBlockedError(
                 f"抖音作品列表被平台阻断 HTTP {response.status_code}"
             )
@@ -482,6 +487,28 @@ class _DouyinPublicClient:
                 "请刷新 DOUYIN_SESSION_COOKIE"
             )
         return payload
+
+    def _signed_query(
+        self, params: dict[str, str], cookie_header: str,
+    ) -> tuple[str, str]:
+        """按网页顺序计算 a_bogus 和 SecSDK，使用当前授权会话的指纹。"""
+
+        uifid = self._cookie_value(cookie_header, "UIFID") or self._cookie_value(
+            cookie_header, "UIFID_TEMP"
+        )
+        if not uifid:
+            raise DouyinBlockedError(
+                "DOUYIN_SESSION_COOKIE 缺少 UIFID/UIFID_TEMP，无法计算 SecSDK 签名"
+            )
+        signed_params = dict(params, uifid=uifid)
+        fp = self._cookie_value(cookie_header, "s_v_web_id")
+        if fp:
+            signed_params.update(verifyFp=fp, fp=fp)
+        query = urlencode(signed_params)
+        signature = self._signer.sign(query)
+        # 必须编码签名中的 + / =，否则 SecSDK 会签入被 URL 解码破坏的 a_bogus。
+        query += "&" + urlencode({"a_bogus": signature})
+        return sign_web_query(query), uifid
 
     def _require_authorized_session(self) -> None:
         """拒绝只能得到陈旧匿名列表的设备 Cookie。"""
@@ -721,12 +748,13 @@ class _DouyinPublicClient:
                     ms_token=ms_token,
                 )
                 params["msToken"] = ms_token
-                query = urlencode(params)
-                signature = self._signer.sign(query)
+                query, uifid = self._signed_query(params, cookie_header)
                 response = await session.get(
-                    f"{WORK_DETAIL_URL}?{query}&a_bogus={signature}",
-                    headers={"Cookie": cookie_header},
+                    f"{WORK_DETAIL_URL}?{query}",
+                    headers={"Cookie": cookie_header, "uifid": uifid},
                 )
+        except DouyinCrawlerError:
+            raise
         except Exception as exc:
             raise DouyinCrawlerError(
                 f"抖音作品详情协议请求失败 work_id={work_id}"

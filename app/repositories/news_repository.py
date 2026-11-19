@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 from typing import Any
 
 from pymongo import ReturnDocument, UpdateOne
@@ -290,7 +292,25 @@ class NewsRepository(BaseMongoRepository):
             sort=[("publish_ts", -1)],
         )
 
-    async def claim_next_sector_judge_news(self) -> News | None:
+    async def _claim_news(self, pending: str, working: str, reason: str, oldest_first: bool) -> News | None:
+        """原子领取待办或租期已过的新闻。重新领取后旧进程的凭证即失效。"""
+        now = datetime.now(timezone.utc)
+        doc = await self.collection.find_one_and_update(
+            {"$or": [
+                {"status.status": pending},
+                {"status.status": working, "status.claim_expires_at": {"$lte": now}},
+            ]},
+            {"$set": {"status": {
+                "status": working, "reason": reason, "claim_id": uuid4().hex,
+                "claim_expires_at": now + timedelta(minutes=30),
+            }}},
+            sort=[("publish_ts", 1 if oldest_first else -1)],
+            projection={"_id": 0},
+            return_document=ReturnDocument.AFTER,
+        )
+        return News(**doc) if doc else None
+
+    async def claim_next_sector_judge_news(self, *, oldest_first: bool = False) -> News | None:
         """
         原子领取一条待板块判断的新闻。
 
@@ -298,38 +318,23 @@ class NewsRepository(BaseMongoRepository):
         只会被一个 worker 改成 sector_judging 并返回。
 
         领取逻辑：
-        1. 只匹配 status.status == crawled 的新闻；
-        2. 按 publish_ts 倒序，优先处理最新新闻；
+        1. 匹配待判断或前一次领取已经超时的新闻；
+        2. 按 publish_ts 倒序，默认优先处理最新新闻，积压轮次优先最早的一条；
         3. 匹配到后立刻把状态改成 sector_judging；
         4. 返回更新后的 News 模型。
 
         如果没有待处理新闻，返回 None，worker 会进入空闲 sleep。
         """
 
-        doc = await self.collection.find_one_and_update(
-            {"status.status": "crawled"},
-            {
-                "$set": {
-                    "status": NewsStatus(
-                        status="sector_judging",
-                        reason="板块判断 worker 已领取，正在调用 LLM。",
-                    ).model_dump(mode="python"),
-                },
-            },
-            sort=[("publish_ts", -1)],
-            projection={"_id": 0},
-            return_document=ReturnDocument.AFTER,
+        return await self._claim_news(
+            "crawled", "sector_judging", "板块判断 worker 已领取，正在调用 LLM。", oldest_first
         )
-
-        if doc is None:
-            return None
-
-        return News(**doc)
 
     async def mark_sector_judge_success(
         self,
         event_id: str,
         analysis: Sequence[NewsSectorLLMAnalysis],
+        *, claim_id: str | None = None,
     ) -> UpdateResult:
         """
         写入板块判断结果，并把状态推进到 sector_judged。
@@ -342,6 +347,7 @@ class NewsRepository(BaseMongoRepository):
         return await self.update_one(
             {
                 "event_id": event_id,
+                "status.claim_id": claim_id,
                 "status.status": "sector_judging",
             },
             {
@@ -359,6 +365,7 @@ class NewsRepository(BaseMongoRepository):
         self,
         event_id: str,
         reason: str,
+        *, claim_id: str | None = None,
     ) -> UpdateResult:
         """
         标记板块判断失败，并记录失败原因。
@@ -373,6 +380,7 @@ class NewsRepository(BaseMongoRepository):
         return await self.update_one(
             {
                 "event_id": event_id,
+                "status.claim_id": claim_id,
                 "status.status": "sector_judging",
             },
             {
@@ -385,42 +393,27 @@ class NewsRepository(BaseMongoRepository):
             },
         )
 
-    async def claim_next_sector_detail_news(self) -> News | None:
+    async def claim_next_sector_detail_news(self, *, oldest_first: bool = False) -> News | None:
         """
         原子领取一条待板块详情分析的新闻。
 
         详情分析是第二阶段，只处理第一阶段已经完成的新闻：
-        1. status.status 必须是 sector_judged；
+        1. 匹配待分析详情或前一次详情领取已经超时的新闻；
         2. 领取后立即改成 sector_detail_analyzing；
         3. 返回更新后的 News 模型。
 
         多 worker 并发时，同一条 sector_judged 新闻只会被一个 worker 领取。
         """
 
-        doc = await self.collection.find_one_and_update(
-            {"status.status": "sector_judged"},
-            {
-                "$set": {
-                    "status": NewsStatus(
-                        status="sector_detail_analyzing",
-                        reason="板块详情 worker 已领取，正在调用 LLM。",
-                    ).model_dump(mode="python"),
-                },
-            },
-            sort=[("publish_ts", -1)],
-            projection={"_id": 0},
-            return_document=ReturnDocument.AFTER,
+        return await self._claim_news(
+            "sector_judged", "sector_detail_analyzing", "板块详情 worker 已领取，正在调用 LLM。", oldest_first
         )
-
-        if doc is None:
-            return None
-
-        return News(**doc)
 
     async def mark_sector_detail_success(
         self,
         event_id: str,
         analysis: Sequence[NewsSectorLLMAnalysis],
+        *, claim_id: str | None = None,
     ) -> UpdateResult:
         """
         写入板块详情分析结果，并把新闻状态推进到 finished。
@@ -432,6 +425,7 @@ class NewsRepository(BaseMongoRepository):
         return await self.update_one(
             {
                 "event_id": event_id,
+                "status.claim_id": claim_id,
                 "status.status": "sector_detail_analyzing",
             },
             {
@@ -449,6 +443,7 @@ class NewsRepository(BaseMongoRepository):
         self,
         event_id: str,
         reason: str,
+        *, claim_id: str | None = None,
     ) -> UpdateResult:
         """
         标记板块详情分析失败，并记录失败原因。
@@ -461,6 +456,7 @@ class NewsRepository(BaseMongoRepository):
         return await self.update_one(
             {
                 "event_id": event_id,
+                "status.claim_id": claim_id,
                 "status.status": "sector_detail_analyzing",
             },
             {

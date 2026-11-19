@@ -9,6 +9,8 @@ from typing import Any, Callable, Optional
 
 import httpx
 
+from app.services.trading_calendar_service import get_a_share_calendar
+
 
 logger = logging.getLogger(__name__)
 CN_TZ = timezone(timedelta(hours=8))
@@ -21,7 +23,7 @@ _SINA_RE = re.compile(r'var hq_str_(sh|sz)(\d{6})="(.*?)";', re.S)
 
 def is_market_session_open(value: datetime) -> bool:
     local = value.astimezone(CN_TZ)
-    return (
+    return get_a_share_calendar().is_session(local.date()) and (
         MORNING_SESSION[0] <= local.time() < MORNING_SESSION[1]
         or AFTERNOON_SESSION[0] <= local.time() < AFTERNOON_SESSION[1]
     )
@@ -226,7 +228,7 @@ class SinaIndexProvider(_IndexProvider):
 
 
 class RealtimeIndexService:
-    """Fetch indices on every open-session request and freeze the close snapshot."""
+    """盘中合并同时到达的刷新请求，收盘后保留已收到收盘行情的快照。"""
 
     def __init__(
         self,
@@ -242,6 +244,7 @@ class RealtimeIndexService:
         self._cached_quotes: tuple[IndexQuote, ...] | None = None
         self._cached_at: Optional[datetime] = None
         self._last_error: Optional[str] = None
+        self._last_attempt: datetime | None = None
 
     async def close(self) -> None:
         await asyncio.gather(self.primary.close(), self.backup.close())
@@ -318,22 +321,31 @@ class RealtimeIndexService:
             data["warning"] = "upstream_unavailable_using_memory_cache"
         return data
 
-    def _has_current_day_cache(self, now: datetime) -> bool:
-        return (
-            self._cached_quotes is not None
-            and self._cached_at is not None
-            and self._cached_at.astimezone(CN_TZ).date() == now.date()
-        )
+    def _can_use_closed_cache(self, now: datetime) -> bool:
+        if not self._cached_quotes or is_market_session_open(now):
+            return False
+        if not self._last_attempt or self._last_attempt.date() != now.date():
+            return False
+        if not get_a_share_calendar().is_session(now.date()) or now.time() < MORNING_SESSION[0]:
+            return True
+        end = AFTERNOON_SESSION[1] if now.time() >= AFTERNOON_SESSION[1] else MORNING_SESSION[1]
+        cutoff = datetime.combine(now.date(), end, CN_TZ)
+        # 未收到全部午盘或收盘报价时短暂复用；下次请求仍可拿到上游迟到的数据。
+        if cutoff <= self._last_attempt <= now and (now - self._last_attempt).total_seconds() < LIVE_GRACE_SECONDS:
+            return True
+        return all(q.market_data_time and cutoff <= q.market_data_time <= now for q in self._cached_quotes)
 
     async def fetch_latest(self) -> dict[str, Any]:
         now = self._wall_clock().astimezone(CN_TZ)
-        if self._has_current_day_cache(now) and not is_market_session_open(now):
+        if self._can_use_closed_cache(now):
             return self._snapshot(now)
 
+        previous_quotes = self._cached_quotes
         async with self._refresh_lock:
             now = self._wall_clock().astimezone(CN_TZ)
-            if self._has_current_day_cache(now) and not is_market_session_open(now):
+            if self._cached_quotes is not previous_quotes or self._can_use_closed_cache(now):
                 return self._snapshot(now)
+            self._last_attempt = now
             try:
                 quotes = await self._fetch_quotes()
             except RealtimeIndexUnavailable:

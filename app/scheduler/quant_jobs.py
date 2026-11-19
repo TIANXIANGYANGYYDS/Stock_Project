@@ -139,6 +139,45 @@ async def resume_quant_live_job() -> dict[str, Any]:
     return {"status": "prepared"}
 
 
+async def recover_completed_quant_job() -> dict[str, Any]:
+    """Publish a validated recovery chain after backfill, then resume normally."""
+    import sys
+    from pathlib import Path
+    from app.services.trading_calendar_service import get_a_share_calendar
+
+    now, _ = await observation_now()
+    # Never replace prior accounts underneath a running trading session.
+    if time(9, 20) <= now.time() < time(15, 20):
+        return await resume_quant_live_job()
+    cutoff = now.date() if now.time() >= time(15, 20) else now.date() - timedelta(days=1)
+    sessions = get_a_share_calendar().sessions_in_range(cutoff - timedelta(days=30), cutoff)
+    end = sessions[-1].strftime('%Y-%m-%d')
+    lock = _get_quant_job_lock()
+    if lock.locked():
+        return {'status': 'skipped', 'reason': 'quant_job_already_running'}
+    async with lock:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, '-u', '-m', 'app.quant.cli.recover_partial_days',
+            '--end-date', end, '--apply', cwd=str(Path(__file__).resolve().parents[2]),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=3600)
+        except (TimeoutError, asyncio.CancelledError):
+            if process.returncode is None:
+                process.terminate()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=10)
+                except TimeoutError:
+                    process.kill()
+                    await process.wait()
+            raise
+        if process.returncode:
+            logger.error('quant_partial_recovery_failed %s', stderr.decode(errors='replace')[-2000:])
+            raise RuntimeError(f'Quant recovery exited with status {process.returncode}')
+        logger.info('quant_partial_recovery_finished %s', stdout.decode(errors='replace')[-2000:])
+    return await resume_quant_live_job()
+
+
 def register_quant_live_jobs(scheduler: AsyncIOScheduler) -> None:
     """注册稳定任务 ID，避免重启后产生重复量化任务。"""
 
@@ -193,7 +232,7 @@ def register_quant_live_jobs(scheduler: AsyncIOScheduler) -> None:
         logger.info("registered job id=%s", job.id)
 
     startup_job = scheduler.add_job(
-        resume_quant_live_job,
+        recover_completed_quant_job,
         trigger=DateTrigger(
             run_date=datetime.now(CN_TZ),
             timezone="Asia/Shanghai",
@@ -207,8 +246,8 @@ def register_quant_live_jobs(scheduler: AsyncIOScheduler) -> None:
     )
     logger.info("registered job id=%s", startup_job.id)
     recovery_job = scheduler.add_job(
-        resume_quant_live_job,
-        trigger=CronTrigger(day_of_week="mon-fri", hour="16-18", minute=15,
+        recover_completed_quant_job,
+        trigger=CronTrigger(day_of_week="mon-fri", hour="16-22", minute=15,
                             timezone="Asia/Shanghai"),
         id=QUANT_LIVE_RECOVERY_JOB_ID,
         name="日线补数后恢复量化账本",

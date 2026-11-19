@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
-from typing import Any, Literal, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 from app.quant.core.models import Bar
 from app.quant.runtime.daily_flow import (
@@ -294,6 +294,7 @@ def replay_live_day(
     expected_bar_count: int,
     close_market: bool,
     opening_exit_states: Mapping[str, Mapping[str, Any]] | None = None,
+    research_buy_gate: Callable[[str, str], tuple[bool, str]] | None = None,
 ) -> dict[str, Any]:
     """以真实完整柱确定性重放正式ADX14/E2策略，恢复跨日账户和延期状态。"""
     from app.quant.research.factors import FactorSnapshot
@@ -474,6 +475,11 @@ def replay_live_day(
 
             signal_id = _signal_id(code, action, bar.end_at)
             accepted = action == "sell" or buy_allowed(snapshots.get(code))
+            rejection_status = "rejected_adx"
+            rejection_reason = "ADX14未达到20且较三个市场交易日前上升"
+            if accepted and action == "buy" and research_buy_gate is not None:
+                accepted, rejection_reason = research_buy_gate(code, flow.trade_date)
+                rejection_status = "rejected_research_filter"
             signal = {
                 "signal_id": signal_id, "code": code, "name": spec.name, "action": action,
                 "observation_before_date": spec.observation_before_date, "observation_date": spec.observation_date,
@@ -483,8 +489,8 @@ def replay_live_day(
                 "provisional_dea": provisional.dea if provisional else None,
                 "provisional_histogram": provisional.histogram if provisional else None,
                 "shrink_ratio": shrink_ratio, "confirmation_count": consecutive,
-                "status": "pending_execution" if accepted else "rejected_adx",
-                "reason": reason if accepted else "ADX14未达到20且较三个市场交易日前上升",
+                "status": "pending_execution" if accepted else rejection_status,
+                "reason": reason if accepted else rejection_reason,
                 "execution_at": None, "execution_price": None, "attempt_count": 0, "attempts": [],
                 "adx_14": spec.adx, "adx_14_3_days_ago": spec.adx_3_days_ago,
                 "factor_completed_date": spec.factor_completed_date,
@@ -497,7 +503,7 @@ def replay_live_day(
             signal_generated_codes.add(code)
             if accepted:
                 pending_by_code[code] = signal
-            observation.update(state="signal_confirmed" if accepted else "rejected_adx",
+            observation.update(state="signal_confirmed" if accepted else rejection_status,
                                signal_id=signal_id, reason=signal["reason"])
 
     # 每只持仓使用本股真实末柱时间，缺行情者沿用已有估值。
